@@ -62,7 +62,7 @@ def _get_client_for_entry(mock_hass: MagicMock, entry_id: str) -> AsyncMock:
 
 
 async def test_setup_registers_all_services(mock_hass: MagicMock) -> None:
-    """async_setup_services must register all 9 service handlers."""
+    """async_setup_services must register all 10 service handlers."""
     await async_setup_services(mock_hass)
 
     registered = {call[0][1] for call in mock_hass.services.async_register.call_args_list}
@@ -76,11 +76,12 @@ async def test_setup_registers_all_services(mock_hass: MagicMock) -> None:
         "add_gear_to_activity",
         "add_hydration",
         "add_nutrition_log",
+        "probe_intraday",
     }
 
 
 async def test_unload_removes_all_services(mock_hass: MagicMock) -> None:
-    """async_unload_services must remove all 9 services."""
+    """async_unload_services must remove all 10 services."""
     await async_unload_services(mock_hass)
 
     removed = {call[0][1] for call in mock_hass.services.async_remove.call_args_list}
@@ -94,7 +95,40 @@ async def test_unload_removes_all_services(mock_hass: MagicMock) -> None:
         "add_gear_to_activity",
         "add_hydration",
         "add_nutrition_log",
+        "probe_intraday",
     }
+
+
+async def test_probe_intraday_uses_loaded_runtime_client(
+    mock_hass: MagicMock,
+) -> None:
+    """probe_intraday must reuse the integration's authenticated client."""
+    await async_setup_services(mock_hass)
+    handler = _get_handler(mock_hass, "probe_intraday")
+    client = _get_client(mock_hass)
+
+    call = MagicMock()
+    call.data = {
+        "date": "2026-07-24",
+        "metric": "stress",
+    }
+
+    expected = {
+        "date": "2026-07-24",
+        "requested_metric": "stress",
+        "results": {"stress": {"ok": True, "point_count": 2}},
+    }
+    with patch(
+        "custom_components.garmin_connect.services.async_probe_intraday",
+        new=AsyncMock(return_value=expected),
+    ) as probe:
+        response = await handler(call)
+
+    assert response == expected
+    probe.assert_awaited_once()
+    assert probe.await_args.args[0] is client
+    assert probe.await_args.args[1].isoformat() == "2026-07-24"
+    assert probe.await_args.args[2] == "stress"
 
 
 async def test_service_no_entry_raises(mock_hass: MagicMock) -> None:

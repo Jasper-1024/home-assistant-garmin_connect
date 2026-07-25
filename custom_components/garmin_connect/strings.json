@@ -339,6 +339,15 @@
         "gear_uuid": { "name": "Gear UUID", "description": "The UUID of the gear to add." },
         "entity_id": { "name": "Gear sensor entity", "description": "Alternative to gear_uuid — select a gear sensor entity." }
       }
+    },
+    "probe_intraday": {
+      "name": "Probe intraday health data",
+      "description": "Read summary metadata from Garmin intraday health series without persisting data.",
+      "fields": {
+        "entity_id": { "name": "Garmin Connect entity", "description": "Optional entity used to select the Garmin account." },
+        "date": { "name": "Date", "description": "Garmin local calendar date. Defaults to today." },
+        "metric": { "name": "Metric", "description": "Intraday series to inspect." }
+      }
     }
   },
   "exceptions": {

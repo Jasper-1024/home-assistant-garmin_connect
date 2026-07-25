@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -16,8 +16,10 @@ from homeassistant.core import (
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
+from .intraday_probe import METRICS, async_probe_intraday
 
 if TYPE_CHECKING:
     from ha_garmin import GarminClient
@@ -34,6 +36,7 @@ SERVICE_DOWNLOAD_ACTIVITY = "download_activity"
 SERVICE_ADD_GEAR_TO_ACTIVITY = "add_gear_to_activity"
 SERVICE_ADD_HYDRATION = "add_hydration"
 SERVICE_ADD_NUTRITION = "add_nutrition_log"
+SERVICE_PROBE_INTRADAY = "probe_intraday"
 
 # Service schemas
 SET_ACTIVE_GEAR_SCHEMA = vol.Schema(
@@ -147,6 +150,14 @@ ADD_NUTRITION_SCHEMA = vol.Schema(
     }
 )
 
+PROBE_INTRADAY_SCHEMA = vol.Schema(
+    {
+        vol.Optional("entity_id"): cv.entity_id,
+        vol.Optional("date"): vol.All(cv.string, vol.Coerce(date.fromisoformat)),
+        vol.Optional("metric", default="all"): vol.In(("all", *METRICS)),
+    }
+)
+
 
 def _get_client(
     hass: HomeAssistant,
@@ -200,6 +211,18 @@ def _get_client(
 
 async def async_setup_services(hass: HomeAssistant) -> None:
     """Set up Garmin Connect services."""
+
+    async def handle_probe_intraday(call: ServiceCall) -> ServiceResponse:
+        """Probe Garmin cloud intraday series without persisting data."""
+        client = _get_client(hass, entity_id=call.data.get("entity_id"))
+        target_date = call.data.get("date") or dt_util.now().date()
+        if isinstance(target_date, str):
+            target_date = date.fromisoformat(target_date)
+        return await async_probe_intraday(
+            client,
+            target_date,
+            call.data.get("metric", "all"),
+        )
 
     async def handle_set_active_gear(call: ServiceCall) -> None:
         """Handle set_active_gear service call."""
@@ -516,6 +539,13 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         handle_add_nutrition,
         schema=ADD_NUTRITION_SCHEMA,
     )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_PROBE_INTRADAY,
+        handle_probe_intraday,
+        schema=PROBE_INTRADAY_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
+    )
 
 
 async def async_unload_services(hass: HomeAssistant) -> None:
@@ -529,3 +559,4 @@ async def async_unload_services(hass: HomeAssistant) -> None:
     hass.services.async_remove(DOMAIN, SERVICE_ADD_GEAR_TO_ACTIVITY)
     hass.services.async_remove(DOMAIN, SERVICE_ADD_HYDRATION)
     hass.services.async_remove(DOMAIN, SERVICE_ADD_NUTRITION)
+    hass.services.async_remove(DOMAIN, SERVICE_PROBE_INTRADAY)

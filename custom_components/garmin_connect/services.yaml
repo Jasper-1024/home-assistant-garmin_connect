@@ -430,3 +430,36 @@ add_nutrition_log:
       example: "2024-01-15T12:30:00"
       selector:
         text:
+
+probe_intraday:
+  name: Probe intraday health data
+  description: >
+    Read metadata and boundary samples from Garmin's intraday heart-rate,
+    stress, Body Battery, and HRV series. This diagnostic action does not
+    persist data.
+  fields:
+    entity_id:
+      name: Garmin Connect entity
+      description: Optional entity used to select the Garmin account.
+      selector:
+        entity:
+          integration: garmin_connect
+          domain: sensor
+    date:
+      name: Date
+      description: Garmin local calendar date. Defaults to today.
+      example: "2026-07-24"
+      selector:
+        date:
+    metric:
+      name: Metric
+      description: Intraday series to inspect.
+      default: all
+      selector:
+        select:
+          options:
+            - all
+            - heart_rate
+            - stress
+            - body_battery
+            - hrv

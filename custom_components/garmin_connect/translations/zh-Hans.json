@@ -315,6 +315,15 @@
         "gear_uuid": { "name": "装备 UUID", "description": "要添加的装备的 UUID。" },
         "entity_id": { "name": "装备传感器实体", "description": "gear_uuid 的替代项 — 选择一个装备传感器实体。" }
       }
+    },
+    "probe_intraday": {
+      "name": "探测日内健康数据",
+      "description": "只读检查 Garmin 日内健康序列的摘要信息，不保存数据。",
+      "fields": {
+        "entity_id": { "name": "Garmin Connect 实体", "description": "可选：用于选择 Garmin 账户的实体。" },
+        "date": { "name": "日期", "description": "Garmin 本地日历日期，默认今天。" },
+        "metric": { "name": "指标", "description": "要检查的日内序列。" }
+      }
     }
   },
   "exceptions": {
