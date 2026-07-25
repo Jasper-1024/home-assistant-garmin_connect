@@ -324,6 +324,17 @@
         "date": { "name": "日期", "description": "Garmin 本地日历日期，默认今天。" },
         "metric": { "name": "指标", "description": "要检查的日内序列。" }
       }
+    },
+    "probe_capability": {
+      "name": "探测 Garmin 数据能力",
+      "description": "只发起一次只读请求，仅返回字段结构和集合大小。",
+      "fields": {
+        "entity_id": { "name": "Garmin Connect 实体", "description": "可选：用于选择 Garmin 账户的实体。" },
+        "probe": { "name": "数据能力", "description": "要检查的 Garmin 数据族。" },
+        "date": { "name": "日期", "description": "Garmin 本地日历日期，默认今天。" },
+        "start_date": { "name": "开始日期", "description": "GraphQL 范围探测的可选开始日期。" },
+        "end_date": { "name": "结束日期", "description": "GraphQL 范围探测的可选结束日期。" }
+      }
     }
   },
   "exceptions": {

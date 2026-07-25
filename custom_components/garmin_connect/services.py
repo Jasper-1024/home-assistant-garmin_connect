@@ -19,7 +19,12 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
-from .intraday_probe import METRICS, async_probe_intraday
+from .intraday_probe import (
+    CAPABILITY_PROBES,
+    METRICS,
+    async_probe_capability,
+    async_probe_intraday,
+)
 
 if TYPE_CHECKING:
     from ha_garmin import GarminClient
@@ -37,6 +42,7 @@ SERVICE_ADD_GEAR_TO_ACTIVITY = "add_gear_to_activity"
 SERVICE_ADD_HYDRATION = "add_hydration"
 SERVICE_ADD_NUTRITION = "add_nutrition_log"
 SERVICE_PROBE_INTRADAY = "probe_intraday"
+SERVICE_PROBE_CAPABILITY = "probe_capability"
 
 # Service schemas
 SET_ACTIVE_GEAR_SCHEMA = vol.Schema(
@@ -158,6 +164,16 @@ PROBE_INTRADAY_SCHEMA = vol.Schema(
     }
 )
 
+PROBE_CAPABILITY_SCHEMA = vol.Schema(
+    {
+        vol.Optional("entity_id"): cv.entity_id,
+        vol.Required("probe"): vol.In(CAPABILITY_PROBES),
+        vol.Optional("date"): vol.All(cv.string, vol.Coerce(date.fromisoformat)),
+        vol.Optional("start_date"): vol.All(cv.string, vol.Coerce(date.fromisoformat)),
+        vol.Optional("end_date"): vol.All(cv.string, vol.Coerce(date.fromisoformat)),
+    }
+)
+
 
 def _get_client(
     hass: HomeAssistant,
@@ -222,6 +238,26 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             client,
             target_date,
             call.data.get("metric", "all"),
+        )
+
+    async def handle_probe_capability(call: ServiceCall) -> ServiceResponse:
+        """Run one privacy-minimized Garmin capability request."""
+        client = _get_client(hass, entity_id=call.data.get("entity_id"))
+        target_date = call.data.get("date") or dt_util.now().date()
+        start_date = call.data.get("start_date")
+        end_date = call.data.get("end_date")
+        if isinstance(target_date, str):
+            target_date = date.fromisoformat(target_date)
+        if isinstance(start_date, str):
+            start_date = date.fromisoformat(start_date)
+        if isinstance(end_date, str):
+            end_date = date.fromisoformat(end_date)
+        return await async_probe_capability(
+            client,
+            call.data["probe"],
+            target_date,
+            start_date,
+            end_date,
         )
 
     async def handle_set_active_gear(call: ServiceCall) -> None:
@@ -546,6 +582,13 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         schema=PROBE_INTRADAY_SCHEMA,
         supports_response=SupportsResponse.ONLY,
     )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_PROBE_CAPABILITY,
+        handle_probe_capability,
+        schema=PROBE_CAPABILITY_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
+    )
 
 
 async def async_unload_services(hass: HomeAssistant) -> None:
@@ -560,3 +603,4 @@ async def async_unload_services(hass: HomeAssistant) -> None:
     hass.services.async_remove(DOMAIN, SERVICE_ADD_HYDRATION)
     hass.services.async_remove(DOMAIN, SERVICE_ADD_NUTRITION)
     hass.services.async_remove(DOMAIN, SERVICE_PROBE_INTRADAY)
+    hass.services.async_remove(DOMAIN, SERVICE_PROBE_CAPABILITY)

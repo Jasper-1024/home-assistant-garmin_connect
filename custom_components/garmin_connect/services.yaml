@@ -463,3 +463,56 @@ probe_intraday:
             - stress
             - body_battery
             - hrv
+
+probe_capability:
+  name: Probe Garmin capability
+  description: >
+    Make exactly one read-only Garmin request and return only its field
+    structure and collection sizes. Scalar health values are not returned.
+  fields:
+    entity_id:
+      name: Garmin Connect entity
+      description: Optional entity used to select the Garmin account.
+      selector:
+        entity:
+          integration: garmin_connect
+          domain: sensor
+    probe:
+      name: Capability
+      description: Garmin data family to inspect.
+      required: true
+      selector:
+        select:
+          options:
+            - daily_summary
+            - sleep
+            - steps_chart
+            - floors_chart
+            - respiration
+            - spo2
+            - intensity_minutes
+            - daily_events
+            - body_battery_events
+            - training_readiness
+            - training_status
+            - heart_rate_schema
+            - health_snapshot_graphql
+            - daily_summary_graphql
+    date:
+      name: Date
+      description: Garmin local calendar date. Defaults to today.
+      example: "2026-07-24"
+      selector:
+        date:
+    start_date:
+      name: Start date
+      description: Optional range start for GraphQL range probes.
+      example: "2026-07-01"
+      selector:
+        date:
+    end_date:
+      name: End date
+      description: Optional range end for GraphQL range probes.
+      example: "2026-07-24"
+      selector:
+        date:

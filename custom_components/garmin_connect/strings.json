@@ -348,6 +348,17 @@
         "date": { "name": "Date", "description": "Garmin local calendar date. Defaults to today." },
         "metric": { "name": "Metric", "description": "Intraday series to inspect." }
       }
+    },
+    "probe_capability": {
+      "name": "Probe Garmin capability",
+      "description": "Make one read-only request and return only field structure and collection sizes.",
+      "fields": {
+        "entity_id": { "name": "Garmin Connect entity", "description": "Optional entity used to select the Garmin account." },
+        "probe": { "name": "Capability", "description": "Garmin data family to inspect." },
+        "date": { "name": "Date", "description": "Garmin local calendar date. Defaults to today." },
+        "start_date": { "name": "Start date", "description": "Optional range start for GraphQL probes." },
+        "end_date": { "name": "End date", "description": "Optional range end for GraphQL probes." }
+      }
     }
   },
   "exceptions": {

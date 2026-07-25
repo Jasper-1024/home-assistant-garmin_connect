@@ -6,6 +6,8 @@ It never logs or returns authentication material and does not persist health dat
 
 from __future__ import annotations
 
+import asyncio
+import json
 from datetime import UTC, date, datetime
 from statistics import median
 from typing import TYPE_CHECKING, Any
@@ -14,6 +16,34 @@ if TYPE_CHECKING:
     from ha_garmin import GarminClient
 
 METRICS = ("heart_rate", "stress", "body_battery", "hrv")
+CAPABILITY_PROBES = (
+    "daily_summary",
+    "sleep",
+    "steps_chart",
+    "floors_chart",
+    "respiration",
+    "spo2",
+    "intensity_minutes",
+    "daily_events",
+    "body_battery_events",
+    "training_readiness",
+    "training_status",
+    "heart_rate_schema",
+    "health_snapshot_graphql",
+    "daily_summary_graphql",
+)
+AVAILABILITY_FLAG_KEYS = {
+    "skinTempDataExists",
+    "sleepDataExists",
+    "spo2DataExists",
+}
+CATEGORY_KEYS = {
+    "activityType",
+    "activityTypeKey",
+    "eventType",
+    "eventTypeKey",
+    "sourceType",
+}
 
 
 def _timestamp_ms_to_iso(value: Any) -> str | None:
@@ -193,6 +223,213 @@ def _safe_error(err: Exception) -> dict[str, Any]:
         "ok": False,
         "error_type": type(err).__name__,
         "error": message[:300],
+    }
+
+
+def _decode_json_scalar(value: Any) -> Any:
+    """Decode Garmin GraphQL scalar JSON without exposing the raw string."""
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped.startswith(("{", "[")):
+        return value
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return value
+
+
+def _summarize_shape(value: Any, depth: int = 0) -> dict[str, Any]:
+    """Describe payload structure and collection sizes without scalar values."""
+    value = _decode_json_scalar(value)
+    if value is None:
+        return {"type": "null", "non_null": False}
+    if isinstance(value, dict):
+        keys = sorted(str(key) for key in value)
+        result: dict[str, Any] = {
+            "type": "object",
+            "non_null": True,
+            "key_count": len(keys),
+            "keys": keys,
+        }
+        if depth < 4:
+            result["fields"] = {
+                str(key): _summarize_shape(child, depth + 1)
+                for key, child in sorted(value.items(), key=lambda item: str(item[0]))
+            }
+        return result
+    if isinstance(value, list | tuple):
+        non_null_items = [item for item in value if item is not None]
+        result = {
+            "type": "array",
+            "non_null": True,
+            "length": len(value),
+            "non_null_count": len(non_null_items),
+            "item_types": sorted(
+                {_summarize_shape(item, depth + 1)["type"] for item in non_null_items[:20]}
+            ),
+        }
+        if non_null_items and depth < 4:
+            result["first_item_shape"] = _summarize_shape(non_null_items[0], depth + 1)
+        return result
+    if isinstance(value, bool):
+        return {"type": "boolean", "non_null": True}
+    if isinstance(value, int | float):
+        return {"type": "number", "non_null": True}
+    if isinstance(value, str):
+        return {"type": "string", "non_null": True, "empty": not bool(value)}
+    return {"type": type(value).__name__, "non_null": True}
+
+
+def _summarize_capability_payload(payload: Any) -> dict[str, Any]:
+    """Return a privacy-minimized capability summary."""
+    decoded = _decode_json_scalar(payload)
+    return {
+        "ok": True,
+        "response_type": type(decoded).__name__,
+        "shape": _summarize_shape(decoded),
+        "availability_flags": _collect_named_scalars(decoded, AVAILABILITY_FLAG_KEYS),
+        "categories": _collect_named_scalars(decoded, CATEGORY_KEYS),
+    }
+
+
+def _collect_named_scalars(
+    value: Any,
+    allowed_keys: set[str],
+    results: dict[str, set[str | bool]] | None = None,
+) -> dict[str, list[str | bool]]:
+    """Collect only whitelisted availability flags and event categories."""
+    if results is None:
+        results = {}
+    value = _decode_json_scalar(value)
+    if isinstance(value, dict):
+        for key, child in value.items():
+            key_text = str(key)
+            if key_text in allowed_keys and isinstance(child, str | bool) and child is not None:
+                results.setdefault(key_text, set()).add(child)
+            _collect_named_scalars(child, allowed_keys, results)
+    elif isinstance(value, list | tuple):
+        for child in value[:1000]:
+            _collect_named_scalars(child, allowed_keys, results)
+    return {key: sorted(values, key=str) for key, values in sorted(results.items())}
+
+
+async def _graphql_request(client: GarminClient, query: str) -> Any:
+    """Run one authenticated Garmin GraphQL request using the existing session."""
+    import requests
+
+    await client.get_user_profile()
+    url = f"{client._base_url}/graphql-gateway/graphql"
+    headers = client._auth.get_api_headers()
+
+    def _request() -> Any:
+        response = requests.post(
+            url,
+            json={"query": query},
+            headers=headers,
+            timeout=20,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"Garmin GraphQL HTTP {response.status_code}")
+        return response.json()
+
+    return await asyncio.to_thread(_request)
+
+
+async def async_probe_capability(
+    client: GarminClient,
+    probe: str,
+    target_date: date,
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> dict[str, Any]:
+    """Run exactly one read-only capability request and summarize its shape."""
+    date_text = target_date.isoformat()
+    start_text = (start_date or target_date).isoformat()
+    end_text = (end_date or target_date).isoformat()
+    base_url = client._base_url
+
+    try:
+        if probe == "daily_summary":
+            payload = await client._get_user_summary_raw(target_date)
+        elif probe == "sleep":
+            payload = await client._get_sleep_data_raw(target_date)
+        elif probe == "steps_chart":
+            profile = await client.get_user_profile()
+            payload = await client._request(
+                "GET",
+                f"{base_url}/wellness-service/wellness/dailySummaryChart/{profile.display_name}",
+                params={"date": date_text},
+            )
+        elif probe == "floors_chart":
+            payload = await client._request(
+                "GET",
+                f"{base_url}/wellness-service/wellness/floorsChartData/daily/{date_text}",
+            )
+        elif probe == "respiration":
+            payload = await client._request(
+                "GET",
+                f"{base_url}/wellness-service/wellness/daily/respiration/{date_text}",
+            )
+        elif probe == "spo2":
+            payload = await client._request(
+                "GET",
+                f"{base_url}/wellness-service/wellness/daily/spo2/{date_text}",
+            )
+        elif probe == "intensity_minutes":
+            payload = await client._request(
+                "GET",
+                f"{base_url}/wellness-service/wellness/daily/im/{date_text}",
+            )
+        elif probe == "daily_events":
+            payload = await client._request(
+                "GET",
+                f"{base_url}/wellness-service/wellness/dailyEvents",
+                params={"calendarDate": date_text},
+            )
+        elif probe == "body_battery_events":
+            payload = await client._request(
+                "GET",
+                f"{base_url}/wellness-service/wellness/bodyBattery/events/{date_text}",
+            )
+        elif probe == "training_readiness":
+            payload = await client.get_training_readiness(target_date)
+        elif probe == "training_status":
+            payload = await client.get_training_status(target_date)
+        elif probe == "heart_rate_schema":
+            profile = await client.get_user_profile()
+            payload = await client._request(
+                "GET",
+                f"{base_url}/wellness-service/wellness/dailyHeartRate/{profile.display_name}",
+                params={"date": date_text},
+            )
+        elif probe == "health_snapshot_graphql":
+            payload = await _graphql_request(
+                client,
+                (f'query{{healthSnapshotScalar(startDate:"{start_text}",endDate:"{end_text}")}}'),
+            )
+        elif probe == "daily_summary_graphql":
+            payload = await _graphql_request(
+                client,
+                (
+                    "query{userDailySummaryV2Scalar("
+                    f'startDate:"{start_text}",endDate:"{end_text}"'
+                    ")}"
+                ),
+            )
+        else:
+            raise ValueError(f"Unknown capability probe: {probe}")
+    except Exception as err:
+        result = _safe_error(err)
+    else:
+        result = _summarize_capability_payload(payload)
+
+    return {
+        "probe": probe,
+        "date": date_text,
+        "start_date": start_text,
+        "end_date": end_text,
+        "result": result,
     }
 
 

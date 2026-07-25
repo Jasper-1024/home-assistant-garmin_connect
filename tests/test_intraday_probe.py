@@ -5,7 +5,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from custom_components.garmin_connect.intraday_probe import (
+    _summarize_capability_payload,
     _summarize_pair_series,
+    async_probe_capability,
     async_probe_intraday,
 )
 
@@ -97,3 +99,53 @@ async def test_probe_intraday_calls_existing_authenticated_client() -> None:
     assert result["results"]["hrv"]["median_interval_seconds"] == 300
     assert client._request.await_count == 3
     client._get_hrv_data_raw.assert_awaited_once_with(date(2026, 7, 24))
+
+
+def test_capability_summary_omits_scalar_health_values() -> None:
+    """Capability summaries expose structure and sizes, never scalar values."""
+    result = _summarize_capability_payload(
+        {
+            "sleepScores": {"overall": {"value": 82}},
+            "skinTempDataExists": True,
+            "sleepLevels": [
+                {
+                    "startGMT": "2026-07-24T01:00:00",
+                    "activityLevel": 2,
+                    "activityType": "deepSleep",
+                }
+            ],
+        }
+    )
+
+    shape = result["shape"]
+    assert shape["fields"]["sleepLevels"]["length"] == 1
+    assert shape["fields"]["sleepScores"]["fields"]["overall"]["fields"]["value"] == {
+        "type": "number",
+        "non_null": True,
+    }
+    assert "82" not in str(result)
+    assert "2026-07-24T01:00:00" not in str(result)
+    assert result["availability_flags"] == {"skinTempDataExists": [True]}
+    assert result["categories"] == {"activityType": ["deepSleep"]}
+
+
+async def test_capability_probe_makes_one_request() -> None:
+    """One capability invocation must make exactly one Garmin data request."""
+    client = SimpleNamespace()
+    client._base_url = "https://connectapi.garmin.com"
+    client._request = AsyncMock(
+        return_value={
+            "respirationValuesArray": [[1688191200000, 14.5]],
+            "respirationAveragesValuesArray": [],
+        }
+    )
+
+    result = await async_probe_capability(
+        client,
+        "respiration",
+        date(2026, 7, 24),
+    )
+
+    assert result["result"]["ok"] is True
+    assert result["result"]["shape"]["fields"]["respirationValuesArray"]["length"] == 1
+    client._request.assert_awaited_once()
