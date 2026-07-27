@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -12,6 +13,8 @@ from custom_components.garmin_connect.fit_archive import (
     async_archive_fit,
     fit_file_name,
     fit_record,
+    inspect_fit,
+    persisted_fit_summary,
 )
 
 
@@ -178,3 +181,16 @@ def test_captured_structural_fixture_is_redacted_and_validated() -> None:
     assert "position_lat" in record["summary"]["message_fields"]["record"]
     assert not any(isinstance(value, (int, float)) for value in record["summary"]["message_fields"]["record"])
     assert "file" not in record["summary"]
+
+
+def test_optional_private_captured_fit_replay() -> None:
+    """Replay a private captured FIT when explicitly supplied by a developer."""
+    raw_path = os.environ.get("GARMIN_SAKAMOTO13_FIT")
+    if not raw_path:
+        pytest.skip("GARMIN_SAKAMOTO13_FIT is not set")
+    summary = inspect_fit(Path(raw_path), 0o600)
+    assert summary["file"]["integrity_ok"] is True
+    assert summary["file"]["decode_ok"] is True
+    persisted = persisted_fit_summary(summary)
+    assert set(persisted) == {"message_counts", "message_fields", "time_coverage", "presence"}
+    assert {"file_id", "session", "lap", "record", "event", "time_in_zone", "device_info"}.intersection(persisted["message_counts"])

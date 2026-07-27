@@ -90,6 +90,11 @@ def _summary_without_file(summary: Mapping[str, Any], *, require_integrity: bool
     return result
 
 
+def persisted_fit_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate and return only the persisted structural summary fields."""
+    return _summary_without_file(summary, require_integrity=False)
+
+
 async def async_archive_fit(
     *,
     client: Any,
@@ -146,4 +151,4 @@ def fit_record(record: Mapping[str, Any]) -> dict[str, Any]:
         raise FitArchiveError("FIT record is invalid")
     if not isinstance(summary, Mapping):
         raise FitArchiveError("FIT record is invalid")
-    return {"logical_id": logical_id, "path": path, "summary": _summary_without_file(summary, require_integrity=False)}
+    return {"logical_id": logical_id, "path": path, "summary": persisted_fit_summary(summary)}

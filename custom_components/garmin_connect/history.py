@@ -22,7 +22,13 @@ from .const import (
     HISTORY_STORE_VERSION,
     RECORDER_COMPATIBILITY_TARGET,
 )
-from .fit_archive import FitArchiveError, async_archive_fit, fit_record, inspect_fit
+from .fit_archive import (
+    FitArchiveError,
+    async_archive_fit,
+    fit_record,
+    inspect_fit,
+    persisted_fit_summary,
+)
 from .history_recorder import (
     BODY_BATTERY_METADATA,
     DAILY_ABNORMAL_HR_METADATA,
@@ -846,7 +852,7 @@ class GarminHistoryArchive:
                             invalid_fit_keys.add(key)
                             continue
                         inspected = await asyncio.to_thread(inspect_fit, fit_path, 0o600)
-                        restored_fit = {"logical_id": key, "path": fit_path.name, "summary": inspected}
+                        restored_fit = {"logical_id": key, "path": fit_path.name, "summary": persisted_fit_summary(inspected)}
                         parsed_fits[key] = fit_record(restored_fit)
                     except (OSError, RuntimeError, TypeError, ValueError):
                         invalid_fit_keys.add(key)
@@ -858,7 +864,7 @@ class GarminHistoryArchive:
                     }
                     try:
                         await self._sleep_partition_stores[year].async_save(cleaned_partition)
-                    except (OSError, TypeError, ValueError):
+                    except (OSError, RuntimeError, TypeError, ValueError):
                         pass
                 self._fit_archives[year] = parsed_fits
             except (KeyError, TypeError, ValueError, OSError):
