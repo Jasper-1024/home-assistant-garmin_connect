@@ -80,8 +80,9 @@ def normalize_pair_series(
         return ()
     if not isinstance(raw_points, list):
         raise HistorySchemaError(f"{values_key} is not an array")
+    descriptor_present = any(key in payload for key in descriptor_keys)
     positions = _descriptors(payload, descriptor_keys)
-    if positions and ("timestamp" not in positions or not any(key in positions for key in value_keys)):
+    if descriptor_present and raw_points and ("timestamp" not in positions or not any(key in positions for key in value_keys)):
         raise HistorySchemaError("descriptor list lacks required fields")
     timestamp_index = positions.get("timestamp", 0)
     value_index = next((positions[key] for key in value_keys if key in positions), 1)

@@ -344,6 +344,9 @@ class GarminHistoryArchive:
             from homeassistant.helpers.recorder import get_instance
 
             recorder = GarminHistoryRecorder(get_instance(self._hass))
+        store = self._store
+        if store is None:
+            return HistorySyncReport(outcome="failed", error_type="store_unavailable")
         processed: list[date] = []
         skipped = 0
         inserted = 0
@@ -353,6 +356,8 @@ class GarminHistoryArchive:
             target_key = target.isoformat()
             if target_key in self._completed_dates:
                 skipped += 1
+                processed.append(target)
+                self._status = HistoryStatus(HistoryArchiveState.RUNNING, current_date=target_key, processed_dates=len(processed), record_count=inserted)
                 continue
             self._status = HistoryStatus(HistoryArchiveState.RUNNING, current_date=target_key, processed_dates=len(processed), record_count=inserted)
             try:
@@ -366,9 +371,10 @@ class GarminHistoryArchive:
                     inserted += outcome.accepted_count
                 processed.append(target)
                 completed_dates = self._completed_dates | {target_key}
-                await self._store.async_save({"schema_version": HISTORY_STORE_VERSION, "account_key": self._account_key(), "completed_dates": sorted(completed_dates)})
+                await store.async_save({"schema_version": HISTORY_STORE_VERSION, "account_key": self._account_key(), "completed_dates": sorted(completed_dates)})
                 self._completed_dates = completed_dates
             except asyncio.CancelledError:
+                self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=target_key, processed_dates=len(processed), record_count=inserted)
                 raise
             except (AttributeError, ImportError, TypeError, ValueError, RuntimeError):
                 self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type="sync_failed")
