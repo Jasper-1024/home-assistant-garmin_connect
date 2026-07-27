@@ -150,6 +150,47 @@ def test_sleep_parser_preserves_sanitized_high_resolution_streams() -> None:
         "heart_rate", "hrv", "body_battery", "stress", "respiration", "spo2", "movement",
     }
     assert session.streams[0].points[0].timestamp.tzinfo is not None
-    assert session.streams[0].points[1].value is None
+    assert any(point.value is None for point in session.streams[0].points)
     assert session_record(session)["streams"]["heart_rate"]
     assert session_from_record(session_record(session)) == session
+
+
+def test_sleep_stream_descriptors_reorder_columns_and_deduplicate_timestamps() -> None:
+    payload = {
+        "startTime": "2026-07-24T23:45:00Z", "endTime": "2026-07-25T07:15:00Z",
+        "sleepHeartRateDescriptors": [
+            {"key": "value", "index": 0}, {"key": "timestamp", "index": 1},
+        ],
+        "sleepHeartRate": [
+            [60, "2026-07-25T00:01:00Z"], [61, "2026-07-25T00:01:00Z"],
+            [59, "2026-07-25T00:00:00Z"],
+        ],
+    }
+    session = parse_sleep_sessions(payload, date(2026, 7, 24))[0]
+    points = session.streams[0].points
+    assert [(point.timestamp.isoformat(), point.value) for point in points] == [
+        ("2026-07-25T00:00:00+00:00", 59.0),
+        ("2026-07-25T00:01:00+00:00", 61.0),
+    ]
+
+    with pytest.raises(SleepSchemaError):
+        parse_sleep_sessions({**payload, "sleepHeartRate": [[60, "x"]]}, date(2026, 7, 24))
+
+    with pytest.raises(SleepSchemaError):
+        parse_sleep_sessions({**payload, "sleepHeartRate": [[60, "2026-07-25T00:00:00Z"]] * 4097}, date(2026, 7, 24))
+
+
+def test_sleep_stream_numeric_epoch_timestamp_and_nested_descriptors() -> None:
+    payload = {
+        "sleepData": {
+            "startTime": "2026-07-24T23:45:00Z", "endTime": "2026-07-25T07:15:00Z",
+            "sleepHeartRateValueDescriptorsDTOList": [
+                {"key": "heartRate", "index": 0}, {"key": "timestamp", "index": 1},
+            ],
+            "sleepHeartRate": [[60, 1_784_841_600_000]],
+        }
+    }
+    session = parse_sleep_sessions(payload, date(2026, 7, 24))[0]
+    point = session.streams[0].points[0]
+    assert point.raw_timestamp == 1_784_841_600_000
+    assert point.timestamp.tzinfo is not None

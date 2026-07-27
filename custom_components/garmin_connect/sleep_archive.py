@@ -56,6 +56,12 @@ class SleepData:
 
 
 def _parse_time(value: Any) -> datetime:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            seconds = float(value) / (1000 if abs(float(value)) >= 100_000_000_000 else 1)
+            return datetime.fromtimestamp(seconds, tz=UTC)
+        except (OverflowError, OSError, ValueError) as err:
+            raise SleepSchemaError("sleep timestamp has invalid value") from err
     if not isinstance(value, str):
         raise SleepSchemaError("sleep timestamp has invalid type")
     try:
@@ -126,6 +132,39 @@ _STREAM_FIELDS = {
     "spo2": ("sleepSpO2", "sleepSpo2", "sleepSpO2Values", "spO2ContinuousValues"),
     "movement": ("sleepMovement", "sleepMovementValues"),
 }
+_STREAM_DESCRIPTOR_FIELDS = {
+    "heart_rate": ("sleepHeartRateDescriptors", "sleepHeartRateValueDescriptors", "sleepHeartRateValueDescriptorsDTOList", "heartRateValueDescriptors"),
+    "hrv": ("hrvDataDescriptors", "hrvValueDescriptors", "hrvValueDescriptorsDTOList", "hrvValueDescriptorDTOList"),
+    "body_battery": ("sleepBodyBatteryDescriptors", "sleepBodyBatteryValueDescriptorsDTOList", "bodyBatteryValueDescriptorsDTOList"),
+    "stress": ("sleepStressDescriptors", "sleepStressValueDescriptorsDTOList", "stressValueDescriptorsDTOList"),
+    "respiration": ("sleepRespirationDescriptors", "sleepRespirationValueDescriptorsDTOList", "respirationValueDescriptorsDTOList"),
+    "spo2": ("sleepSpO2Descriptors", "sleepSpO2ValueDescriptorsDTOList", "spO2ValueDescriptorsDTOList"),
+    "movement": ("sleepMovementDescriptors", "sleepMovementValueDescriptorsDTOList", "movementValueDescriptorsDTOList"),
+}
+
+
+def _stream_descriptors(item: dict[str, Any], metric: str) -> dict[str, int] | None:
+    raw = next((item[key] for key in _STREAM_DESCRIPTOR_FIELDS[metric] if key in item), None)
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise SleepSchemaError("sleep stream descriptors have invalid type")
+    descriptors: dict[str, int] = {}
+    indexes: set[int] = set()
+    for descriptor in raw:
+        if (
+            not isinstance(descriptor, dict)
+            or not isinstance(descriptor.get("key"), str)
+            or not isinstance(descriptor.get("index"), int)
+            or isinstance(descriptor.get("index"), bool)
+        ):
+            raise SleepSchemaError("sleep stream descriptor is invalid")
+        key, index = descriptor["key"], descriptor["index"]
+        if index < 0 or key in descriptors or index in indexes:
+            raise SleepSchemaError("sleep stream descriptor index is invalid")
+        descriptors[key] = index
+        indexes.add(index)
+    return descriptors
 
 
 def _sleep_streams(item: dict[str, Any]) -> tuple[SleepStream, ...]:
@@ -140,11 +179,21 @@ def _sleep_streams(item: dict[str, Any]) -> tuple[SleepStream, ...]:
             continue
         if not isinstance(values, list):
             raise SleepSchemaError("sleep stream has invalid type")
+        if len(values) > 4096:
+            raise SleepSchemaError("sleep stream exceeds bounded point limit")
+        descriptors = _stream_descriptors(item, metric)
         points: list[SleepStreamPoint] = []
-        for row in values[:4096]:
+        by_timestamp: dict[datetime, SleepStreamPoint] = {}
+        for row in values:
             if isinstance(row, dict):
                 raw_time = next((row[name] for name in ("timestamp", "time", "startGMT", "readingTimeGMT") if name in row), None)
                 raw_value = next((row[name] for name in ("value", metric, "heartRate", "hrvValue", "stressLevel", "spO2", "spo2") if name in row), None)
+            elif isinstance(row, list) and descriptors is not None:
+                timestamp_index = next((descriptors[key] for key in ("timestamp", "time", "startGMT", "readingTimeGMT") if key in descriptors), None)
+                value_index = next((descriptors[key] for key in ("value", metric, "heartRate", "hrvValue", "stressLevel", "spO2", "spo2") if key in descriptors), None)
+                if timestamp_index is None or value_index is None or max(timestamp_index, value_index) >= len(row):
+                    raise SleepSchemaError("sleep stream descriptor fields are missing")
+                raw_time, raw_value = row[timestamp_index], row[value_index]
             elif isinstance(row, list) and len(row) >= 2:
                 raw_time, raw_value = row[0], row[1]
             else:
@@ -152,7 +201,8 @@ def _sleep_streams(item: dict[str, Any]) -> tuple[SleepStream, ...]:
             parsed_time = _parse_time(raw_time)
             if raw_value is not None and (isinstance(raw_value, bool) or not isinstance(raw_value, int | float)):
                 raise SleepSchemaError("sleep stream value has invalid type")
-            points.append(SleepStreamPoint(parsed_time, raw_time, None if raw_value is None else float(raw_value)))
+            by_timestamp[parsed_time] = SleepStreamPoint(parsed_time, raw_time, None if raw_value is None else float(raw_value))
+        points.extend(by_timestamp[key] for key in sorted(by_timestamp))
         result.append(SleepStream(metric, tuple(points)))
     return tuple(result)
 
@@ -284,7 +334,7 @@ def session_from_record(record: dict[str, Any]) -> SleepSession:
         for metric, points in raw_streams.items():
             if metric not in _STREAM_FIELDS or not isinstance(points, list):
                 raise SleepSchemaError("sleep Store record is invalid")
-            restored_points = []
+            restored_by_timestamp: dict[datetime, SleepStreamPoint] = {}
             for point in points:
                 if not isinstance(point, dict):
                     raise SleepSchemaError("sleep Store record is invalid")
@@ -292,8 +342,10 @@ def session_from_record(record: dict[str, Any]) -> SleepSession:
                 value = point["value"]
                 if value is not None and (isinstance(value, bool) or not isinstance(value, int | float)):
                     raise SleepSchemaError("sleep Store record is invalid")
-                restored_points.append(SleepStreamPoint(timestamp, point["raw_timestamp"], None if value is None else float(value)))
-            streams.append(SleepStream(metric, tuple(restored_points)))
+                restored_by_timestamp[timestamp] = SleepStreamPoint(
+                    timestamp, point["raw_timestamp"], None if value is None else float(value)
+                )
+            streams.append(SleepStream(metric, tuple(restored_by_timestamp[key] for key in sorted(restored_by_timestamp))))
         return SleepSession(
             logical_id=logical_id, kind=kind, start=start, end=end,
             calendar_date=calendar_date, revision=revision, score=bounded_score,

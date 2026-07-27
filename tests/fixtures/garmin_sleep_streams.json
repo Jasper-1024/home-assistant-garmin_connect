@@ -1,7 +1,8 @@
 {
   "startTime": "2026-07-24T23:45:00Z",
   "endTime": "2026-07-25T07:15:00Z",
-  "sleepHeartRate": [["2026-07-25T00:00:00Z", 60], ["2026-07-24T23:55:00Z", 60], ["2026-07-25T00:10:00Z", null]],
+  "sleepHeartRateDescriptors": [{"key": "value", "index": 0}, {"key": "timestamp", "index": 1}],
+  "sleepHeartRate": [[60, "2026-07-25T00:00:00Z"], [60, "2026-07-24T23:55:00Z"], [null, "2026-07-25T00:10:00Z"]],
   "hrvData": [{"timestamp": "2026-07-25T00:05:00Z", "value": 42}, {"timestamp": "2026-07-25T00:15:00Z", "value": 42}],
   "sleepBodyBattery": [["2026-07-25T00:10:00Z", 70]],
   "sleepStress": [["2026-07-25T00:15:00Z", -1], ["2026-07-25T00:16:00Z", 0]],
