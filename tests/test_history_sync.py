@@ -709,7 +709,9 @@ async def test_activity_partition_uses_local_calendar_year_at_utc_year_boundary(
             return (activity,) if metric == "timed_activities" else ()
 
     stores = {"garmin_connect.e.history_catalog": _NamedStore()}
-    archive = _partition_archive(Source(), MagicMock(), stores)
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = _partition_archive(Source(), recorder, stores)
     await archive.async_start()
     await archive.async_sync_range(date(2026, 1, 1), date(2026, 1, 1))
     assert "garmin_connect.e.sleep_2026" in stores
