@@ -10,6 +10,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Protocol
 
 from homeassistant.config_entries import ConfigEntry
@@ -75,6 +76,7 @@ from .history_source import (
     health_event_from_record,
     health_event_record,
 )
+from .fit_archive import FitArchiveError, async_archive_fit, fit_record, inspect_fit
 from .sleep_archive import SleepSchemaError, SleepSession, session_from_record, session_record
 
 _LOGGER = logging.getLogger(__name__)
@@ -297,6 +299,7 @@ class GarminHistoryArchive:
         self._sleep_sessions: dict[str, dict[str, dict[str, Any]]] = {}
         self._health_events: dict[str, dict[str, dict[str, Any]]] = {}
         self._activities: dict[str, dict[str, dict[str, Any]]] = {}
+        self._fit_archives: dict[str, dict[str, dict[str, Any]]] = {}
         self._sleep_partition_stores: dict[str, Any] = {}
         self._presence: dict[str, dict[str, str]] = {}
 
@@ -643,9 +646,20 @@ class GarminHistoryArchive:
                         "end": activity.end.isoformat() if activity.end else None, "duration_seconds": activity.duration_seconds,
                         "training_effect": activity.training_effect, "load": activity.load, "recovery": activity.recovery,
                     }
+                    download_activity = getattr(client, "download_activity", None)
+                    if callable(download_activity):
+                        fit_directory = Path(self._hass.config.path("garmin_connect", "fit"))
+                        fit_result = await async_archive_fit(
+                            client=client,
+                            activity_id=activity.activity_id,
+                            logical_id=activity.logical_id,
+                            directory=fit_directory,
+                            inspect=inspect_fit,
+                        )
+                        self._fit_archives.setdefault(year, {})[activity.logical_id] = fit_result
                 processed.append(target)
                 completed_dates = self._completed_dates | {target_key}
-                await self._async_save_sleep_partitions(sleep_sessions, events_by_year, activities_by_year)
+                await self._async_save_sleep_partitions(sleep_sessions, events_by_year, activities_by_year, self._fit_archives)
                 # Publish the catalog checkpoint only after every affected annual
                 # partition is durable. A failed partition save must be replayed.
                 await store.async_save({"schema_version": HISTORY_STORE_VERSION, "sleep_schema_version": _SLEEP_SCHEMA_VERSION, "account_key": self._account_key(), "completed_dates": sorted(completed_dates), "hrv_summaries": self._hrv_summaries, "presence": presence, "sleep_index": {year: sorted(records) for year, records in sleep_sessions.items()}, "event_index": {year: sorted(records) for year, records in events_by_year.items()}, "activity_index": {year: sorted(records) for year, records in activities_by_year.items()}})
@@ -669,6 +683,7 @@ class GarminHistoryArchive:
         self, sessions_by_year: Mapping[str, Mapping[str, dict[str, Any]]],
         events_by_year: Mapping[str, Mapping[str, dict[str, Any]]] | None = None,
         activities_by_year: Mapping[str, Mapping[str, dict[str, Any]]] | None = None,
+        fits_by_year: Mapping[str, Mapping[str, dict[str, Any]]] | None = None,
     ) -> None:
         """Atomically checkpoint each annual sleep partition."""
         store_factory = self._store_factory
@@ -676,7 +691,7 @@ class GarminHistoryArchive:
             from homeassistant.helpers.storage import Store
 
             store_factory = Store
-        for year in set(sessions_by_year) | set(events_by_year or {}) | set(activities_by_year or {}):
+        for year in set(sessions_by_year) | set(events_by_year or {}) | set(activities_by_year or {}) | set(fits_by_year or {}):
             records = sessions_by_year.get(year, {})
             if year not in self._sleep_partition_stores:
                 self._sleep_partition_stores[year] = store_factory(
@@ -695,6 +710,7 @@ class GarminHistoryArchive:
                     "sessions": dict(records),
                     "events": dict((events_by_year or {}).get(year, {})),
                     "activities": dict((activities_by_year or {}).get(year, {})),
+                    "fits": dict((fits_by_year or {}).get(year, {})),
                 }
             )
 
@@ -758,6 +774,7 @@ class GarminHistoryArchive:
             self._sleep_sessions.pop(year, None)
             self._health_events.pop(year, None)
             self._activities.pop(year, None)
+            self._fit_archives.pop(year, None)
             if year not in self._sleep_partition_stores:
                 self._sleep_partition_stores[year] = store_factory(
                     self._hass,
@@ -812,10 +829,21 @@ class GarminHistoryArchive:
                         raise SleepSchemaError("activity partition is invalid")
                     parsed_activities[key] = dict(value)
                 self._activities[year] = parsed_activities
+                raw_fits = partition.get("fits", {})
+                if not isinstance(raw_fits, Mapping):
+                    raise FitArchiveError("FIT partition is invalid")
+                parsed_fits: dict[str, dict[str, Any]] = {}
+                for key, value in raw_fits.items():
+                    restored_fit = fit_record(value)
+                    if restored_fit["logical_id"] != key:
+                        raise FitArchiveError("FIT partition is invalid")
+                    parsed_fits[key] = restored_fit
+                self._fit_archives[year] = parsed_fits
             except (KeyError, TypeError, ValueError, OSError):
                 self._sleep_sessions.pop(year, None)
                 self._health_events.pop(year, None)
                 self._activities.pop(year, None)
+                self._fit_archives.pop(year, None)
                 self._completed_dates = {value for value in self._completed_dates if value[:4] != year}
                 await self._async_invalidate_activity_index(year)
 
