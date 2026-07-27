@@ -18,8 +18,15 @@ from custom_components.garmin_connect.history import (
     HistorySyncReport,
 )
 from custom_components.garmin_connect.history_source import (
+    DAILY_SUMMARY_FIELDS,
+    HistorySchemaError,
+    TRAINING_STATUS_FIELDS,
     normalize_activities,
     normalize_health_events,
+    normalize_respiration,
+    normalize_snapshot,
+    normalize_spo2,
+    normalize_steps,
 )
 from custom_components.garmin_connect.services import async_setup_services
 from custom_components.garmin_connect.sleep_archive import SleepSchemaError, parse_sleep_sessions
@@ -84,14 +91,22 @@ def _dispatch_fixture_contract(stem: str, state: str, fixture: dict) -> str:
         return "empty"
     if state == "schema_drift":
         assert fixture.get("unknown_structural_field") == "redacted"
-        if stem == "garmin_sleep_structured":
-            try:
+        try:
+            if stem == "garmin_respiration_spo2":
+                normalize_respiration(fixture["respiration"], date(2026, 7, 24))
+            elif stem == "garmin_segmented_charts":
+                normalize_steps(fixture["steps"], date(2026, 7, 24))
+            elif stem == "garmin_sleep_streams":
+                parse_sleep_sessions(fixture, date(2026, 7, 24))
+            elif stem == "garmin_summary_training":
+                normalize_snapshot(fixture["daily_summary"], date(2026, 7, 24), DAILY_SUMMARY_FIELDS)
+            elif stem == "garmin_sleep_structured":
                 parse_sleep_sessions(fixture, date(2026, 2, 28))
-            except SleepSchemaError:
+            else:
                 return "schema-drift"
-            raise AssertionError("sleep schema drift was accepted")
-        # The other family drift contracts are checked by their adapters.
-        return "schema-drift"
+        except HistorySchemaError:
+            return "schema-drift"
+        raise AssertionError(f"{stem} schema drift was accepted")
     if stem == "garmin_sleep_streams":
         assert isinstance(fixture.get("sleepHeartRateValueDescriptorsDTOList"), list)
         assert fixture["sleepHeartRateValueDescriptorsDTOList"]
@@ -107,6 +122,16 @@ def _dispatch_fixture_contract(stem: str, state: str, fixture: dict) -> str:
         assert parse_sleep_sessions(source, date(2026, 2, 28))
     elif stem == "garmin_fit_structural_summary":
         assert persisted_fit_summary(source["summary"])
+    elif stem == "garmin_respiration_spo2":
+        assert normalize_respiration(source["respiration"], date(2026, 7, 24)).presence == "present"
+        assert normalize_spo2(source["spo2"], date(2026, 7, 24), "continuous").presence == "present"
+    elif stem == "garmin_segmented_charts":
+        assert normalize_steps(source["steps"], date(2026, 7, 24))
+    elif stem == "garmin_sleep_streams":
+        assert parse_sleep_sessions(source, date(2026, 7, 24))
+    elif stem == "garmin_summary_training":
+        assert normalize_snapshot(source["daily_summary"], date(2026, 7, 24), DAILY_SUMMARY_FIELDS)
+        assert normalize_snapshot(source["training_status"], date(2026, 7, 24), TRAINING_STATUS_FIELDS)
     if stem == "garmin_fit_structural_summary":
         assert isinstance(payload.get("message_counts"), dict)
         assert isinstance(payload.get("message_fields"), dict)

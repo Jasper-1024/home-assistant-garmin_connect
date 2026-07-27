@@ -1,1 +1,1 @@
-{"_provenance":"Sanitized chart schema-drift state; unknown structural field only.","_redaction_version":"3.1.0-beta.1","state":"schema_drift","steps":{"stepsValueDescriptorDTOList":[{"key":"time","index":0}]},"unknown_structural_field":"redacted"}
+{"_provenance":"Sanitized chart schema-drift state; known array type is invalid.","_redaction_version":"3.1.0-beta.1","state":"schema_drift","steps":{"stepsValueDescriptorDTOList":[{"key":"timestamp","index":0}],"stepsValuesArray":"redacted_schema_drift"},"unknown_structural_field":"redacted"}
