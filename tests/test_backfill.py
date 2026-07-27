@@ -6,8 +6,8 @@ from datetime import UTC, date, datetime
 import pytest
 
 from custom_components.garmin_connect.backfill import (
-    BACKFILL_START,
     BACKFILL_INTERVAL,
+    BACKFILL_START,
     BACKOFF_429,
     BackfillScheduler,
     BackfillState,
