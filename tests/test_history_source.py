@@ -7,11 +7,11 @@ import pytest
 from custom_components.garmin_connect.history_source import (
     HistorySchemaError,
     normalize_body_battery,
-    normalize_pair_series,
-    parse_hrv_data,
-    normalize_steps,
     normalize_floors,
     normalize_intensity,
+    normalize_pair_series,
+    normalize_steps,
+    parse_hrv_data,
 )
 
 

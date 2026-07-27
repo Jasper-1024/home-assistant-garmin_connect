@@ -16,6 +16,7 @@ from custom_components.garmin_connect.history_source import (
     HRVData,
     HRVSummary,
     NormalizedSample,
+    SegmentedData,
 )
 
 
@@ -104,6 +105,10 @@ async def test_archive_aggregates_import_classification_counts():
         RecorderWriteOutcome(2, skipped_count=2),
         RecorderWriteOutcome(0),
         RecorderWriteOutcome(0),
+        RecorderWriteOutcome(0),
+        RecorderWriteOutcome(0),
+        RecorderWriteOutcome(0),
+        RecorderWriteOutcome(0),
     ])
     archive = _sync_archive(source, recorder, _Store())
     await archive.async_start()
@@ -163,6 +168,10 @@ async def test_runtime_failure_can_retry():
             RecorderWriteOutcome(0),
             RecorderWriteOutcome(0),
             RecorderWriteOutcome(0),
+            RecorderWriteOutcome(0),
+            RecorderWriteOutcome(0),
+            RecorderWriteOutcome(0),
+            RecorderWriteOutcome(0),
         ]
     )
     archive = _sync_archive(source, recorder, _Store())
@@ -173,6 +182,25 @@ async def test_runtime_failure_can_retry():
 
     assert first.outcome == "failed"
     assert second.outcome == "written"
+
+
+@pytest.mark.asyncio
+async def test_segmented_daily_totals_write_separate_statistic():
+    class Source:
+        async def async_fetch_details(self, target_date, metric):
+            if metric == "steps":
+                return SegmentedData((), {"totalSteps": 7.0})
+            return ()
+
+    source = Source()
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = _sync_archive(source, recorder, _Store())
+    await archive.async_start()
+    await archive.async_sync_range(date(2026, 1, 1), date(2026, 1, 1))
+    statistic_ids = [call.args[0] for call in recorder.async_write.await_args_list]
+    assert any(statistic_id.endswith(":steps") for statistic_id in statistic_ids)
+    assert any(statistic_id.endswith(":steps_daily_total") for statistic_id in statistic_ids)
 
 
 @pytest.mark.asyncio

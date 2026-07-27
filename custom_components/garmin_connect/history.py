@@ -8,7 +8,7 @@ import logging
 import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime, time
 from enum import StrEnum
 from typing import Any, Protocol
 
@@ -23,13 +23,20 @@ from .const import (
 )
 from .history_recorder import (
     BODY_BATTERY_METADATA,
+    FLOORS_METADATA,
     HEART_RATE_METADATA,
+    MODERATE_INTENSITY_METADATA,
     NIGHTLY_HRV_METADATA,
     STEPS_METADATA,
-    FLOORS_METADATA,
-    MODERATE_INTENSITY_METADATA,
-    VIGOROUS_INTENSITY_METADATA,
     STRESS_METADATA,
+    VIGOROUS_INTENSITY_METADATA,
+    STEPS_DAILY_TOTAL_METADATA,
+    FLOORS_ASCENDED_DAILY_METADATA,
+    FLOORS_DESCENDED_DAILY_METADATA,
+    FLOORS_ASCENDED_METERS_DAILY_METADATA,
+    FLOORS_DESCENDED_METERS_DAILY_METADATA,
+    MODERATE_INTENSITY_DAILY_METADATA,
+    VIGOROUS_INTENSITY_DAILY_METADATA,
     GarminHistoryRecorder,
     RecorderWriteOutcome,
     statistic_id_for,
@@ -404,7 +411,7 @@ class GarminHistoryArchive:
                     ("intensity_moderate", MODERATE_INTENSITY_METADATA),
                     ("intensity_vigorous", VIGOROUS_INTENSITY_METADATA),
                 ):
-                    details_method = getattr(source, "async_fetch_details", None) if metric == "nightly_hrv" else None
+                    details_method = inspect.getattr_static(source, "async_fetch_details", None)
                     if callable(details_method):
                         details = details_method(target, metric)
                         if inspect.isawaitable(details):
@@ -428,6 +435,29 @@ class GarminHistoryArchive:
                     outcome: RecorderWriteOutcome = await recorder.async_write(
                         statistic_id_for(self._account_key(), metric), metadata, samples
                     )
+                    if isinstance(details, SegmentedData) and details.totals:
+                        total_metadata = {
+                            ("steps", "totalSteps"): STEPS_DAILY_TOTAL_METADATA,
+                            ("floors", "floorsAscended"): FLOORS_ASCENDED_DAILY_METADATA,
+                            ("floors", "floorsDescended"): FLOORS_DESCENDED_DAILY_METADATA,
+                            ("floors", "floorsAscendedInMeters"): FLOORS_ASCENDED_METERS_DAILY_METADATA,
+                            ("floors", "floorsDescendedInMeters"): FLOORS_DESCENDED_METERS_DAILY_METADATA,
+                            ("intensity_moderate", "moderateIntensityMinutes"): MODERATE_INTENSITY_DAILY_METADATA,
+                            ("intensity_vigorous", "vigorousIntensityMinutes"): VIGOROUS_INTENSITY_DAILY_METADATA,
+                        }
+                        for total_key, total_value in details.totals.items():
+                            total_metric = total_metadata.get((metric, total_key))
+                            if total_metric is None:
+                                continue
+                            total_sample = NormalizedSample(datetime.combine(target, time.min, tzinfo=UTC), target, target.isoformat(), total_value)
+                            total_outcome = await recorder.async_write(statistic_id_for(self._account_key(), total_metric.key), total_metric, (total_sample,))
+                            if total_outcome.outcome != "written":
+                                self._runtime_sync_failure = True
+                                self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, error_type=total_outcome.error_type or "sync_failed")
+                                return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome=total_outcome.outcome, error_type=total_outcome.error_type)
+                            inserted += getattr(total_outcome, "inserted_count", total_outcome.accepted_count)
+                            updated += getattr(total_outcome, "updated_count", 0)
+                            skipped += getattr(total_outcome, "skipped_count", 0)
                     if outcome.outcome != "written":
                         self._runtime_sync_failure = True
                         self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type=outcome.error_type or "sync_failed")

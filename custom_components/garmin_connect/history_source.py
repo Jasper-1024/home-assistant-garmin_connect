@@ -201,7 +201,7 @@ def normalize_steps(payload: Any, target_date: date) -> SegmentedData:
 
 def normalize_floors(payload: Any, target_date: date) -> SegmentedData:
     readings = _descriptor_segment(payload, target_date, ("floorsValues", "floorsValuesArray", "chartData", "data"), ("floors", "floorCount", "value"), ("floorsValueDescriptors", "floorsValueDescriptorsDTOList"))
-    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, ("floors", "floorCount", "value"), ("floors", "floorValues", "floorsValuesArray", "chartData", "data")), _totals(payload, ("floorsAscended", "floorsDescended", "totalFloors")))
+    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, ("floors", "floorCount", "value"), ("floors", "floorValues", "floorsValuesArray", "chartData", "data")), _totals(payload, ("floorsAscended", "floorsDescended", "floorsAscendedInMeters", "floorsDescendedInMeters", "totalFloors")))
 
 
 def normalize_intensity(payload: Any, target_date: date, kind: str) -> SegmentedData:
@@ -333,7 +333,7 @@ class GarminHistorySource:
         result = await self.async_fetch_details(target_date, metric)
         return result.readings if isinstance(result, (HRVData, SegmentedData)) else result
 
-    async def async_fetch_details(self, target_date: date, metric: str) -> tuple[NormalizedSample, ...] | HRVData:
+    async def async_fetch_details(self, target_date: date, metric: str) -> tuple[NormalizedSample, ...] | HRVData | SegmentedData:
         """Fetch a metric and retain private details needed by the archive."""
 
         async def request() -> Any:
