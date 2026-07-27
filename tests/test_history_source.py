@@ -115,6 +115,16 @@ async def test_timed_activities_uses_pagination_and_deduplicates_overlap() -> No
     assert len(result) == 1
 
 
+@pytest.mark.asyncio
+async def test_timed_activity_uses_local_fallback_date_across_utc_midnight() -> None:
+    client = MagicMock()
+    client.get_activities = AsyncMock(return_value=[{"activityId": 2, "activityType": "walking", "startTimeLocal": "2026-07-25T00:30:00+02:00", "durationInSeconds": 60}])
+    source = GarminHistorySource(client, _ImmediateGate())
+    result = await source.async_fetch_details(date(2026, 7, 25), "timed_activities")
+    assert len(result) == 1
+    assert result[0].calendar_date == date(2026, 7, 25)
+
+
 def test_health_event_revision_keeps_identity_and_rejects_bounds() -> None:
     first = normalize_health_events({"events": [{"source": "A", "type": "x", "category": "one", "occurrenceTime": "2026-07-24T00:00:00Z"}]}, date(2026, 7, 24))[0]
     revised = normalize_health_events({"events": [{"source": "B", "type": "x", "category": "two", "occurrenceTime": "2026-07-24T00:00:00Z"}]}, date(2026, 7, 24))[0]

@@ -160,12 +160,13 @@ def activity_from_record(record: Mapping[str, Any]) -> NormalizedActivity:
         end = _timestamp(record["end"]) if record.get("end") is not None else None
         calendar_date = date.fromisoformat(record["calendar_date"])
         values = (record.get("duration_seconds"), record.get("training_effect"), record.get("load"), record.get("recovery"))
-        if not isinstance(activity_type, str) or not isinstance(activity_id, str) or start is None or any(value is not None and (isinstance(value, bool) or not isinstance(value, int | float)) for value in values):
+        name = record.get("name")
+        if not isinstance(activity_type, str) or len(activity_type) > 64 or not isinstance(activity_id, str) or (name is not None and (not isinstance(name, str) or len(name) > 128)) or start is None or (end is not None and end <= start) or any(value is not None and (isinstance(value, bool) or not isinstance(value, int | float)) for value in values):
             raise HistorySchemaError("activity record is invalid")
-        logical_id, revision = _activity_hashes(activity_type, activity_id, start, end, values[0], record.get("name"), values[1], values[2], values[3])
+        logical_id, revision = _activity_hashes(activity_type, activity_id, start, end, values[0], name, values[1], values[2], values[3])
         if record.get("logical_id") != logical_id or record.get("revision") != revision:
             raise HistorySchemaError("activity record is inconsistent")
-        return NormalizedActivity(logical_id, activity_id, revision, activity_type, record.get("name") if isinstance(record.get("name"), str) else None, start, end, values[0], values[1], values[2], values[3], calendar_date)
+        return NormalizedActivity(logical_id, activity_id, revision, activity_type, name, start, end, values[0], values[1], values[2], values[3], calendar_date)
     except (KeyError, TypeError, ValueError) as err:
         raise HistorySchemaError("activity record is invalid") from err
 
@@ -751,7 +752,7 @@ class GarminHistorySource:
         if metric == "sleep_sessions":
             return parse_sleep_sessions(payload, target_date)
         if metric == "timed_activities":
-            return tuple(activity for activity in normalize_activities(payload, target_date) if activity.start.date() == target_date)
+            return tuple(activity for activity in normalize_activities(payload, target_date) if activity.calendar_date == target_date)
         if metric in {"health_events_daily", "health_events_body_battery"}:
             return normalize_health_events(payload, target_date)
         if not isinstance(payload, dict):
