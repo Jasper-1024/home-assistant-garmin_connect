@@ -120,6 +120,40 @@ async def test_coordinators_serialize_current_fetches_through_shared_gate() -> N
     await gate.async_close()
 
 
+async def test_token_update_stays_inside_current_request_slot() -> None:
+    """A following coordinator cannot fetch before token persistence finishes."""
+    hass, entry, client, auth = _inputs()
+    gate = GarminRequestGate()
+    token_update_started = asyncio.Event()
+    release_token_update = asyncio.Event()
+    second_started = asyncio.Event()
+
+    async def update_tokens() -> None:
+        token_update_started.set()
+        await release_token_update.wait()
+
+    async def second_fetch() -> dict:
+        second_started.set()
+        return {"source": "activity"}
+
+    client.fetch_core_data = AsyncMock(return_value={"source": "core"})
+    client.fetch_activity_data = second_fetch
+    core = CoreCoordinator(hass, entry, client, auth, gate)
+    activity = ActivityCoordinator(hass, entry, client, auth, gate)
+    core._update_tokens_if_changed = update_tokens
+
+    first_task = asyncio.create_task(core._async_update_data())
+    await token_update_started.wait()
+    second_task = asyncio.create_task(activity._async_update_data())
+    await asyncio.sleep(0)
+    assert not second_started.is_set()
+
+    release_token_update.set()
+    assert await first_task == {"source": "core"}
+    assert await second_task == {"source": "activity"}
+    await gate.async_close()
+
+
 async def test_auth_errors_keep_config_entry_auth_semantics() -> None:
     """A Garmin auth failure remains a Home Assistant auth failure."""
     hass, entry, client, auth = _inputs()

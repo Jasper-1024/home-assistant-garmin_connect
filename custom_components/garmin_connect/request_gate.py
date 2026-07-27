@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import TypeVar
+from typing import Any, TypeVar
 
 
 class GarminRequestPriority(IntEnum):
@@ -30,6 +30,7 @@ class _Waiter:
     priority: GarminRequestPriority
     sequence: int
     ready: asyncio.Future[None]
+    task: asyncio.Task[Any]
     granted: bool = False
 
 
@@ -39,8 +40,8 @@ class GarminRequestGate:
     The gate owns only request admission.  A caller supplies a zero-argument
     async requester, which is invoked after admission and released on every
     exit path.  Queued requests are ordered by priority and then arrival;
-    cancellation removes a waiter, and closing rejects future work and waits
-    for the active request to finish.
+    cancellation removes a waiter, and closing rejects future work and
+    cancels any active request before waiting for its release.
     """
 
     def __init__(self) -> None:
@@ -49,6 +50,7 @@ class GarminRequestGate:
         self._waiters: list[_Waiter] = []
         self._next_sequence = 0
         self._active = False
+        self._active_task: asyncio.Task[Any] | None = None
         self._closed = False
         self._idle = asyncio.Event()
         self._idle.set()
@@ -59,7 +61,10 @@ class GarminRequestGate:
         requester: Callable[[], Awaitable[_RequestResult]],
     ) -> _RequestResult:
         """Run one request after acquiring this account's priority slot."""
-        waiter = await self._async_enqueue(priority)
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("Garmin requests must run in an asyncio task")
+        waiter = await self._async_enqueue(priority, task)
         try:
             await waiter.ready
         except asyncio.CancelledError:
@@ -72,21 +77,29 @@ class GarminRequestGate:
             await self._async_release(waiter)
 
     async def async_close(self) -> None:
-        """Reject queued work and wait until the active request is released."""
+        """Reject queued work and cancel active work before returning."""
         async with self._lock:
             self._closed = True
             waiters = tuple(self._waiters)
             self._waiters.clear()
             for waiter in waiters:
                 waiter.ready.cancel()
+            active_task = self._active_task
             idle = self._idle
+
+        if active_task is asyncio.current_task():
+            return
+        if active_task is not None:
+            active_task.cancel()
 
         await idle.wait()
 
-    async def _async_enqueue(self, priority: GarminRequestPriority) -> _Waiter:
+    async def _async_enqueue(
+        self, priority: GarminRequestPriority, task: asyncio.Task[Any]
+    ) -> _Waiter:
         """Queue a request and grant it immediately when the gate is idle."""
         loop = asyncio.get_running_loop()
-        waiter = _Waiter(priority, self._next_sequence, loop.create_future())
+        waiter = _Waiter(priority, self._next_sequence, loop.create_future(), task)
 
         async with self._lock:
             if self._closed:
@@ -101,6 +114,7 @@ class GarminRequestGate:
         async with self._lock:
             if waiter.granted:
                 self._active = False
+                self._active_task = None
                 self._async_grant_next_locked()
                 if not self._active:
                     self._idle.set()
@@ -118,6 +132,7 @@ class GarminRequestGate:
             if not waiter.granted or not self._active:
                 return
             self._active = False
+            self._active_task = None
             self._async_grant_next_locked()
             if not self._active:
                 self._idle.set()
@@ -140,6 +155,7 @@ class GarminRequestGate:
             return
 
         self._active = True
+        self._active_task = waiter.task
         self._idle.clear()
         waiter.granted = True
         waiter.ready.set_result(None)

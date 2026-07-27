@@ -109,7 +109,7 @@ async def test_cancelled_waiter_is_removed_and_does_not_block_next_request() -> 
 
 
 async def test_closing_gate_cancels_waiters_and_waits_for_active_request() -> None:
-    """Unload closes queued work and does not return during an active request."""
+    """Unload cancels active and queued work without leaving the gate busy."""
     clock = ControllableClock()
     gate = GarminRequestGate()
     active = FakeRequester(clock, "active")
@@ -124,15 +124,36 @@ async def test_closing_gate_cancels_waiters_and_waits_for_active_request() -> No
 
     close_task = asyncio.create_task(gate.async_close())
     await asyncio.sleep(0)
-    assert not close_task.done()
 
     with pytest.raises(asyncio.CancelledError):
         await waiting_task
 
-    active.release.set()
-    await active_task
     await close_task
+    with pytest.raises(asyncio.CancelledError):
+        await active_task
     assert not waiting.started.is_set()
+
+
+async def test_cancelling_active_request_releases_the_gate() -> None:
+    """A cancelled in-flight requester cannot strand the next waiter."""
+    clock = ControllableClock()
+    gate = GarminRequestGate()
+    active = FakeRequester(clock, "active")
+    next_request = FakeRequester(clock, "next")
+
+    active_task = asyncio.create_task(gate.async_request(GarminRequestPriority.FOREGROUND, active))
+    await active.started.wait()
+    active_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await active_task
+
+    next_task = asyncio.create_task(
+        gate.async_request(GarminRequestPriority.FOREGROUND, next_request)
+    )
+    await next_request.started.wait()
+    next_request.release.set()
+    assert await next_task == "next"
+    await gate.async_close()
 
 
 async def test_separate_gates_do_not_block_each_other() -> None:
