@@ -630,6 +630,15 @@ async def test_timed_activity_archive_and_calendar_excludes_open_interval():
     assert len(events) == 1 and events[0].summary == "Morning Run"
 
 
+def test_activity_fixture_preserves_training_fields_and_excludes_raw_route() -> None:
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "garmin_activity_archive.json").read_text())
+    activity = normalize_activities(fixture["activities"], date(2026, 7, 24))[0]
+    assert activity.training_effect == 3.2
+    assert activity.load == 82.0
+    assert activity.recovery is None
+    assert not hasattr(activity, "polyline")
+
+
 @pytest.mark.asyncio
 async def test_calendar_loads_prior_year_partition_for_cross_year_sleep():
     session = parse_sleep_sessions(

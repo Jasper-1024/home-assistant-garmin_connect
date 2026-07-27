@@ -116,6 +116,20 @@ async def test_timed_activities_uses_pagination_and_deduplicates_overlap() -> No
 
 
 @pytest.mark.asyncio
+async def test_timed_activity_pagination_stops_on_older_page_and_excludes_move_iq() -> None:
+    client = MagicMock()
+    client.get_activities = AsyncMock(side_effect=[
+        [{"activityId": 1, "activityType": "running", "startTime": "2026-07-24T10:00:00Z", "endTime": "2026-07-24T11:00:00Z"}] * 100,
+        [{"activityId": 2, "activityType": "walking", "source": "MOVE_IQ", "startTime": "2026-07-23T12:00:00Z", "durationInSeconds": 60}],
+    ])
+    source = GarminHistorySource(client, _ImmediateGate())
+    result = await source.async_fetch_details(date(2026, 7, 24), "timed_activities")
+    assert len(result) == 1
+    assert client.get_activities.await_count == 2
+    assert client.get_activities.call_args_list[1].args == (100, 100)
+
+
+@pytest.mark.asyncio
 async def test_timed_activity_uses_local_fallback_date_across_utc_midnight() -> None:
     client = MagicMock()
     client.get_activities = AsyncMock(return_value=[{"activityId": 2, "activityType": "walking", "startTimeLocal": "2026-07-25T00:30:00+02:00", "durationInSeconds": 60}])

@@ -124,6 +124,10 @@ def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedAct
         if not isinstance(item, dict):
             raise HistorySchemaError("activity has invalid type")
         activity_type = item.get("activityType", item.get("activityTypeKey"))
+        family = str(item.get("source", item.get("eventType", ""))).lower()
+        type_key = str(activity_type).lower() if activity_type is not None else ""
+        if family in {"move_iq", "moveiq", "daily", "daily_event"} or type_key in {"move_iq", "moveiq", "daily", "daily_event"}:
+            continue
         start_raw = item.get("startTime", item.get("startTimeGMT", item.get("startTimeLocal")))
         activity_id = item.get("activityId", item.get("activityUUID"))
         end_raw = item.get("endTimeGMT", item.get("endTime"))
@@ -690,6 +694,19 @@ class GarminHistorySource:
                     if not isinstance(page_items, list) or not page_items:
                         break
                     pages.extend(page_items)
+                    page_dates = []
+                    for item in page_items:
+                        if not isinstance(item, dict):
+                            continue
+                        raw_start = item.get("startTime", item.get("startTimeGMT", item.get("startTimeLocal")))
+                        parsed_start = _timestamp(raw_start)
+                        if parsed_start is not None:
+                            if "startTime" not in item and "startTimeGMT" not in item and isinstance(raw_start, str):
+                                page_dates.append(datetime.fromisoformat(raw_start.replace("Z", "+00:00")).date())
+                            else:
+                                page_dates.append(parsed_start.date())
+                    if page_dates and all(page_date < target_date for page_date in page_dates):
+                        break
                     if len(page_items) < 100:
                         break
                 return {"activities": pages}

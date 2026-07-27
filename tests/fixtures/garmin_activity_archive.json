@@ -1,0 +1,20 @@
+{
+  "lastActivity": {
+    "activityId": 12345,
+    "activityName": "Morning Run",
+    "activityType": "running",
+    "startTime": "2026-07-24T23:30:00Z",
+    "endTimeGMT": "2026-07-25T00:30:00Z",
+    "durationInSeconds": 3600,
+    "aerobicTrainingEffect": 3.2,
+    "activityTrainingLoad": 82,
+    "recoveryTime": null,
+    "polyline": [{"lat": 25.0, "lon": 121.0}],
+    "fitFileId": "redacted-structural-only"
+  },
+  "activities": [
+    {"activityId": 12345, "activityName": "Morning Run", "activityType": "running", "startTime": "2026-07-24T23:30:00Z", "endTimeGMT": "2026-07-25T00:30:00Z", "durationInSeconds": 3600, "trainingEffect": 3.2, "activityTrainingLoad": 82, "recoveryTime": null},
+    {"activityId": 12344, "activityName": "Walk", "activityType": "walking", "startTime": "2026-07-23T10:00:00Z", "endTimeGMT": "2026-07-23T10:30:00Z", "durationInSeconds": 1800, "trainingEffect": null, "activityTrainingLoad": null, "recoveryTime": null}
+  ],
+  "fitEvidence": {"recordMessage": ["timestamp", "heart_rate", "distance"], "structuralOnly": true}
+}
