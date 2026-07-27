@@ -15,6 +15,7 @@ from custom_components.garmin_connect.fit_archive import (
     fit_record,
     inspect_fit,
     persisted_fit_summary,
+    validated_fit_summary,
 )
 
 
@@ -158,6 +159,14 @@ def test_fit_record_keeps_opaque_activity_association_and_rejects_mismatch() -> 
 def test_fit_record_rejects_inspector_file_metadata() -> None:
     with pytest.raises(FitArchiveError):
         fit_record({"logical_id": "a" * 24, "path": fit_file_name("a" * 24), "summary": _summary()})
+
+
+def test_inspector_summary_is_validated_then_stripped_for_persistence() -> None:
+    summary = validated_fit_summary(_summary())
+    assert "file" not in summary
+    assert set(summary) == {"message_counts", "message_fields", "time_coverage", "presence"}
+    with pytest.raises(FitArchiveError):
+        persisted_fit_summary(_summary())
 
 
 def test_fit_record_rejects_raw_or_unbounded_summary_fields() -> None:

@@ -95,6 +95,11 @@ def persisted_fit_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
     return _summary_without_file(summary, require_integrity=False)
 
 
+def validated_fit_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate an inspector result, then strip its transient file metadata."""
+    return _summary_without_file(summary, require_integrity=True)
+
+
 async def async_archive_fit(
     *,
     client: Any,
