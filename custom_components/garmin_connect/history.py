@@ -641,7 +641,7 @@ class GarminHistoryArchive:
         if start_date > end_date:
             return ()
         await self._async_load_sleep_partitions(
-            {str(year) for year in range(start_date.year, end_date.year + 1)}
+            {str(year) for year in range(start_date.year - 1, end_date.year + 2)}
         )
         events: dict[tuple[datetime, datetime, str], HistoryCalendarEvent] = {}
         for records in self._sleep_sessions.values():

@@ -35,7 +35,7 @@ from custom_components.garmin_connect.history_source import (
     SourceSeries,
     normalize_snapshot,
 )
-from custom_components.garmin_connect.sleep_archive import SleepSession
+from custom_components.garmin_connect.sleep_archive import SleepSession, parse_sleep_sessions, session_record
 
 
 class _Store:
@@ -466,3 +466,29 @@ async def test_restart_drops_missing_or_corrupt_sleep_partition_from_completed_i
         await archive.async_start()
         assert "2026-01-01" not in archive._completed_dates
         assert await archive.async_get_calendar_events("sleep", date(2026, 1, 1), date(2026, 1, 2)) == ()
+
+
+@pytest.mark.asyncio
+async def test_calendar_loads_prior_year_partition_for_cross_year_sleep():
+    session = parse_sleep_sessions(
+        {"startTime": "2025-12-31T22:00:00Z", "endTime": "2026-01-01T06:00:00Z"},
+        date(2025, 12, 31),
+    )[0]
+    catalog = _NamedStore({
+        "account_key": "opaque-account-key-1234567890", "schema_version": 1,
+        "completed_dates": [], "hrv_summaries": {}, "presence": {},
+        "sleep_schema_version": 1, "sleep_index": {"2025": [session.logical_id]},
+    })
+    stores = {
+        "garmin_connect.e.history_catalog": catalog,
+        "garmin_connect.e.sleep_2025": _NamedStore({
+            "account_key": "opaque-account-key-1234567890", "schema_version": 1,
+            "sleep_schema_version": 1, "year": "2025",
+            "sessions": {session.logical_id: session_record(session)},
+        }),
+    }
+    archive = _partition_archive(MagicMock(), MagicMock(), stores)
+    await archive.async_start()
+    events = await archive.async_get_calendar_events("sleep", date(2026, 1, 1), date(2026, 1, 1))
+    assert len(events) == 1
+    assert events[0].start.date() == date(2025, 12, 31)

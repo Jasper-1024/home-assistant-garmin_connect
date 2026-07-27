@@ -145,7 +145,9 @@ def parse_sleep_sessions(payload: Any, target_date: date) -> tuple[SleepSession,
         start, end = _parse_time(start_raw), _parse_time(end_raw)
         if end <= start:
             continue
-        logical_id = hashlib.sha256(f"{kind}:{start.isoformat()}:{end.isoformat()}".encode()).hexdigest()[:24]
+        canonical_start = start.astimezone(UTC).isoformat()
+        canonical_end = end.astimezone(UTC).isoformat()
+        logical_id = hashlib.sha256(f"{kind}:{canonical_start}:{canonical_end}".encode()).hexdigest()[:24]
         revision_payload = {
             "score": item.get("sleepScores", item.get("score", {})),
             "adjustments": item.get("adjustments"),
@@ -200,7 +202,9 @@ def session_from_record(record: dict[str, Any]) -> SleepSession:
             or not isinstance(score, dict)
         ):
             raise SleepSchemaError("sleep Store record is invalid")
-        expected_id = hashlib.sha256(f"{kind}:{start.isoformat()}:{end.isoformat()}".encode()).hexdigest()[:24]
+        expected_id = hashlib.sha256(
+            f"{kind}:{start.astimezone(UTC).isoformat()}:{end.astimezone(UTC).isoformat()}".encode()
+        ).hexdigest()[:24]
         if logical_id != expected_id:
             raise SleepSchemaError("sleep Store record is invalid")
         bounded_score = _bounded_structured(score)

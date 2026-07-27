@@ -43,7 +43,7 @@ def test_sleep_parser_rejects_known_shape_drift() -> None:
     with pytest.raises(SleepSchemaError):
         parse_sleep_sessions({"sleepData": {"napEvents": "bad"}}, date(2026, 7, 24))
     with pytest.raises(SleepSchemaError):
-        parse_sleep_sessions({"sleepData": {"napEvents": [{} , "bad"]}}, date(2026, 7, 24))
+        parse_sleep_sessions({"sleepData": {"napEvents": [{}, "bad"]}}, date(2026, 7, 24))
 
 
 def test_logical_id_is_stable_across_score_revisions() -> None:
@@ -105,3 +105,16 @@ def test_sleep_parser_handles_leap_day_and_overlap_identity() -> None:
     )[0]
     assert first == second
     assert first.calendar_date == date(2028, 2, 29)
+
+
+def test_sleep_logical_id_canonicalizes_equivalent_offsets() -> None:
+    first = parse_sleep_sessions(
+        {"startTime": "2026-07-23T22:00:00Z", "endTime": "2026-07-24T06:00:00Z"},
+        date(2026, 7, 24),
+    )[0]
+    second = parse_sleep_sessions(
+        {"startTime": "2026-07-24T00:00:00+02:00", "endTime": "2026-07-24T08:00:00+02:00"},
+        date(2026, 7, 24),
+    )[0]
+    assert first.logical_id == second.logical_id
+    assert first.start != second.start
