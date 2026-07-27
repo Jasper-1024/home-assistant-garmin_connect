@@ -228,7 +228,8 @@ def normalize_intensity(payload: Any, target_date: date, kind: str) -> Segmented
 def _descriptor_segment(payload: Any, target_date: date, values_keys: tuple[str, ...], value_keys: tuple[str, ...], descriptor_keys: tuple[str, ...]) -> tuple[NormalizedSample, ...] | None:
     if not isinstance(payload, dict) or not any(key in payload for key in descriptor_keys):
         return None
-    values_key = next((key for key in values_keys if key in payload), values_keys[0])
+    present = [key for key in values_keys if key in payload]
+    values_key = next((key for key in present if payload[key] not in (None, [])), present[0] if present else values_keys[0])
     return normalize_pair_series(payload, values_key=values_key, descriptor_keys=descriptor_keys, value_keys=value_keys, request_date=target_date)
 
 

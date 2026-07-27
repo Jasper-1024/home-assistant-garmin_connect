@@ -1,6 +1,8 @@
 """Tests for captured-shape Garmin history normalization."""
 
+import json
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 import pytest
 
@@ -184,3 +186,15 @@ def test_descriptor_index_beyond_point_width_is_schema_error() -> None:
             "stepsValueDescriptorDTOList": [{"key": "timestamp", "index": 0}, {"key": "steps", "index": 2}],
             "stepsValuesArray": [["2026-07-24T00:00:00Z", 1]],
         }, date(2026, 7, 24))
+
+
+def test_sanitized_captured_chart_fixture_preserves_nested_shapes() -> None:
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "garmin_segmented_charts.json").read_text())
+    steps = normalize_steps(fixture["steps"], date(2026, 7, 24))
+    floors = normalize_floors(fixture["floors"], date(2026, 7, 24))
+    intensity = normalize_intensity(fixture["intensity"], date(2026, 7, 24), "moderate")
+    assert len(steps.readings) == 8
+    assert len(floors.readings) == 6
+    assert len(intensity.readings) == 4
+    assert steps.totals == {"totalSteps": 12345.0}
+    assert floors.totals == {"floorsAscended": 10.0, "floorsDescended": 4.0}

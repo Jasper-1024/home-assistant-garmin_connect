@@ -1,0 +1,41 @@
+{
+  "_provenance": "Sanitized synthetic fixture preserving captured Garmin chart nesting and descriptor names; scalar values redacted/replaced.",
+  "steps": {
+    "summary": {"totalSteps": 12345, "goal": 15000, "distance": null},
+    "stepsValueDescriptorDTOList": [
+      {"key": "steps", "index": 2},
+      {"key": "timestamp", "index": 0},
+      {"key": "activityLevel", "index": 1}
+    ],
+    "stepsValuesArray": [
+      ["2026-07-24T00:00:00Z", "rest", 0],
+      ["2026-07-24T00:15:00Z", "active", 3],
+      ["2026-07-24T00:30:00Z", "active", 7],
+      ["2026-07-24T00:45:00Z", "rest", 0],
+      ["2026-07-24T01:00:00Z", "rest", 0],
+      ["2026-07-24T01:15:00Z", "active", 12],
+      ["2026-07-24T01:30:00Z", "active", 8],
+      ["2026-07-24T01:45:00Z", "rest", 0]
+    ]
+  },
+  "floors": {
+    "report": {"totals": {"floorsAscended": 10, "floorsDescended": 4}, "optionalGoal": null},
+    "floorsValueDescriptorDTOList": [
+      {"key": "floorCount", "index": 1},
+      {"key": "timestamp", "index": 0}
+    ],
+    "floorsValuesArray": [[0, 0], [60, 1], [120, 0], [180, 2], [240, 1], [300, 0]]
+  },
+  "intensity": {
+    "data": {"summary": {"moderateIntensityMinutes": 42, "vigorousIntensityMinutes": 8}, "optional": null},
+    "intensityValueDescriptorDTOList": [
+      {"key": "moderateIntensityMinutes", "index": 0},
+      {"key": "timestamp", "index": 1},
+      {"key": "activityLevel", "index": 2}
+    ],
+    "intensityValues": [],
+    "intensityValuesArray": [
+      [1, 0, "moderate"], [2, 900000, "moderate"], [0, 1800000, "rest"], [3, 2700000, "moderate"]
+    ]
+  }
+}
