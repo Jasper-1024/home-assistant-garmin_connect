@@ -98,6 +98,17 @@ def test_normalize_health_events_preserves_explicit_fields_only() -> None:
     assert events[1].event_type == "abnormalHeartRate"
     assert events[1].occurrence is not None
 
+
+def test_health_event_revision_keeps_identity_and_rejects_bounds() -> None:
+    first = normalize_health_events({"events": [{"source": "A", "type": "x", "category": "one", "occurrenceTime": "2026-07-24T00:00:00Z"}]}, date(2026, 7, 24))[0]
+    revised = normalize_health_events({"events": [{"source": "B", "type": "x", "category": "two", "occurrenceTime": "2026-07-24T00:00:00Z"}]}, date(2026, 7, 24))[0]
+    assert first.logical_id == revised.logical_id
+    assert first.revision != revised.revision
+    with pytest.raises(HistorySchemaError):
+        normalize_health_events({"events": [{}] * 513}, date(2026, 7, 24))
+    with pytest.raises(HistorySchemaError):
+        normalize_health_events({"events": [{"source": "x" * 65}]}, date(2026, 7, 24))
+
 def test_normalize_pair_series_rejects_incompatible_known_series() -> None:
     """A changed known field fails only this family/date."""
     with pytest.raises(HistorySchemaError):

@@ -34,6 +34,8 @@ from custom_components.garmin_connect.history_source import (
     SegmentedData,
     SourceSeries,
     normalize_snapshot,
+    NormalizedHealthEvent,
+    SnapshotData,
 )
 from custom_components.garmin_connect.sleep_archive import (
     SleepSession,
@@ -538,6 +540,49 @@ async def test_restart_drops_missing_or_corrupt_sleep_partition_from_completed_i
         await archive.async_start()
         assert "2026-01-01" not in archive._completed_dates
         assert await archive.async_get_calendar_events("sleep", date(2026, 1, 1), date(2026, 1, 2)) == ()
+
+
+@pytest.mark.asyncio
+async def test_health_events_archive_before_checkpoint_and_calendar_restart():
+    event = NormalizedHealthEvent("a" * 24, "b" * 16, date(2026, 7, 24), "MOVE_IQ", "walking", "activity", datetime(2026, 7, 24, 10, tzinfo=UTC), datetime(2026, 7, 24, 10, 15, tzinfo=UTC), None)
+
+    class Source:
+        async def async_fetch_details(self, target, metric):
+            if metric == "daily_summary":
+                return SnapshotData({}, datetime(2026, 7, 24, tzinfo=UTC), "2026-07-24", (event,))
+            if metric in {"health_events_daily", "health_events_body_battery"}:
+                return (event,) if metric == "health_events_daily" else ()
+            return ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    catalog = _NamedStore()
+    stores = {"garmin_connect.e.history_catalog": catalog}
+    archive = _partition_archive(Source(), recorder, stores)
+    await archive.async_start()
+    report = await archive.async_sync_range(date(2026, 7, 24), date(2026, 7, 24))
+    assert report.outcome == "written"
+    assert catalog.data["event_index"]["2026"] == [event.logical_id]
+    assert stores["garmin_connect.e.sleep_2026"].data["events"][event.logical_id]["source"] == "MOVE_IQ"
+    restarted = _partition_archive(Source(), recorder, stores)
+    await restarted.async_start()
+    events = await restarted.async_get_calendar_events("health", date(2026, 7, 24), date(2026, 7, 24))
+    assert len(events) == 1 and events[0].summary == "activity"
+    assert await restarted.async_get_calendar_events("health", date(2027, 1, 1), date(2027, 1, 1)) == ()
+
+
+@pytest.mark.asyncio
+async def test_corrupt_or_other_account_event_partition_is_ignored():
+    catalog_data = {"account_key": "opaque-account-key-1234567890", "schema_version": 1, "completed_dates": ["2026-07-24"], "hrv_summaries": {}, "presence": {}, "sleep_index": {}, "event_index": {"2026": ["a" * 24]}}
+    for partition in (
+        {"account_key": "other-account-key-1234567890", "year": "2026", "sessions": {}, "events": {}},
+        {"account_key": "opaque-account-key-1234567890", "year": "2026", "sessions": {}, "events": {"a" * 24: {"bad": True}}},
+    ):
+        stores = {"garmin_connect.e.history_catalog": _NamedStore(catalog_data), "garmin_connect.e.sleep_2026": _NamedStore(partition)}
+        archive = _partition_archive(MagicMock(), MagicMock(), stores)
+        await archive.async_start()
+        assert "2026-07-24" not in archive._completed_dates
+        assert await archive.async_get_calendar_events("health", date(2026, 7, 24), date(2026, 7, 24)) == ()
 
 
 @pytest.mark.asyncio

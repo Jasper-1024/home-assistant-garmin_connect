@@ -70,6 +70,8 @@ from .history_source import (
     SegmentedData,
     SnapshotData,
     SourceSeries,
+    health_event_from_record,
+    health_event_record,
 )
 from .sleep_archive import SleepSchemaError, SleepSession, session_from_record, session_record
 
@@ -625,12 +627,7 @@ class GarminHistoryArchive:
                 events_by_year = {year: dict(records) for year, records in self._health_events.items()}
                 for event in health_events:
                     year = str((event.start or event.occurrence or datetime.combine(event.calendar_date, time.min, tzinfo=UTC)).year)
-                    events_by_year.setdefault(year, {})[event.logical_id] = {
-                        "logical_id": event.logical_id, "revision": event.revision, "calendar_date": event.calendar_date.isoformat(),
-                        "source": event.source, "event_type": event.event_type, "category": event.category,
-                        "start": event.start.isoformat() if event.start else None, "end": event.end.isoformat() if event.end else None,
-                        "occurrence": event.occurrence.isoformat() if event.occurrence else None,
-                    }
+                    events_by_year.setdefault(year, {})[event.logical_id] = health_event_record(event)
                 processed.append(target)
                 completed_dates = self._completed_dates | {target_key}
                 await self._async_save_sleep_partitions(sleep_sessions, events_by_year)
@@ -767,13 +764,16 @@ class GarminHistoryArchive:
                 raw_events = partition.get("events", {})
                 if not isinstance(raw_events, Mapping):
                     raise SleepSchemaError("health event partition is invalid")
-                self._health_events[year] = {
-                    str(logical_id): dict(record)
-                    for logical_id, record in raw_events.items()
-                    if isinstance(logical_id, str) and isinstance(record, Mapping)
-                }
+                parsed_events: dict[str, dict[str, Any]] = {}
+                for logical_id, record in raw_events.items():
+                    restored_event = health_event_from_record(record)
+                    if restored_event.logical_id != logical_id:
+                        raise SleepSchemaError("health event partition is invalid")
+                    parsed_events[logical_id] = health_event_record(restored_event)
+                self._health_events[year] = parsed_events
             except (KeyError, TypeError, ValueError, OSError):
-                pass
+                self._sleep_sessions.pop(year, None)
+                self._health_events.pop(year, None)
 
     def _async_ensure_account_key(self) -> str:
         """Load or create the opaque identity persisted in the config entry."""

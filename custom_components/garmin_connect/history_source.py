@@ -90,6 +90,42 @@ class NormalizedHealthEvent:
     occurrence: datetime | None
 
 
+def health_event_record(event: NormalizedHealthEvent) -> dict[str, Any]:
+    return {
+        "logical_id": event.logical_id, "revision": event.revision,
+        "calendar_date": event.calendar_date.isoformat(), "source": event.source,
+        "event_type": event.event_type, "category": event.category,
+        "start": event.start.isoformat() if event.start else None,
+        "end": event.end.isoformat() if event.end else None,
+        "occurrence": event.occurrence.isoformat() if event.occurrence else None,
+    }
+
+
+def health_event_from_record(record: Mapping[str, Any]) -> NormalizedHealthEvent:
+    if not isinstance(record, Mapping):
+        raise HistorySchemaError("health event record is invalid")
+    strings = tuple(record.get(key) for key in ("source", "event_type", "category"))
+    if any(value is not None and (not isinstance(value, str) or len(value) > 64) for value in strings):
+        raise HistorySchemaError("health event record is invalid")
+    logical_id, revision = record.get("logical_id"), record.get("revision")
+    if not isinstance(logical_id, str) or len(logical_id) != 24 or any(char not in "0123456789abcdef" for char in logical_id):
+        raise HistorySchemaError("health event record is invalid")
+    if not isinstance(revision, str) or len(revision) != 16 or any(char not in "0123456789abcdef" for char in revision):
+        raise HistorySchemaError("health event record is invalid")
+    try:
+        calendar_date = date.fromisoformat(record["calendar_date"])
+        values = {
+            key: (_timestamp(record[key]) if record.get(key) is not None else None)
+            for key in ("start", "end", "occurrence")
+        }
+    except (KeyError, TypeError, ValueError) as err:
+        raise HistorySchemaError("health event record is invalid") from err
+    if any(record.get(key) is not None and values[key] is None for key in values):
+        raise HistorySchemaError("health event record is invalid")
+    event = NormalizedHealthEvent(logical_id, revision, calendar_date, *strings, values["start"], values["end"], values["occurrence"])
+    return event
+
+
 HistorySeries = tuple[NormalizedSample, ...]
 HistoryResult = HistorySeries | tuple[SleepSession, ...] | tuple[NormalizedHealthEvent, ...]
 HistoryDetails = HistorySeries | HRVData | SegmentedData | SourceSeries | SnapshotData | tuple[SleepSession, ...] | tuple[NormalizedHealthEvent, ...]
@@ -119,6 +155,8 @@ def normalize_health_events(payload: Any, target_date: date) -> tuple[Normalized
         raw_events = [raw_events]
     if not isinstance(raw_events, list):
         raise HistorySchemaError("health events have invalid type")
+    if len(raw_events) > 512:
+        raise HistorySchemaError("health event batch exceeds bounded limit")
     result: dict[str, NormalizedHealthEvent] = {}
     for event in raw_events[:512]:
         if not isinstance(event, dict):
@@ -126,7 +164,7 @@ def normalize_health_events(payload: Any, target_date: date) -> tuple[Normalized
         source = next((event[key] for key in ("source", "eventSource") if key in event), None)
         event_type = next((event[key] for key in ("type", "eventType") if key in event), None)
         category = next((event[key] for key in ("category", "eventCategory") if key in event), None)
-        if any(value is not None and not isinstance(value, str) for value in (source, event_type, category)):
+        if any(value is not None and (not isinstance(value, str) or len(value) > 64) for value in (source, event_type, category)):
             raise HistorySchemaError("health event identity has invalid type")
         def event_time(event_data: dict[str, Any], names: tuple[str, ...]) -> datetime | None:
             value = next((event_data[key] for key in names if key in event_data), None)
@@ -134,9 +172,9 @@ def normalize_health_events(payload: Any, target_date: date) -> tuple[Normalized
         start = event_time(event, ("startTime", "startTimeGMT", "start"))
         end = event_time(event, ("endTime", "endTimeGMT", "end"))
         occurrence = event_time(event, ("occurrenceTime", "occurrenceTimeGMT", "eventTime", "timestamp", "time"))
-        identity = (source, event_type, category, start.isoformat() if start else None, end.isoformat() if end else None, occurrence.isoformat() if occurrence else None)
+        identity = (event_type or "event", start.isoformat() if start else None, end.isoformat() if end else None, occurrence.isoformat() if occurrence else None)
         logical_id = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()[:24]
-        revision = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+        revision = hashlib.sha256(json.dumps((source, event_type, category, identity), sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
         result[logical_id] = NormalizedHealthEvent(logical_id, revision, target_date, source, event_type, category, start, end, occurrence)
     return tuple(sorted(result.values(), key=lambda item: (item.start or item.occurrence or datetime.min.replace(tzinfo=UTC), item.logical_id)))
 
