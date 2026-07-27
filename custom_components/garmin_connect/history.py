@@ -16,7 +16,12 @@ from typing import Any, Protocol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .backfill import BackfillScheduler, BackfillState, classify_backfill_error, next_backfill_date
+from .backfill import (
+    BackfillScheduler,
+    BackfillState,
+    classify_backfill_error,
+    count_uncompleted_dates,
+)
 from .const import (
     CONF_HISTORY_ACCOUNT_KEY,
     DOMAIN,
@@ -478,7 +483,7 @@ class GarminHistoryArchive:
             updated["backfill"] = dict(state)
             await self._store.async_save(updated)
         parsed = BackfillState.from_record(state)
-        queued = 0 if next_backfill_date(parsed, date.today()) is None else 1
+        queued = count_uncompleted_dates(parsed, date.today())
         self._status = replace(self._status, queued_count=queued, completed_count=len(parsed.completed_dates), next_eligible_run=parsed.next_run.isoformat() if parsed.next_run else None, last_success=parsed.last_success.isoformat() if parsed.last_success else None, backoff_until=parsed.backoff_until.isoformat() if parsed.backoff_until else None, safe_error_class=parsed.error_type)
 
     async def _async_backfill_reauth(self) -> None:
@@ -510,7 +515,7 @@ class GarminHistoryArchive:
         request_gate = getattr(runtime_data, "request_gate", None)
         if client is None:
             self._runtime_sync_failure = True
-            self._status = HistoryStatus(HistoryArchiveState.FAILED, error_type="integration_not_loaded")
+            self._status = HistoryStatus(HistoryArchiveState.FAILED, error_type="integration_not_loaded", **self._backfill_status_fields())
             return HistorySyncReport(outcome="failed", error_type="integration_not_loaded")
         source = (self._source_factory or GarminHistorySource)(client, request_gate)
         if self._recorder_adapter is None:
@@ -524,7 +529,7 @@ class GarminHistoryArchive:
         store = self._store
         if store is None:
             self._runtime_sync_failure = True
-            self._status = HistoryStatus(HistoryArchiveState.FAILED, error_type="store_unavailable")
+            self._status = HistoryStatus(HistoryArchiveState.FAILED, error_type="store_unavailable", **self._backfill_status_fields())
             return HistorySyncReport(outcome="failed", error_type="store_unavailable")
         processed: list[date] = []
         skipped = 0
@@ -656,14 +661,14 @@ class GarminHistoryArchive:
                             total_outcome = await recorder.async_write(statistic_id_for(self._account_key(), total_metric.key), total_metric, (total_sample,))
                             if total_outcome.outcome != "written":
                                 self._runtime_sync_failure = True
-                                self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, error_type=total_outcome.error_type or "sync_failed")
+                                self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, error_type=total_outcome.error_type or "sync_failed", **self._backfill_status_fields())
                                 return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome=total_outcome.outcome, error_type=total_outcome.error_type)
                             inserted += getattr(total_outcome, "inserted_count", total_outcome.accepted_count)
                             updated += getattr(total_outcome, "updated_count", 0)
                             skipped += getattr(total_outcome, "skipped_count", 0)
                     if outcome.outcome != "written":
                         self._runtime_sync_failure = True
-                        self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type=outcome.error_type or "sync_failed")
+                        self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type=outcome.error_type or "sync_failed", **self._backfill_status_fields())
                         return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome=outcome.outcome, error_type=outcome.error_type)
                     inserted += getattr(outcome, "inserted_count", outcome.accepted_count)
                     updated += getattr(outcome, "updated_count", 0)
@@ -757,7 +762,7 @@ class GarminHistoryArchive:
                 raise
             except (AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError) as error:
                 self._runtime_sync_failure = True
-                self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type="sync_failed")
+                self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type="sync_failed", **self._backfill_status_fields())
                 return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome="failed", error_type=classify_backfill_error(error))
         self._runtime_sync_failure = False
         self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=end_date.isoformat(), processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())

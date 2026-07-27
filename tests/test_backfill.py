@@ -10,6 +10,7 @@ from custom_components.garmin_connect.backfill import (
     BackfillScheduler,
     BackfillState,
     classify_backfill_error,
+    count_uncompleted_dates,
     next_backfill_date,
 )
 
@@ -26,6 +27,7 @@ def test_backfill_state_round_trips_checkpoint_and_backoff() -> None:
     state = BackfillState(frozenset({"2026-01-01"}), now, now + BACKOFF_429, now, "rate_limited")
     restored = BackfillState.from_record(state.as_record())
     assert restored == state
+    assert count_uncompleted_dates(BackfillState(frozenset({"2026-01-01"})), date(2026, 1, 3)) == 2
 
 
 def test_backfill_error_classes_are_bounded() -> None:

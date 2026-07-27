@@ -76,6 +76,18 @@ def next_backfill_date(state: BackfillState, today: date) -> date | None:
     return None
 
 
+def count_uncompleted_dates(state: BackfillState, today: date) -> int:
+    """Count dates eligible for conservative backfill."""
+    if today < BACKFILL_START:
+        return 0
+    total = (today - BACKFILL_START).days + 1
+    completed = sum(
+        (BACKFILL_START + timedelta(days=offset)).isoformat() in state.completed_dates
+        for offset in range(total)
+    )
+    return total - completed
+
+
 class BackfillScheduler:
     """One-account scheduler; all network work is delegated to the archive."""
 
@@ -119,7 +131,7 @@ class BackfillScheduler:
             self.state = BackfillState(self.state.completed_dates | {target.isoformat()}, now + BACKFILL_INTERVAL, None, now, None)
         except asyncio.CancelledError:
             raise
-        except BaseException as error:
+        except Exception as error:
             error_type = classify_backfill_error(error)
             backoff = now + BACKOFF_429 if error_type == "rate_limited" else self.state.backoff_until
             disabled = self.state.disabled_paths
