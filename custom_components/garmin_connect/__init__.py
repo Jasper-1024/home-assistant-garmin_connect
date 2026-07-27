@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import cast
 
 from ha_garmin import GarminAuth, GarminClient
 from homeassistant.config_entries import ConfigEntryNotReady
@@ -240,7 +241,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: GarminConnectConfigEntr
     if isinstance(history_archive, GarminHistoryArchive):
         await history_archive.async_stop()
 
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    unload_ok = cast(bool, await hass.config_entries.async_unload_platforms(entry, PLATFORMS))
 
     if unload_ok and len(hass.config_entries.async_entries(DOMAIN)) == 1:
         await async_unload_services(hass)
