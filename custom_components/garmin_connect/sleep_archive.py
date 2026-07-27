@@ -76,6 +76,8 @@ def _structured_list(value: Any) -> tuple[Any, ...]:
         return ()
     if not isinstance(value, list):
         raise SleepSchemaError("sleep structured collection has invalid type")
+    if value and all(item is None or isinstance(item, (int, float, bool)) for item in value):
+        raise SleepSchemaError("numeric sleep arrays are excluded")
     return tuple(_bounded_structured(item) for item in value)
 
 
