@@ -65,7 +65,9 @@ def classify_backfill_error(error: BaseException) -> str:
 
 
 def next_backfill_date(state: BackfillState, today: date) -> date | None:
-    end = max(today, BACKFILL_START)
+    if today < BACKFILL_START:
+        return None
+    end = today
     for offset in range((end - BACKFILL_START).days + 1):
         target = BACKFILL_START + timedelta(days=offset)
         if target.isoformat() not in state.completed_dates:

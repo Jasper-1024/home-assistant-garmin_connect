@@ -186,6 +186,12 @@ async def test_status_sensor_exposes_only_privacy_safe_placeholders() -> None:
         "processed_dates",
         "record_count",
         "error_type",
+        "queued_count",
+        "completed_count",
+        "next_eligible_run",
+        "last_success",
+        "backoff_until",
+        "safe_error_class",
     }
     assert "history_account_key" not in sensor.extra_state_attributes
 

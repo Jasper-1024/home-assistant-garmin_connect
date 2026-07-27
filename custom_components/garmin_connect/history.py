@@ -427,7 +427,8 @@ class GarminHistoryArchive:
             sync_date=lambda target: self.async_sync_range(target, target),
             reauth=self._async_backfill_reauth,
         )
-        self._backfill_task = asyncio.create_task(self._backfill.async_run())
+        if isinstance(self._hass, HomeAssistant):
+            self._backfill_task = self._hass.async_create_task(self._backfill.async_run())
 
     async def async_stop(self) -> None:
         """Stop archive tasks and leave no background work behind."""

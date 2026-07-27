@@ -17,7 +17,7 @@ from custom_components.garmin_connect.backfill import (
 def test_backfill_selects_first_uncompleted_date() -> None:
     state = BackfillState(frozenset({"2026-01-01", "2026-01-03"}))
     assert next_backfill_date(state, date(2026, 1, 3)) == date(2026, 1, 2)
-    assert next_backfill_date(BackfillState(frozenset({"2026-01-01"})), date(2026, 1, 1)) == date(2026, 1, 2)
+    assert next_backfill_date(BackfillState(frozenset({"2026-01-01"})), date(2026, 1, 1)) is None
     assert BACKFILL_START == date(2026, 1, 1)
 
 
@@ -45,6 +45,7 @@ async def test_401_reauth_once_and_403_disable_path() -> None:
     now = datetime(2026, 2, 1, tzinfo=UTC)
     reauth_calls: list[int] = []
     attempts: list[int] = []
+    persisted: dict = {}
 
     class UnauthorizedError(Exception):
         status_code = 401
@@ -57,10 +58,10 @@ async def test_401_reauth_once_and_403_disable_path() -> None:
         reauth_calls.append(1)
 
     async def save_state(state: dict) -> None:
-        return None
+        persisted.update(state)
 
     async def load_state() -> dict:
-        return {}
+        return persisted
 
     scheduler = BackfillScheduler(load_state=load_state, save_state=save_state, sync_date=sync_date, reauth=reauth, now=lambda: now)
     await scheduler.async_run_once()
