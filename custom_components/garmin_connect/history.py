@@ -23,25 +23,31 @@ from .const import (
 )
 from .history_recorder import (
     BODY_BATTERY_METADATA,
+    FLOORS_ASCENDED_DAILY_METADATA,
+    FLOORS_ASCENDED_METERS_DAILY_METADATA,
+    FLOORS_DESCENDED_DAILY_METADATA,
+    FLOORS_DESCENDED_METERS_DAILY_METADATA,
     FLOORS_METADATA,
     HEART_RATE_METADATA,
+    MODERATE_INTENSITY_DAILY_METADATA,
     MODERATE_INTENSITY_METADATA,
     NIGHTLY_HRV_METADATA,
+    STEPS_DAILY_TOTAL_METADATA,
     STEPS_METADATA,
     STRESS_METADATA,
-    VIGOROUS_INTENSITY_METADATA,
-    STEPS_DAILY_TOTAL_METADATA,
-    FLOORS_ASCENDED_DAILY_METADATA,
-    FLOORS_DESCENDED_DAILY_METADATA,
-    FLOORS_ASCENDED_METERS_DAILY_METADATA,
-    FLOORS_DESCENDED_METERS_DAILY_METADATA,
-    MODERATE_INTENSITY_DAILY_METADATA,
     VIGOROUS_INTENSITY_DAILY_METADATA,
+    VIGOROUS_INTENSITY_METADATA,
     GarminHistoryRecorder,
     RecorderWriteOutcome,
     statistic_id_for,
 )
-from .history_source import GarminHistorySource, HRVData, HRVSummary, SegmentedData
+from .history_source import (
+    GarminHistorySource,
+    HRVData,
+    HRVSummary,
+    NormalizedSample,
+    SegmentedData,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -411,12 +417,22 @@ class GarminHistoryArchive:
                     ("intensity_moderate", MODERATE_INTENSITY_METADATA),
                     ("intensity_vigorous", VIGOROUS_INTENSITY_METADATA),
                 ):
-                    details_method = inspect.getattr_static(source, "async_fetch_details", None)
-                    if callable(details_method):
-                        details = details_method(target, metric)
-                        if inspect.isawaitable(details):
-                            details = await details
-                    else:
+                    try:
+                        details_descriptor = inspect.getattr_static(source, "async_fetch_details")
+                    except AttributeError:
+                        details_descriptor = None
+                    details = None
+                    if callable(details_descriptor):
+                        bound_details = source.async_fetch_details
+                        if inspect.iscoroutinefunction(details_descriptor) or inspect.iscoroutinefunction(bound_details):
+                            details = bound_details(target, metric)
+                        elif callable(bound_details):
+                            candidate = bound_details(target, metric)
+                            if inspect.isawaitable(candidate) or isinstance(candidate, (HRVData, SegmentedData, tuple)):
+                                details = candidate
+                    if inspect.isawaitable(details):
+                        details = await details
+                    if not isinstance(details, (HRVData, SegmentedData, tuple)):
                         details = await source.async_fetch(target, metric)
                     if isinstance(details, HRVData):
                         samples = details.readings
