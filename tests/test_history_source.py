@@ -1,12 +1,14 @@
 """Tests for captured-shape Garmin history normalization."""
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 
 from custom_components.garmin_connect.history_source import (
     HistorySchemaError,
     normalize_pair_series,
+    normalize_body_battery,
+    parse_hrv_data,
 )
 
 
@@ -79,3 +81,35 @@ def test_normalize_pair_series_rejects_incompatible_known_series() -> None:
             descriptor_keys=("heartRateValueDescriptors",),
             value_keys=("heartRate",),
         )
+
+
+def test_body_battery_selects_daily_report_and_revises_irregular_times() -> None:
+    payload = [
+        {"calendarDate": "2026-07-25", "bodyBatteryValuesArray": []},
+        {
+            "calendarDate": "2026-07-24",
+            "bodyBatteryValueDescriptorsDTOList": [
+                {"key": "bodyBatteryValue", "index": 2}, {"key": "timestamp", "index": 0}, {"key": "unknown", "index": 1}
+            ],
+            "bodyBatteryValuesArray": [
+                ["2026-07-24T23:59:00Z", "x", 0],
+                ["2026-07-24T01:02:03Z", "x", 44],
+                ["2026-07-24T01:02:03Z", "revision", 45],
+            ],
+        },
+    ]
+    samples = normalize_body_battery(payload, date(2026, 7, 24))
+    assert [(sample.value, sample.raw_timestamp) for sample in samples] == [(45.0, "2026-07-24T01:02:03Z"), (0.0, "2026-07-24T23:59:00Z")]
+
+
+def test_hrv_raw_readings_tolerate_missing_summary_and_keep_zero() -> None:
+    parsed = parse_hrv_data(
+        {"hrvReadings": [
+            {"readingTimeGMT": "2026-07-24T23:59:00Z", "hrvValue": 0, "unknown": True},
+            {"readingTimeGmt": "2026-07-24T01:00:00Z", "value": 42},
+            {"readingTime": "2026-07-24T01:00:00Z", "hrvValue": 43},
+            {"readingTime": "2026-07-24T02:00:00Z", "hrvValue": None},
+        ]}, date(2026, 7, 24)
+    )
+    assert [sample.value for sample in parsed.readings] == [43.0, 0.0]
+    assert parsed.summary is None

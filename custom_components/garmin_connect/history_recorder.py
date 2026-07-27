@@ -32,6 +32,8 @@ class HistoryMetricMetadata:
 
 HEART_RATE_METADATA = HistoryMetricMetadata("heart_rate", "Heart rate", "bpm")
 STRESS_METADATA = HistoryMetricMetadata("stress", "Stress", "unitless")
+BODY_BATTERY_METADATA = HistoryMetricMetadata("body_battery", "Body Battery", "unitless")
+NIGHTLY_HRV_METADATA = HistoryMetricMetadata("nightly_hrv", "Nightly HRV", "ms")
 
 
 @dataclass(frozen=True, slots=True)

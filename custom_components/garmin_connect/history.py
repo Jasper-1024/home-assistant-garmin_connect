@@ -24,6 +24,8 @@ from .const import (
 from .history_recorder import (
     HEART_RATE_METADATA,
     STRESS_METADATA,
+    BODY_BATTERY_METADATA,
+    NIGHTLY_HRV_METADATA,
     GarminHistoryRecorder,
     RecorderWriteOutcome,
     statistic_id_for,
@@ -366,7 +368,12 @@ class GarminHistoryArchive:
                 continue
             self._status = HistoryStatus(HistoryArchiveState.RUNNING, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated)
             try:
-                for metric, metadata in (("heart_rate", HEART_RATE_METADATA), ("stress", STRESS_METADATA)):
+                for metric, metadata in (
+                    ("heart_rate", HEART_RATE_METADATA),
+                    ("stress", STRESS_METADATA),
+                    ("body_battery", BODY_BATTERY_METADATA),
+                    ("nightly_hrv", NIGHTLY_HRV_METADATA),
+                ):
                     samples = await source.async_fetch(target, metric)
                     outcome: RecorderWriteOutcome = await recorder.async_write(
                         statistic_id_for(self._account_key(), metric), metadata, samples

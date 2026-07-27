@@ -26,6 +26,22 @@ class NormalizedSample:
     value: float
 
 
+@dataclass(frozen=True, slots=True)
+class HRVSummary:
+    """Bounded HRV summary metadata, kept separate from raw readings."""
+
+    status: str | None = None
+    baseline: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class HRVData:
+    """Raw HRV readings plus an optional, bounded summary."""
+
+    readings: tuple[NormalizedSample, ...]
+    summary: HRVSummary | None = None
+
+
 def _timestamp(value: Any) -> datetime | None:
     if isinstance(value, bool):
         return None
@@ -114,6 +130,68 @@ def normalize_pair_series(
     return tuple(latest[key] for key in sorted(latest))
 
 
+def _select_daily_report(payload: Any, target_date: date) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        for key in ("bodyBatteryReports", "reports", "dailyReports"):
+            if key in payload:
+                return _select_daily_report(payload[key], target_date)
+        return payload
+    if not isinstance(payload, list):
+        raise HistorySchemaError("body battery reports are not an array")
+    for report in payload:
+        if not isinstance(report, dict):
+            raise HistorySchemaError("body battery report is not an object")
+        for key in ("calendarDate", "date", "reportDate"):
+            value = report.get(key)
+            if isinstance(value, str) and value[:10] == target_date.isoformat():
+                return report
+    return {}
+
+
+def normalize_body_battery(payload: Any, target_date: date) -> tuple[NormalizedSample, ...]:
+    """Normalize one daily body-battery report with descriptor-defined columns."""
+    report = _select_daily_report(payload, target_date)
+    return normalize_pair_series(
+        report,
+        values_key="bodyBatteryValuesArray",
+        descriptor_keys=(
+            "bodyBatteryValueDescriptorsDTOList",
+            "bodyBatteryValueDescriptorsDtoList",
+            "bodyBatteryValueDescriptors",
+        ),
+        value_keys=("bodyBatteryValue", "bodyBatteryLevel", "value"),
+        request_date=target_date,
+    )
+
+
+def parse_hrv_data(payload: Any, target_date: date) -> HRVData:
+    """Parse HRV readings while tolerating absent summary fields."""
+    if not isinstance(payload, dict):
+        raise HistorySchemaError("HRV payload is not an object")
+    raw_readings = payload.get("hrvReadings", [])
+    if raw_readings is None:
+        raw_readings = []
+    if not isinstance(raw_readings, list):
+        raise HistorySchemaError("HRV readings are not an array")
+    readings: list[NormalizedSample] = []
+    for reading in raw_readings:
+        if not isinstance(reading, dict):
+            raise HistorySchemaError("HRV reading is not an object")
+        raw_time = next((reading[key] for key in ("readingTimeGMT", "readingTimeGmt", "readingTime") if key in reading), None)
+        raw_value = next((reading[key] for key in ("hrvValue", "value") if key in reading), None)
+        parsed = _timestamp(raw_time)
+        if parsed is None or isinstance(raw_value, bool) or not isinstance(raw_value, int | float):
+            continue
+        readings.append(NormalizedSample(parsed, target_date, raw_time, float(raw_value)))
+    latest = {sample.timestamp: sample for sample in readings}
+    status = payload.get("status")
+    baseline = payload.get("baseline")
+    summary_status = status if isinstance(status, str) else None
+    summary_baseline = float(baseline) if isinstance(baseline, int | float) and not isinstance(baseline, bool) else None
+    summary = HRVSummary(summary_status, summary_baseline) if summary_status is not None or summary_baseline is not None else None
+    return HRVData(tuple(latest[key] for key in sorted(latest)), summary)
+
+
 class GarminHistorySource:
     """Small serialized adapter for Garmin intraday endpoints."""
 
@@ -137,9 +215,20 @@ class GarminHistorySource:
                 return await self.client._request(
                     "GET", f"{base}/wellness-service/wellness/dailyStress/{target_date.isoformat()}"
                 )
+            if metric == "body_battery":
+                return await self.client._request(
+                    "GET", f"{base}/wellness-service/wellness/bodyBattery/reports/daily",
+                    params={"date": target_date.isoformat()},
+                )
+            if metric == "nightly_hrv":
+                return await self.client._get_hrv_data_raw(target_date)
             raise ValueError(f"unsupported history metric: {metric}")
 
         payload = await self.request_gate.async_request(GarminRequestPriority.BACKGROUND, request)
+        if metric == "body_battery":
+            return normalize_body_battery(payload, target_date)
+        if metric == "nightly_hrv":
+            return parse_hrv_data(payload, target_date).readings
         if not isinstance(payload, dict):
             return ()
         if metric == "heart_rate":
