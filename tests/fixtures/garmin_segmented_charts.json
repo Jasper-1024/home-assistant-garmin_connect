@@ -30,12 +30,13 @@
     "data": {"summary": {"moderateIntensityMinutes": 42, "vigorousIntensityMinutes": 8}, "optional": null},
     "intensityValueDescriptorDTOList": [
       {"key": "moderateIntensityMinutes", "index": 0},
-      {"key": "timestamp", "index": 1},
-      {"key": "activityLevel", "index": 2}
+      {"key": "vigorousIntensityMinutes", "index": 1},
+      {"key": "timestamp", "index": 2},
+      {"key": "activityLevel", "index": 3}
     ],
     "intensityValues": [],
     "intensityValuesArray": [
-      [1, 0, "moderate"], [2, 900000, "moderate"], [0, 1800000, "rest"], [3, 2700000, "moderate"]
+      [1, 0, 0, "moderate"], [2, 1, 900000, "moderate"], [0, 0, 1800000, "rest"], [3, 2, 2700000, "moderate"]
     ]
   }
 }

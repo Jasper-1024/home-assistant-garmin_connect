@@ -193,8 +193,12 @@ def test_sanitized_captured_chart_fixture_preserves_nested_shapes() -> None:
     steps = normalize_steps(fixture["steps"], date(2026, 7, 24))
     floors = normalize_floors(fixture["floors"], date(2026, 7, 24))
     intensity = normalize_intensity(fixture["intensity"], date(2026, 7, 24), "moderate")
+    vigorous = normalize_intensity(fixture["intensity"], date(2026, 7, 24), "vigorous")
     assert len(steps.readings) == 8
     assert len(floors.readings) == 6
     assert len(intensity.readings) == 4
+    assert len(vigorous.readings) == 4
     assert steps.totals == {"totalSteps": 12345.0}
     assert floors.totals == {"floorsAscended": 10.0, "floorsDescended": 4.0}
+    assert intensity.totals == vigorous.totals
+    assert [sample.value for sample in vigorous.readings] == [0.0, 1.0, 0.0, 2.0]
