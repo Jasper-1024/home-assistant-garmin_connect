@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from custom_components.garmin_connect.diagnostics import async_get_config_entry_diagnostics
-from custom_components.garmin_connect.fit_archive import persisted_fit_summary
+from custom_components.garmin_connect.fit_archive import FitArchiveError, persisted_fit_summary
 from custom_components.garmin_connect.history import (
     GarminHistoryArchive,
     HistoryArchiveState,
@@ -102,9 +102,15 @@ def _dispatch_fixture_contract(stem: str, state: str, fixture: dict) -> str:
                 normalize_snapshot(fixture["daily_summary"], date(2026, 7, 24), DAILY_SUMMARY_FIELDS)
             elif stem == "garmin_sleep_structured":
                 parse_sleep_sessions(fixture, date(2026, 2, 28))
+            elif stem == "garmin_activity_archive":
+                normalize_activities([fixture["lastActivity"]], date(2026, 7, 24))
+            elif stem == "garmin_health_events":
+                normalize_health_events(fixture["events"], date(2026, 7, 24))
+            elif stem == "garmin_fit_structural_summary":
+                persisted_fit_summary(fixture["summary"])
             else:
                 return "schema-drift"
-        except (HistorySchemaError, SleepSchemaError):
+        except (FitArchiveError, HistorySchemaError, SleepSchemaError):
             return "schema-drift"
         raise AssertionError(f"{stem} schema drift was accepted")
     if stem == "garmin_sleep_streams":
