@@ -833,20 +833,33 @@ class GarminHistoryArchive:
                 if not isinstance(raw_fits, Mapping):
                     raise FitArchiveError("FIT partition is invalid")
                 parsed_fits: dict[str, dict[str, Any]] = {}
+                invalid_fit_keys: set[str] = set()
                 for key, value in raw_fits.items():
                     try:
                         restored_fit = fit_record(value)
                         if restored_fit["logical_id"] != key or key not in parsed_activities:
+                            invalid_fit_keys.add(key)
                             continue
                         fit_directory = Path(self._hass.config.path("garmin_connect", "fit")).resolve()
                         fit_path = (fit_directory / restored_fit["path"]).resolve()
                         if fit_path.parent != fit_directory or not fit_path.is_file():
+                            invalid_fit_keys.add(key)
                             continue
                         inspected = await asyncio.to_thread(inspect_fit, fit_path, 0o600)
                         restored_fit = {"logical_id": key, "path": fit_path.name, "summary": inspected}
                         parsed_fits[key] = fit_record(restored_fit)
                     except (OSError, RuntimeError, TypeError, ValueError):
+                        invalid_fit_keys.add(key)
                         continue
+                if invalid_fit_keys:
+                    cleaned_partition = dict(partition)
+                    cleaned_partition["fits"] = {
+                        key: value for key, value in raw_fits.items() if key not in invalid_fit_keys
+                    }
+                    try:
+                        await self._sleep_partition_stores[year].async_save(cleaned_partition)
+                    except (OSError, TypeError, ValueError):
+                        pass
                 self._fit_archives[year] = parsed_fits
             except (KeyError, TypeError, ValueError, OSError):
                 self._sleep_sessions.pop(year, None)

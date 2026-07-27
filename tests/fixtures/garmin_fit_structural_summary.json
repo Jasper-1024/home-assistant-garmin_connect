@@ -1,0 +1,44 @@
+{
+  "provenance": {
+    "source": "sanitized captured Garmin activity FIT probe",
+    "redaction_version": "sak-13-1",
+    "raw_values_removed": true,
+    "coordinates_removed": true
+  },
+  "summary": {
+    "message_counts": {
+      "file_id": 1,
+      "session": 1,
+      "lap": 2,
+      "record": 120,
+      "event": 4,
+      "time_in_zone": 3,
+      "device_info": 1
+    },
+    "message_fields": {
+      "file_id": ["type", "manufacturer", "product"],
+      "session": ["start_time", "total_elapsed_time", "total_distance", "sport"],
+      "lap": ["start_time", "total_elapsed_time", "total_distance", "avg_speed"],
+      "record": ["timestamp", "heart_rate", "temperature", "position_lat", "position_long", "cadence", "speed"],
+      "event": ["timestamp", "event", "event_type"],
+      "time_in_zone": ["reference_mesg", "hr_zone", "time"],
+      "device_info": ["timestamp", "manufacturer", "product" ]
+    },
+    "time_coverage": {
+      "start": "2026-07-24T01:00:00+00:00",
+      "end": "2026-07-24T02:00:00+00:00"
+    },
+    "presence": {
+      "heart_rate": true,
+      "temperature": true,
+      "gps": true,
+      "cadence": true,
+      "speed": true,
+      "power": false,
+      "training_effect": true,
+      "training_load": true,
+      "recovery_time": false,
+      "recovery": false
+    }
+  }
+}

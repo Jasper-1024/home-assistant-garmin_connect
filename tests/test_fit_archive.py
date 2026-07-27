@@ -1,6 +1,7 @@
 """FIT archive seam tests."""
 
 import asyncio
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -154,3 +155,15 @@ def test_fit_record_rejects_raw_or_unbounded_summary_fields() -> None:
     injected["message_counts"] = {"record": "177"}
     with pytest.raises(FitArchiveError):
         fit_record({"logical_id": "a" * 24, "path": fit_file_name("a" * 24), "summary": injected})
+
+
+def test_captured_structural_fixture_is_redacted_and_validated() -> None:
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "garmin_fit_structural_summary.json").read_text())
+    assert fixture["provenance"]["redaction_version"] == "sak-13-1"
+    summary = fixture["summary"]
+    record = fit_record({"logical_id": "1" * 24, "path": fit_file_name("1" * 24), "summary": summary})
+    assert set(record["summary"]) == {"message_counts", "message_fields", "time_coverage", "presence"}
+    assert "heart_rate" in record["summary"]["message_fields"]["record"]
+    assert "position_lat" in record["summary"]["message_fields"]["record"]
+    assert not any(isinstance(value, (int, float)) for value in record["summary"]["message_fields"]["record"])
+    assert "file" not in record["summary"]

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from custom_components.garmin_connect.fit_archive import fit_file_name
 from custom_components.garmin_connect.history import (
     GarminHistoryArchive,
     HistoryArchiveState,
@@ -718,6 +719,38 @@ async def test_activity_partition_uses_local_calendar_year_at_utc_year_boundary(
     await archive.async_sync_range(date(2026, 1, 1), date(2026, 1, 1))
     assert "garmin_connect.e.sleep_2026" in stores
     assert "garmin_connect.e.sleep_2025" not in stores
+
+
+@pytest.mark.asyncio
+async def test_bad_fit_is_removed_without_touching_same_year_activity_partition() -> None:
+    activity = normalize_activities(
+        [{"activityId": 999, "activityType": "running", "startTime": "2026-01-01T10:00:00Z", "durationInSeconds": 60}],
+        date(2026, 1, 1),
+    )[0]
+    activity_record = {
+        "logical_id": activity.logical_id, "activity_id": activity.activity_id, "revision": activity.revision,
+        "calendar_date": activity.calendar_date.isoformat(), "activity_type": activity.activity_type,
+        "name": activity.name, "start": activity.start.isoformat(), "end": None,
+        "duration_seconds": activity.duration_seconds, "training_effect": activity.training_effect,
+        "load": activity.load, "recovery": activity.recovery,
+    }
+    summary = json.loads((Path(__file__).parent / "fixtures" / "garmin_fit_structural_summary.json").read_text())["summary"]
+    catalog = _NamedStore({
+        "account_key": "opaque-account-key-1234567890", "schema_version": 1,
+        "completed_dates": ["2026-01-01"], "hrv_summaries": {}, "presence": {},
+        "sleep_index": {}, "event_index": {}, "activity_index": {"2026": [activity.logical_id]},
+    })
+    partition = _NamedStore({
+        "account_key": "opaque-account-key-1234567890", "schema_version": 1,
+        "sleep_schema_version": 1, "year": "2026", "sessions": {}, "events": {},
+        "activities": {activity.logical_id: activity_record},
+        "fits": {activity.logical_id: {"logical_id": activity.logical_id, "path": fit_file_name(activity.logical_id), "summary": summary}},
+    })
+    stores = {"garmin_connect.e.history_catalog": catalog, "garmin_connect.e.sleep_2026": partition}
+    archive = _partition_archive(MagicMock(), MagicMock(), stores)
+    await archive.async_start()
+    assert partition.data["fits"] == {}
+    assert activity.logical_id in partition.data["activities"]
 
 
 @pytest.mark.asyncio

@@ -40,7 +40,8 @@ def _summary_without_file(summary: Mapping[str, Any], *, require_integrity: bool
     file_info = summary.get("file")
     if require_integrity and (not isinstance(file_info, Mapping) or file_info.get("integrity_ok") is not True or file_info.get("decode_ok") is not True):
         raise FitArchiveError("FIT integrity or decode failed")
-    if set(summary) - _SUMMARY_KEYS - {"file"}:
+    allowed_top_level = _SUMMARY_KEYS | ({"file"} if require_integrity else set())
+    if set(summary) - allowed_top_level or (not require_integrity and "file" in summary):
         raise FitArchiveError("FIT summary has unknown fields")
     allowed = set(_SUMMARY_KEYS)
     result = {key: summary[key] for key in allowed if key in summary}
