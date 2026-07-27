@@ -731,11 +731,11 @@ class GarminHistoryArchive:
         if calendar == "health":
             for records in self._health_events.values():
                 for record in records.values():
-                    start = datetime.fromisoformat(record["start"]) if record.get("start") else None
-                    end = datetime.fromisoformat(record["end"]) if record.get("end") else None
-                    if start is not None and end is not None and start_date <= start.date() <= end_date:
+                    health_start = datetime.fromisoformat(record["start"]) if record.get("start") else None
+                    health_end = datetime.fromisoformat(record["end"]) if record.get("end") else None
+                    if health_start is not None and health_end is not None and start_date <= health_start.date() <= end_date:
                         summary = str(record.get("category") or record.get("event_type") or "Health event")[:64]
-                        events[(start, end, summary)] = HistoryCalendarEvent(start, end, summary)
+                        events[(health_start, health_end, summary)] = HistoryCalendarEvent(health_start, health_end, summary)
             return tuple(sorted(events.values(), key=lambda event: event.start))
         for records in self._sleep_sessions.values():
             for record in records.values():
