@@ -29,6 +29,12 @@ def _valid_inspector(path: Path, required_mode: int) -> dict[str, object]:
     return _summary()
 
 
+def _persisted_summary() -> dict[str, object]:
+    summary = _summary()
+    del summary["file"]
+    return summary
+
+
 def _crc_failure(path: Path, required_mode: int) -> dict[str, object]:
     raise ValueError("CRC")
 
@@ -139,11 +145,16 @@ async def test_cancelled_download_leaves_no_temporary_or_target_file(tmp_path: P
 
 
 def test_fit_record_keeps_opaque_activity_association_and_rejects_mismatch() -> None:
-    record = fit_record({"logical_id": "a" * 24, "path": fit_file_name("a" * 24), "summary": _summary()})
+    record = fit_record({"logical_id": "a" * 24, "path": fit_file_name("a" * 24), "summary": _persisted_summary()})
     assert record["logical_id"] == "a" * 24
     assert "heart_rate" in record["summary"]["message_fields"]["record"]
     with pytest.raises(FitArchiveError):
-        fit_record({"logical_id": "b" * 24, "path": fit_file_name("a" * 24), "summary": _summary()})
+        fit_record({"logical_id": "b" * 24, "path": fit_file_name("a" * 24), "summary": _persisted_summary()})
+
+
+def test_fit_record_rejects_inspector_file_metadata() -> None:
+    with pytest.raises(FitArchiveError):
+        fit_record({"logical_id": "a" * 24, "path": fit_file_name("a" * 24), "summary": _summary()})
 
 
 def test_fit_record_rejects_raw_or_unbounded_summary_fields() -> None:
