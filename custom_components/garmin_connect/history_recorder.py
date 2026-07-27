@@ -50,6 +50,14 @@ RESPIRATION_AVERAGE_METADATA = HistoryMetricMetadata("respiration_average", "Res
 SPO2_SINGLE_METADATA = HistoryMetricMetadata("spo2_single", "SpO2 single", "%")
 SPO2_CONTINUOUS_METADATA = HistoryMetricMetadata("spo2_continuous", "SpO2 continuous", "%")
 SPO2_HOURLY_METADATA = HistoryMetricMetadata("spo2_hourly", "SpO2 hourly average", "%")
+DAILY_ABNORMAL_HR_METADATA = HistoryMetricMetadata("daily_abnormal_heart_rate_alerts", "Abnormal heart-rate alerts", "alerts")
+TRAINING_ACUTE_LOAD_METADATA = HistoryMetricMetadata("training_acute_load", "Training acute load", "load")
+TRAINING_CHRONIC_LOAD_METADATA = HistoryMetricMetadata("training_chronic_load", "Training chronic load", "load")
+TRAINING_LOAD_BALANCE_METADATA = HistoryMetricMetadata("training_load_balance", "Training load balance", "load")
+TRAINING_ACWR_METADATA = HistoryMetricMetadata("training_acwr", "Training ACWR", "ratio")
+TRAINING_VO2_MAX_METADATA = HistoryMetricMetadata("training_vo2_max", "Training VO2 Max", "mL/kg/min")
+TRAINING_FITNESS_TREND_METADATA = HistoryMetricMetadata("training_fitness_trend", "Fitness trend", "unitless")
+TRAINING_RECOVERY_TIME_METADATA = HistoryMetricMetadata("training_recovery_time", "Recovery time", "s")
 
 
 @dataclass(frozen=True, slots=True)

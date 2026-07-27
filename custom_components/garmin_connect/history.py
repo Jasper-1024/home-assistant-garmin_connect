@@ -23,6 +23,7 @@ from .const import (
 )
 from .history_recorder import (
     BODY_BATTERY_METADATA,
+    DAILY_ABNORMAL_HR_METADATA,
     FLOORS_ASCENDED_DAILY_METADATA,
     FLOORS_ASCENDED_METERS_DAILY_METADATA,
     FLOORS_DESCENDED_DAILY_METADATA,
@@ -40,6 +41,13 @@ from .history_recorder import (
     STEPS_DAILY_TOTAL_METADATA,
     STEPS_METADATA,
     STRESS_METADATA,
+    TRAINING_ACUTE_LOAD_METADATA,
+    TRAINING_ACWR_METADATA,
+    TRAINING_CHRONIC_LOAD_METADATA,
+    TRAINING_FITNESS_TREND_METADATA,
+    TRAINING_LOAD_BALANCE_METADATA,
+    TRAINING_RECOVERY_TIME_METADATA,
+    TRAINING_VO2_MAX_METADATA,
     VIGOROUS_INTENSITY_DAILY_METADATA,
     VIGOROUS_INTENSITY_METADATA,
     GarminHistoryRecorder,
@@ -52,6 +60,7 @@ from .history_source import (
     HRVSummary,
     NormalizedSample,
     SegmentedData,
+    SnapshotData,
     SourceSeries,
 )
 
@@ -66,7 +75,7 @@ _RECORDER_SUPPORTED_VERSIONS = frozenset({"2026.7.3", "2026.7.4"})
 _RECORDER_BARRIER_TIMEOUT = 10
 _HISTORY_MIN_DATE = date(2026, 1, 1)
 _HISTORY_MAX_DAYS = 31
-_PRESENCE_STATES = frozenset({"null", "empty", "missing", "unsupported", "returned-empty", "present"})
+_PRESENCE_STATES = frozenset({"null", "empty", "missing", "unsupported", "returned-empty", "present", "absent"})
 
 
 class HistoryArchiveState(StrEnum):
@@ -440,6 +449,8 @@ class GarminHistoryArchive:
                     ("spo2_single", SPO2_SINGLE_METADATA),
                     ("spo2_continuous", SPO2_CONTINUOUS_METADATA),
                     ("spo2_hourly", SPO2_HOURLY_METADATA),
+                    ("daily_summary", None),
+                    ("training_status", None),
                 ):
                     try:
                         details_descriptor = inspect.getattr_static(source, "async_fetch_details")
@@ -452,11 +463,11 @@ class GarminHistoryArchive:
                             details = bound_details(target, metric)
                         elif callable(bound_details):
                             candidate = bound_details(target, metric)
-                            if inspect.isawaitable(candidate) or isinstance(candidate, (HRVData, SegmentedData, SourceSeries, tuple)):
+                            if inspect.isawaitable(candidate) or isinstance(candidate, (HRVData, SegmentedData, SourceSeries, SnapshotData, tuple)):
                                 details = candidate
                     if inspect.isawaitable(details):
                         details = await details
-                    if not isinstance(details, (HRVData, SegmentedData, SourceSeries, tuple)):
+                    if not isinstance(details, (HRVData, SegmentedData, SourceSeries, SnapshotData, tuple)):
                         details = await source.async_fetch(target, metric)
                     if isinstance(details, HRVData):
                         samples = details.readings
@@ -473,11 +484,47 @@ class GarminHistoryArchive:
                     elif isinstance(details, SourceSeries):
                         samples = details.readings
                         presence.setdefault(target_key, {})[metric] = details.presence
+                    elif isinstance(details, SnapshotData):
+                        samples = ()
+                        snapshot_metadata = {
+                            "abnormal_heart_rate_alerts": DAILY_ABNORMAL_HR_METADATA,
+                            **{
+                                "acute_load": TRAINING_ACUTE_LOAD_METADATA,
+                                "chronic_load": TRAINING_CHRONIC_LOAD_METADATA,
+                                "load_balance": TRAINING_LOAD_BALANCE_METADATA,
+                                "acwr": TRAINING_ACWR_METADATA,
+                                "vo2_max": TRAINING_VO2_MAX_METADATA,
+                                "fitness_trend": TRAINING_FITNESS_TREND_METADATA,
+                                "recovery_time": TRAINING_RECOVERY_TIME_METADATA,
+                            },
+                        }
+                        for field, (state, value) in details.fields.items():
+                            presence.setdefault(target_key, {})[f"{metric}:{field}"] = state
+                            metadata_for_field = snapshot_metadata.get(field)
+                            if state != "present" or value is None or metadata_for_field is None:
+                                continue
+                            snapshot = NormalizedSample(details.timestamp, target, details.raw_timestamp, value)
+                            snapshot_outcome = await recorder.async_write(
+                                statistic_id_for(self._account_key(), metadata_for_field.key),
+                                metadata_for_field,
+                                (snapshot,),
+                            )
+                            if snapshot_outcome.outcome != "written":
+                                return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome=snapshot_outcome.outcome, error_type=snapshot_outcome.error_type)
+                            inserted += getattr(snapshot_outcome, "inserted_count", snapshot_outcome.accepted_count)
+                            updated += getattr(snapshot_outcome, "updated_count", 0)
+                            skipped += getattr(snapshot_outcome, "skipped_count", 0)
+                        outcome = RecorderWriteOutcome(0)
+                    elif metadata is None:
+                        outcome = RecorderWriteOutcome(0)
                     else:
                         samples = details
-                    outcome: RecorderWriteOutcome = await recorder.async_write(
-                        statistic_id_for(self._account_key(), metric), metadata, samples
-                    )
+                    if isinstance(details, SnapshotData) or metadata is None:
+                        outcome = RecorderWriteOutcome(0)
+                    else:
+                        outcome = await recorder.async_write(
+                            statistic_id_for(self._account_key(), metric), metadata, samples
+                        )
                     if isinstance(details, SegmentedData) and details.totals:
                         total_metadata = {
                             ("steps", "totalSteps"): STEPS_DAILY_TOTAL_METADATA,

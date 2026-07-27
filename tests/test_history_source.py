@@ -3,20 +3,30 @@
 import json
 from datetime import UTC, date, datetime
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from custom_components.garmin_connect.history_source import (
+    DAILY_SUMMARY_FIELDS,
+    TRAINING_STATUS_FIELDS,
+    GarminHistorySource,
     HistorySchemaError,
     normalize_body_battery,
     normalize_floors,
     normalize_intensity,
     normalize_pair_series,
     normalize_respiration,
+    normalize_snapshot,
     normalize_spo2,
     normalize_steps,
     parse_hrv_data,
 )
+
+
+class _ImmediateGate:
+    async def async_request(self, priority, request):
+        return await request()
 
 
 def test_normalize_pair_series_uses_descriptors_and_keeps_ordered_equal_values() -> None:
@@ -244,3 +254,35 @@ def test_recognized_respiration_and_spo2_array_type_drift_raises(
             normalizer(payload, date(2026, 7, 24), "single")
         else:
             normalizer(payload, date(2026, 7, 24))
+
+
+def test_daily_summary_and_training_snapshot_presence_and_type_drift() -> None:
+    """Snapshots preserve present/null/absent fields without readiness calls."""
+    daily = normalize_snapshot(
+        {"abnormalHeartRateAlertsCount": 2, "unknown": "ignored"},
+        date(2026, 7, 24),
+        DAILY_SUMMARY_FIELDS,
+    )
+    training = normalize_snapshot(
+        {"acuteLoad": 42, "recoveryTime": None},
+        date(2026, 7, 24),
+        TRAINING_STATUS_FIELDS,
+    )
+    assert daily.fields["abnormal_heart_rate_alerts"] == ("present", 2.0)
+    assert training.fields["recovery_time"] == ("null", None)
+    assert training.fields["vo2_max"] == ("absent", None)
+    with pytest.raises(HistorySchemaError):
+        normalize_snapshot({"acuteLoad": "drift"}, date(2026, 7, 24), TRAINING_STATUS_FIELDS)
+
+
+@pytest.mark.asyncio
+async def test_training_status_never_calls_training_readiness() -> None:
+    client = MagicMock()
+    client.get_training_status = AsyncMock(return_value={"acuteLoad": 1})
+    client.get_training_readiness = AsyncMock(side_effect=AssertionError("readiness forbidden"))
+    source = GarminHistorySource(client, _ImmediateGate())
+
+    await source.async_fetch_details(date(2026, 7, 24), "training_status")
+
+    client.get_training_status.assert_awaited_once()
+    client.get_training_readiness.assert_not_awaited()

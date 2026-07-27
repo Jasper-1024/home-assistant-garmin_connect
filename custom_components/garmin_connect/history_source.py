@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
@@ -59,6 +60,52 @@ class SourceSeries:
 
     readings: tuple[NormalizedSample, ...]
     presence: str
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotData:
+    """Bounded numeric snapshot fields and their source presence states."""
+
+    fields: dict[str, tuple[str, float | None]]
+    timestamp: datetime
+    raw_timestamp: Any
+
+
+def normalize_snapshot(
+    payload: Any,
+    target_date: date,
+    field_aliases: Mapping[str, tuple[str, ...]],
+) -> SnapshotData:
+    """Extract known numeric fields without inferring absent or null values."""
+    if payload is None:
+        return SnapshotData(dict.fromkeys(field_aliases, ("null", None)), datetime.combine(target_date, datetime.min.time(), tzinfo=UTC), target_date.isoformat())
+    if not isinstance(payload, dict):
+        raise HistorySchemaError("snapshot payload is not an object")
+    timestamp_value = next((payload[key] for key in ("timestamp", "startTime", "calendarDate") if key in payload), target_date.isoformat())
+    timestamp = _timestamp(timestamp_value) or datetime.combine(target_date, datetime.min.time(), tzinfo=UTC)
+    fields: dict[str, tuple[str, float | None]] = {}
+    for name, aliases in field_aliases.items():
+        found = _nested_value(payload, aliases)
+        if found is None:
+            fields[name] = ("absent", None)
+            continue
+        value = found[0]
+        if value is None:
+            fields[name] = ("null", None)
+        elif isinstance(value, bool) or not isinstance(value, int | float):
+            raise HistorySchemaError(f"{name} has an invalid type")
+        else:
+            fields[name] = ("present", float(value))
+    return SnapshotData(fields, timestamp, timestamp_value)
+
+
+DAILY_SUMMARY_FIELDS = {"abnormal_heart_rate_alerts": ("abnormalHeartRateAlertsCount",)}
+TRAINING_STATUS_FIELDS = {
+    "acute_load": ("acuteLoad",), "chronic_load": ("chronicLoad",),
+    "load_balance": ("loadBalance",), "acwr": ("acwr", "acuteChronicWorkloadRatio"),
+    "vo2_max": ("vo2Max", "vo2MaxValue"), "fitness_trend": ("fitnessTrend",),
+    "recovery_time": ("recoveryTime",),
+}
 
 
 def _timestamp(value: Any) -> datetime | None:
@@ -412,9 +459,9 @@ class GarminHistorySource:
     async def async_fetch(self, target_date: date, metric: str) -> tuple[NormalizedSample, ...]:
         """Fetch one metric, retaining the historical tuple return contract."""
         result = await self.async_fetch_details(target_date, metric)
-        return result.readings if isinstance(result, (HRVData, SegmentedData, SourceSeries)) else result
+        return result.readings if isinstance(result, (HRVData, SegmentedData, SourceSeries)) else () if isinstance(result, SnapshotData) else result
 
-    async def async_fetch_details(self, target_date: date, metric: str) -> tuple[NormalizedSample, ...] | HRVData | SegmentedData | SourceSeries:
+    async def async_fetch_details(self, target_date: date, metric: str) -> tuple[NormalizedSample, ...] | HRVData | SegmentedData | SourceSeries | SnapshotData:
         """Fetch a metric and retain private details needed by the archive."""
 
         async def request() -> Any:
@@ -447,6 +494,10 @@ class GarminHistorySource:
                 return await self.client._request("GET", f"{base}/wellness-service/wellness/daily/respiration/{target_date.isoformat()}")
             if metric.startswith("spo2_"):
                 return await self.client._request("GET", f"{base}/wellness-service/wellness/daily/spo2/{target_date.isoformat()}")
+            if metric == "daily_summary":
+                return await self.client._get_user_summary_raw(target_date)
+            if metric == "training_status":
+                return await self.client.get_training_status(target_date)
             raise ValueError(f"unsupported history metric: {metric}")
 
         payload = await self.request_gate.async_request(GarminRequestPriority.BACKGROUND, request)
@@ -466,6 +517,10 @@ class GarminHistorySource:
             return normalize_respiration(payload, target_date, True)
         if metric.startswith("spo2_"):
             return normalize_spo2(payload, target_date, metric.removeprefix("spo2_"))
+        if metric == "daily_summary":
+            return normalize_snapshot(payload, target_date, DAILY_SUMMARY_FIELDS)
+        if metric == "training_status":
+            return normalize_snapshot(payload, target_date, TRAINING_STATUS_FIELDS)
         if not isinstance(payload, dict):
             return ()
         if metric == "heart_rate":
