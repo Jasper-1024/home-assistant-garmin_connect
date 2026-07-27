@@ -66,6 +66,7 @@ _RECORDER_SUPPORTED_VERSIONS = frozenset({"2026.7.3", "2026.7.4"})
 _RECORDER_BARRIER_TIMEOUT = 10
 _HISTORY_MIN_DATE = date(2026, 1, 1)
 _HISTORY_MAX_DAYS = 31
+_PRESENCE_STATES = frozenset({"unsupported", "returned-empty", "present"})
 
 
 class HistoryArchiveState(StrEnum):
@@ -261,6 +262,7 @@ class GarminHistoryArchive:
         self._runtime_sync_failure = False
         self._recorder_adapter: Any | None = None
         self._hrv_summaries: dict[str, dict[str, Any]] = {}
+        self._presence: dict[str, dict[str, str]] = {}
 
     @property
     def status(self) -> HistoryStatus:
@@ -287,6 +289,16 @@ class GarminHistoryArchive:
             baseline = value.get("baseline")
             result.append((target, HRVSummary(value.get("status"), value.get("last_night_avg"), value.get("last_night_5_min_high"), value.get("weekly_avg"), baseline)))
         return tuple(sorted(result))
+
+    def get_history_presence(self, start_date: date, end_date: date) -> dict[str, dict[str, str]]:
+        """Query bounded source availability without payload or identity data."""
+        if start_date > end_date or (end_date - start_date).days + 1 > _HISTORY_MAX_DAYS:
+            return {}
+        return {
+            key: dict(value)
+            for key, value in self._presence.items()
+            if start_date <= date.fromisoformat(key) <= end_date
+        }
 
     async def async_start(self) -> None:
         """Initialize identity, Store catalog, and Recorder compatibility."""
@@ -402,6 +414,7 @@ class GarminHistoryArchive:
         skipped = 0
         inserted = 0
         updated = 0
+        presence = {key: dict(value) for key, value in self._presence.items()}
         self._status = HistoryStatus(HistoryArchiveState.RUNNING)
         for offset in range((end_date - start_date).days + 1):
             target = start_date.fromordinal(start_date.toordinal() + offset)
@@ -459,6 +472,7 @@ class GarminHistoryArchive:
                         samples = details.readings
                     elif isinstance(details, SourceSeries):
                         samples = details.readings
+                        presence.setdefault(target_key, {})[metric] = details.presence
                     else:
                         samples = details
                     outcome: RecorderWriteOutcome = await recorder.async_write(
@@ -496,8 +510,9 @@ class GarminHistoryArchive:
                     skipped += getattr(outcome, "skipped_count", 0)
                 processed.append(target)
                 completed_dates = self._completed_dates | {target_key}
-                await store.async_save({"schema_version": HISTORY_STORE_VERSION, "account_key": self._account_key(), "completed_dates": sorted(completed_dates), "hrv_summaries": self._hrv_summaries})
+                await store.async_save({"schema_version": HISTORY_STORE_VERSION, "account_key": self._account_key(), "completed_dates": sorted(completed_dates), "hrv_summaries": self._hrv_summaries, "presence": presence})
                 self._completed_dates = completed_dates
+                self._presence = presence
             except asyncio.CancelledError:
                 self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated)
                 raise
@@ -560,6 +575,7 @@ class GarminHistoryArchive:
                     "account_key": account_key,
                     "completed_dates": [],
                     "hrv_summaries": {},
+                    "presence": {},
                 }
             )
             return
@@ -583,6 +599,25 @@ class GarminHistoryArchive:
         summaries = catalog.get("hrv_summaries", {})
         if isinstance(summaries, Mapping):
             self._hrv_summaries = {key: dict(value) for key, value in summaries.items() if isinstance(key, str) and isinstance(value, Mapping)}
+        raw_presence = catalog.get("presence", {})
+        if not isinstance(raw_presence, Mapping):
+            raise ValueError("Store presence catalog is invalid")
+        parsed_presence: dict[str, dict[str, str]] = {}
+        for key, metrics in raw_presence.items():
+            if not isinstance(key, str):
+                raise ValueError("Store presence catalog is invalid")
+            parsed_date = date.fromisoformat(key)
+            if parsed_date.isoformat() != key or parsed_date < _HISTORY_MIN_DATE:
+                raise ValueError("Store presence catalog is invalid")
+            if not isinstance(metrics, Mapping) or len(metrics) > 32:
+                raise ValueError("Store presence catalog is invalid")
+            bounded: dict[str, str] = {}
+            for metric, state in metrics.items():
+                if not isinstance(metric, str) or len(metric) > 64 or state not in _PRESENCE_STATES:
+                    raise ValueError("Store presence catalog is invalid")
+                bounded[metric] = state
+            parsed_presence[key] = bounded
+        self._presence = parsed_presence
 
     def _set_failed(self, error_type: str) -> None:
         """Set a bounded startup failure without exposing exception details."""

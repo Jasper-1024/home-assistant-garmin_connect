@@ -17,6 +17,7 @@ from custom_components.garmin_connect.history_source import (
     HRVSummary,
     NormalizedSample,
     SegmentedData,
+    SourceSeries,
 )
 
 
@@ -90,9 +91,56 @@ async def test_sync_fetches_only_supported_metrics_and_writes_each_day():
 
     assert report.outcome == "written"
     assert source.async_fetch.await_args_list[0].args[1] == "heart_rate"
-    assert {call.args[1] for call in source.async_fetch.await_args_list} == {"heart_rate", "stress", "body_battery", "nightly_hrv", "steps", "floors", "intensity_moderate", "intensity_vigorous"}
-    assert recorder.async_write.await_count == 16
+    assert {call.args[1] for call in source.async_fetch.await_args_list} == {
+        "heart_rate",
+        "stress",
+        "body_battery",
+        "nightly_hrv",
+        "steps",
+        "floors",
+        "intensity_moderate",
+        "intensity_vigorous",
+        "respiration_raw",
+        "respiration_average",
+        "spo2_single",
+        "spo2_continuous",
+        "spo2_hourly",
+    }
+    assert recorder.async_write.await_count == 26
     assert archive.status.state is HistoryArchiveState.IDLE
+
+
+@pytest.mark.asyncio
+async def test_source_series_unwraps_and_presence_survives_restart():
+    """Source metadata reaches the private catalog; Recorder receives samples only."""
+    sample = NormalizedSample(datetime(2026, 1, 1, tzinfo=UTC), date(2026, 1, 1), 1, 14.0)
+
+    class Source:
+        async def async_fetch_details(self, target, metric):
+            if metric == "respiration_raw":
+                return SourceSeries((sample,), "present")
+            return ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(1))
+    store = _Store()
+    archive = _sync_archive(Source(), recorder, store)
+    await archive.async_start()
+    report = await archive.async_sync_range(date(2026, 1, 1), date(2026, 1, 1))
+
+    assert report.outcome == "written"
+    respiration_call = next(
+        call for call in recorder.async_write.await_args_list
+        if call.args[1].key == "respiration_raw"
+    )
+    assert respiration_call.args[2] == (sample,)
+    assert store.data["presence"]["2026-01-01"]["respiration_raw"] == "present"
+
+    restarted = _sync_archive(Source(), recorder, _Store(store.data))
+    await restarted.async_start()
+    assert restarted.get_history_presence(date(2026, 1, 1), date(2026, 1, 1)) == {
+        "2026-01-01": {"respiration_raw": "present"}
+    }
 
 
 @pytest.mark.asyncio
@@ -103,6 +151,11 @@ async def test_archive_aggregates_import_classification_counts():
     recorder.async_write = AsyncMock(side_effect=[
         RecorderWriteOutcome(2, inserted_count=1, updated_count=1),
         RecorderWriteOutcome(2, skipped_count=2),
+        RecorderWriteOutcome(0),
+        RecorderWriteOutcome(0),
+        RecorderWriteOutcome(0),
+        RecorderWriteOutcome(0),
+        RecorderWriteOutcome(0),
         RecorderWriteOutcome(0),
         RecorderWriteOutcome(0),
         RecorderWriteOutcome(0),
@@ -164,6 +217,11 @@ async def test_runtime_failure_can_retry():
     recorder.async_write = AsyncMock(
         side_effect=[
             RecorderWriteOutcome(0, "failed", "writer"),
+            RecorderWriteOutcome(0),
+            RecorderWriteOutcome(0),
+            RecorderWriteOutcome(0),
+            RecorderWriteOutcome(0),
+            RecorderWriteOutcome(0),
             RecorderWriteOutcome(0),
             RecorderWriteOutcome(0),
             RecorderWriteOutcome(0),
