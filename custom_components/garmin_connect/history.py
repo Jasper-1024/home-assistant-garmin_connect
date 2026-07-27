@@ -1,9 +1,4 @@
-"""Lifecycle seam for Garmin history.
-
-This module deliberately stops at archive lifecycle and compatibility.  Garmin
-history fetching, normalization, Recorder imports, Calendar records, and FIT
-archival belong to later vertical slices.
-"""
+"""Privacy-safe Garmin intraday history archive lifecycle and manual sync."""
 
 from __future__ import annotations
 
@@ -238,6 +233,7 @@ class GarminHistoryArchive:
         self._status = HistoryStatus(HistoryArchiveState.IDLE)
         self._completed_dates: set[str] = set()
         self._sync_lock = asyncio.Lock()
+        self._runtime_sync_failure = False
 
     @property
     def status(self) -> HistoryStatus:
@@ -322,7 +318,8 @@ class GarminHistoryArchive:
         if validation_error:
             return HistorySyncReport(outcome="invalid", error_type=validation_error)
         if self._status.state is not HistoryArchiveState.IDLE:
-            return HistorySyncReport(outcome="disabled", error_type=self._status.error_type)
+            if not (self._status.state is HistoryArchiveState.FAILED and self._runtime_sync_failure):
+                return HistorySyncReport(outcome="disabled", error_type=self._status.error_type)
         if self._sync_lock.locked():
             return HistorySyncReport(outcome="busy", error_type="sync_in_progress")
 
@@ -336,6 +333,8 @@ class GarminHistoryArchive:
         client = getattr(getattr(runtime_data, "core", None), "client", None)
         request_gate = getattr(runtime_data, "request_gate", None)
         if client is None:
+            self._runtime_sync_failure = True
+            self._status = HistoryStatus(HistoryArchiveState.FAILED, error_type="integration_not_loaded")
             return HistorySyncReport(outcome="failed", error_type="integration_not_loaded")
         source = (self._source_factory or GarminHistorySource)(client, request_gate)
         if self._recorder_factory:
@@ -346,6 +345,8 @@ class GarminHistoryArchive:
             recorder = GarminHistoryRecorder(get_instance(self._hass))
         store = self._store
         if store is None:
+            self._runtime_sync_failure = True
+            self._status = HistoryStatus(HistoryArchiveState.FAILED, error_type="store_unavailable")
             return HistorySyncReport(outcome="failed", error_type="store_unavailable")
         processed: list[date] = []
         skipped = 0
@@ -367,6 +368,8 @@ class GarminHistoryArchive:
                         statistic_id_for(self._account_key(), metric), metadata, samples
                     )
                     if outcome.outcome != "written":
+                        self._runtime_sync_failure = True
+                        self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type=outcome.error_type or "sync_failed")
                         return HistorySyncReport(tuple(processed), inserted, skipped_count=skipped, outcome=outcome.outcome, error_type=outcome.error_type)
                     inserted += outcome.accepted_count
                 processed.append(target)
@@ -377,8 +380,10 @@ class GarminHistoryArchive:
                 self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=target_key, processed_dates=len(processed), record_count=inserted)
                 raise
             except (AttributeError, ImportError, TypeError, ValueError, RuntimeError):
+                self._runtime_sync_failure = True
                 self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type="sync_failed")
                 return HistorySyncReport(tuple(processed), inserted, skipped_count=skipped, outcome="failed", error_type="sync_failed")
+        self._runtime_sync_failure = False
         self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=end_date.isoformat(), processed_dates=len(processed), record_count=inserted)
         return HistorySyncReport(tuple(processed), inserted, skipped_count=skipped, outcome="written")
 
@@ -440,10 +445,22 @@ class GarminHistoryArchive:
         completed = catalog.get("completed_dates", [])
         if not isinstance(completed, list) or any(not isinstance(item, str) for item in completed):
             raise ValueError("Store checkpoint is invalid")
-        self._completed_dates = set(completed)
+        if len(set(completed)) != len(completed):
+            raise ValueError("Store checkpoint is invalid")
+        parsed_dates: set[str] = set()
+        for item in completed:
+            try:
+                parsed = date.fromisoformat(item)
+            except ValueError as err:
+                raise ValueError("Store checkpoint is invalid") from err
+            if parsed.isoformat() != item or parsed < _HISTORY_MIN_DATE:
+                raise ValueError("Store checkpoint is invalid")
+            parsed_dates.add(item)
+        self._completed_dates = parsed_dates
 
     def _set_failed(self, error_type: str) -> None:
         """Set a bounded startup failure without exposing exception details."""
+        self._runtime_sync_failure = False
         self._status = HistoryStatus(HistoryArchiveState.FAILED, error_type=error_type)
 
 
