@@ -1,5 +1,6 @@
 """Conservative backfill policy tests."""
 
+import asyncio
 from datetime import UTC, date, datetime
 
 import pytest
@@ -13,6 +14,8 @@ from custom_components.garmin_connect.backfill import (
     count_uncompleted_dates,
     next_backfill_date,
 )
+from custom_components.garmin_connect.history import HistorySyncReport
+from custom_components.garmin_connect.request_gate import GarminRequestGate, GarminRequestPriority
 
 
 def test_backfill_selects_first_uncompleted_date() -> None:
@@ -71,3 +74,79 @@ async def test_401_reauth_once_and_403_disable_path() -> None:
     assert attempts == [1]
     assert reauth_calls == [1]
     assert "history" in scheduler.state.disabled_paths
+
+
+@pytest.mark.asyncio
+async def test_failed_archive_seam_does_not_checkpoint_then_restart_retries() -> None:
+    persisted: dict = {}
+    outcomes = iter((HistorySyncReport(outcome="failed", error_type="network"), HistorySyncReport(outcome="written")))
+
+    async def load_state() -> dict:
+        return persisted
+
+    async def save_state(state: dict) -> None:
+        persisted.clear()
+        persisted.update(state)
+
+    async def sync_date(target: date) -> HistorySyncReport:
+        return next(outcomes)
+
+    now = datetime(2026, 2, 1, tzinfo=UTC)
+    first = BackfillScheduler(load_state=load_state, save_state=save_state, sync_date=sync_date, now=lambda: now)
+    await first.async_run_once()
+    assert "2026-01-01" not in persisted["completed_dates"]
+    restarted = BackfillScheduler(load_state=load_state, save_state=save_state, sync_date=sync_date, now=lambda: now)
+    await restarted.async_run_once()
+    assert "2026-01-01" in persisted["completed_dates"]
+
+
+@pytest.mark.asyncio
+async def test_foreground_request_priority_preempts_background_batch() -> None:
+    gate = GarminRequestGate()
+    order: list[str] = []
+    release_blocker = asyncio.Event()
+
+    async def blocker() -> None:
+        order.append("blocker")
+        await release_blocker.wait()
+
+    async def background() -> None:
+        order.append("background")
+
+    async def foreground() -> None:
+        order.append("foreground")
+
+    blocker_task = asyncio.create_task(gate.async_request(GarminRequestPriority.BACKGROUND, blocker))
+    await asyncio.sleep(0)
+    background_task = asyncio.create_task(gate.async_request(GarminRequestPriority.BACKGROUND, background))
+    await asyncio.sleep(0)
+    foreground_task = asyncio.create_task(gate.async_request(GarminRequestPriority.FOREGROUND, foreground))
+    await asyncio.sleep(0)
+    release_blocker.set()
+    await asyncio.gather(blocker_task, background_task, foreground_task)
+    assert order == ["blocker", "foreground", "background"]
+
+
+@pytest.mark.asyncio
+async def test_background_fit_limit_defers_date_until_remaining_fit_converges() -> None:
+    persisted: dict = {}
+    calls: list[int] = []
+    now = datetime(2026, 2, 1, tzinfo=UTC)
+
+    async def load_state() -> dict:
+        return persisted
+
+    async def save_state(state: dict) -> None:
+        persisted.clear()
+        persisted.update(state)
+
+    async def sync_date(target: date) -> HistorySyncReport:
+        calls.append(1)
+        return HistorySyncReport(outcome="failed", error_type="fit_limit_pending") if len(calls) == 1 else HistorySyncReport(outcome="written")
+
+    scheduler = BackfillScheduler(load_state=load_state, save_state=save_state, sync_date=sync_date, now=lambda: now)
+    await scheduler.async_run_once()
+    assert persisted["completed_dates"] == []
+    await scheduler.async_run_once()
+    assert persisted["completed_dates"] == ["2026-01-01"]
+    assert len(calls) == 2
