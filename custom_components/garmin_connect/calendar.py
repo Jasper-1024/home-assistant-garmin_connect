@@ -15,10 +15,13 @@ from .history import GarminHistoryArchive
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
-    """Set up the per-account Garmin sleep Calendar."""
+    """Set up per-account Garmin structured Calendars."""
     archive = getattr(entry.runtime_data, "history_archive", None)
     if isinstance(archive, GarminHistoryArchive):
-        async_add_entities([GarminSleepCalendar(archive, entry.entry_id)])
+        async_add_entities([
+            GarminSleepCalendar(archive, entry.entry_id),
+            GarminHealthEventsCalendar(archive, entry.entry_id),
+        ])
 
 
 class GarminSleepCalendar(CalendarEntity):
@@ -51,3 +54,17 @@ class GarminSleepCalendar(CalendarEntity):
     def event(self) -> CalendarEvent | None:
         """Calendar state is supplied by range queries."""
         return None
+
+
+class GarminHealthEventsCalendar(GarminSleepCalendar):
+    """Expose sanitized health event intervals only."""
+
+    _attr_name = "Health events"
+
+    def __init__(self, archive: GarminHistoryArchive, entry_id: str) -> None:
+        super().__init__(archive, entry_id)
+        self._attr_unique_id = f"{entry_id}_health_events_calendar"
+
+    async def async_get_events(self, hass: HomeAssistant, start_date: datetime, end_date: datetime) -> list[CalendarEvent]:
+        events = await self._archive.async_get_calendar_events("health", start_date.date(), end_date.date())
+        return [CalendarEvent(summary=event.summary, start=event.start, end=event.end) for event in events]

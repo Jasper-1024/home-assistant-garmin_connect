@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -70,11 +72,73 @@ class SnapshotData:
     fields: dict[str, tuple[str, float | None]]
     timestamp: datetime
     raw_timestamp: Any
+    events: tuple[NormalizedHealthEvent, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedHealthEvent:
+    """Sanitized Garmin event without health-value payloads."""
+
+    logical_id: str
+    revision: str
+    calendar_date: date
+    source: str | None
+    event_type: str | None
+    category: str | None
+    start: datetime | None
+    end: datetime | None
+    occurrence: datetime | None
 
 
 HistorySeries = tuple[NormalizedSample, ...]
 HistoryResult = HistorySeries | tuple[SleepSession, ...]
-HistoryDetails = HistorySeries | HRVData | SegmentedData | SourceSeries | SnapshotData | tuple[SleepSession, ...]
+HistoryDetails = HistorySeries | HRVData | SegmentedData | SourceSeries | SnapshotData | tuple[SleepSession, ...] | tuple[NormalizedHealthEvent, ...]
+
+
+def normalize_health_events(payload: Any, target_date: date) -> tuple[NormalizedHealthEvent, ...]:
+    """Normalize explicit event identity/category/time fields only."""
+    if payload is None:
+        return ()
+    if isinstance(payload, dict) and "abnormalHRValuesArray" in payload:
+        values = payload["abnormalHRValuesArray"]
+        if values is None:
+            return ()
+        if not isinstance(values, list) or len(values) > 512:
+            raise HistorySchemaError("abnormal events have invalid type")
+        payload = {
+            "events": [
+                {"source": "GARMIN", "type": "abnormalHeartRate", "category": "abnormal",
+                 "occurrenceTime": row[0] if isinstance(row, list) and row else row.get("timestamp") if isinstance(row, dict) else None}
+                for row in values
+            ]
+        }
+    raw_events: Any = payload
+    if isinstance(payload, dict):
+        raw_events = next((payload[key] for key in ("events", "dailyEvents", "bodyBatteryEvents", "eventList") if key in payload), payload)
+    if isinstance(raw_events, dict):
+        raw_events = [raw_events]
+    if not isinstance(raw_events, list):
+        raise HistorySchemaError("health events have invalid type")
+    result: dict[str, NormalizedHealthEvent] = {}
+    for event in raw_events[:512]:
+        if not isinstance(event, dict):
+            raise HistorySchemaError("health event has invalid type")
+        source = next((event[key] for key in ("source", "eventSource") if key in event), None)
+        event_type = next((event[key] for key in ("type", "eventType") if key in event), None)
+        category = next((event[key] for key in ("category", "eventCategory") if key in event), None)
+        if any(value is not None and not isinstance(value, str) for value in (source, event_type, category)):
+            raise HistorySchemaError("health event identity has invalid type")
+        def event_time(names: tuple[str, ...]) -> datetime | None:
+            value = next((event[key] for key in names if key in event), None)
+            return _timestamp(value)
+        start = event_time(("startTime", "startTimeGMT", "start"))
+        end = event_time(("endTime", "endTimeGMT", "end"))
+        occurrence = event_time(("occurrenceTime", "occurrenceTimeGMT", "eventTime", "timestamp", "time"))
+        identity = (source, event_type, category, start.isoformat() if start else None, end.isoformat() if end else None, occurrence.isoformat() if occurrence else None)
+        logical_id = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()[:24]
+        revision = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+        result[logical_id] = NormalizedHealthEvent(logical_id, revision, target_date, source, event_type, category, start, end, occurrence)
+    return tuple(sorted(result.values(), key=lambda item: (item.start or item.occurrence or datetime.min.replace(tzinfo=UTC), item.logical_id)))
 
 
 def normalize_snapshot(
@@ -102,7 +166,8 @@ def normalize_snapshot(
             raise HistorySchemaError(f"{name} has an invalid type")
         else:
             fields[name] = ("present", float(value))
-    return SnapshotData(fields, timestamp, timestamp_value)
+    events = normalize_health_events(payload, target_date) if "abnormalHRValuesArray" in payload or "abnormalHeartRateEvents" in payload else ()
+    return SnapshotData(fields, timestamp, timestamp_value, events)
 
 
 DAILY_SUMMARY_FIELDS = {"abnormal_heart_rate_alerts": ("abnormalHeartRateAlertsCount",)}
@@ -482,6 +547,10 @@ class GarminHistorySource:
                 return await self.client.get_training_status(target_date)
             if metric == "sleep_sessions":
                 return await self.client._get_sleep_data_raw(target_date)
+            if metric == "health_events_daily":
+                return await self.client._request("GET", f"{base}/wellness-service/wellness/dailyEvents", params={"calendarDate": target_date.isoformat()})
+            if metric == "health_events_body_battery":
+                return await self.client._request("GET", f"{base}/wellness-service/wellness/bodyBattery/events/{target_date.isoformat()}")
             if metric == "heart_rate":
                 profile = await self.client.get_user_profile()
                 return await self.client._request(
@@ -536,6 +605,8 @@ class GarminHistorySource:
             return normalize_snapshot(payload, target_date, TRAINING_STATUS_FIELDS)
         if metric == "sleep_sessions":
             return parse_sleep_sessions(payload, target_date)
+        if metric in {"health_events_daily", "health_events_body_battery"}:
+            return normalize_health_events(payload, target_date)
         if not isinstance(payload, dict):
             return ()
         if metric == "heart_rate":

@@ -21,6 +21,7 @@ from custom_components.garmin_connect.history_source import (
     normalize_spo2,
     normalize_steps,
     parse_hrv_data,
+    normalize_health_events,
 )
 
 
@@ -84,6 +85,16 @@ def test_normalize_stress_excludes_negative_quality_codes_but_keeps_zero_and_nul
         value_keys=("stressLevel",),
         exclude_negative=True,
     )
+
+
+def test_normalize_health_events_preserves_explicit_fields_only() -> None:
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "garmin_health_events.json").read_text())
+    events = normalize_health_events(fixture, date(2026, 7, 24))
+    assert len(events) == 2
+    assert events[0].source == "MOVE_IQ"
+    assert events[0].start is not None and events[0].end is not None
+    assert events[1].event_type == "abnormalHeartRate"
+    assert events[1].occurrence is not None
 
     assert len(samples) == 1
     assert samples[0].value == 0
