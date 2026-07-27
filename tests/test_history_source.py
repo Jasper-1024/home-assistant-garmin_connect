@@ -9,6 +9,9 @@ from custom_components.garmin_connect.history_source import (
     normalize_body_battery,
     normalize_pair_series,
     parse_hrv_data,
+    normalize_steps,
+    normalize_floors,
+    normalize_intensity,
 )
 
 
@@ -132,3 +135,22 @@ def test_known_type_drift_is_rejected_but_null_is_missing() -> None:
         normalize_pair_series({"heartRateValues": [["bad", 60]]}, values_key="heartRateValues", descriptor_keys=(), value_keys=("heartRate",))
     samples = normalize_pair_series({"heartRateValues": [["2026-07-24T01:00:00Z", None], ["2026-07-24T01:01:00Z", 0]]}, values_key="heartRateValues", descriptor_keys=(), value_keys=("heartRate",))
     assert [sample.value for sample in samples] == [0]
+
+
+def test_segmented_steps_descriptor_reordering_preserves_revisions_and_totals() -> None:
+    parsed = normalize_steps({
+        "stepsValueDescriptors": [{"key": "steps", "index": 2}, {"key": "timestamp", "index": 0}, {"key": "activityLevel", "index": 1}],
+        "stepsValuesArray": [["2026-07-24T02:00:00Z", "active", 10], ["2026-07-24T01:00:00Z", "rest", 0], ["2026-07-24T02:00:00Z", "revised", 12]],
+        "totalSteps": 12,
+    }, date(2026, 7, 24))
+    assert [sample.value for sample in parsed.readings] == [0, 12]
+    assert parsed.totals == {"totalSteps": 12.0}
+
+
+def test_floors_and_intensity_keep_distinct_semantics() -> None:
+    floors = normalize_floors({"data": [{"time": 0, "floors": 0}, {"time": 60, "floors": 2}]}, date(2026, 7, 24))
+    moderate = normalize_intensity({"data": [{"start": 0, "moderateIntensityMinutes": 1}]}, date(2026, 7, 24), "moderate")
+    vigorous = normalize_intensity({"data": [{"start": 0, "vigorousIntensityMinutes": 3}]}, date(2026, 7, 24), "vigorous")
+    assert [sample.value for sample in floors.readings] == [0, 2]
+    assert moderate.readings[0].value == 1
+    assert vigorous.readings[0].value == 3

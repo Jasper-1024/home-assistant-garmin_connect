@@ -89,8 +89,8 @@ async def test_sync_fetches_only_supported_metrics_and_writes_each_day():
 
     assert report.outcome == "written"
     assert source.async_fetch.await_args_list[0].args[1] == "heart_rate"
-    assert {call.args[1] for call in source.async_fetch.await_args_list} == {"heart_rate", "stress", "body_battery", "nightly_hrv"}
-    assert recorder.async_write.await_count == 8
+    assert {call.args[1] for call in source.async_fetch.await_args_list} == {"heart_rate", "stress", "body_battery", "nightly_hrv", "steps", "floors", "intensity_moderate", "intensity_vigorous"}
+    assert recorder.async_write.await_count == 16
     assert archive.status.state is HistoryArchiveState.IDLE
 
 

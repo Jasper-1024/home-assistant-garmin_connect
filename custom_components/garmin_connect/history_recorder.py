@@ -34,6 +34,10 @@ HEART_RATE_METADATA = HistoryMetricMetadata("heart_rate", "Heart rate", "bpm")
 STRESS_METADATA = HistoryMetricMetadata("stress", "Stress", "unitless")
 BODY_BATTERY_METADATA = HistoryMetricMetadata("body_battery", "Body Battery", "unitless")
 NIGHTLY_HRV_METADATA = HistoryMetricMetadata("nightly_hrv", "Nightly HRV", "ms")
+STEPS_METADATA = HistoryMetricMetadata("steps", "Steps", "steps")
+FLOORS_METADATA = HistoryMetricMetadata("floors", "Floors", "floors")
+MODERATE_INTENSITY_METADATA = HistoryMetricMetadata("intensity_moderate", "Moderate intensity minutes", "min")
+VIGOROUS_INTENSITY_METADATA = HistoryMetricMetadata("intensity_vigorous", "Vigorous intensity minutes", "min")
 
 
 @dataclass(frozen=True, slots=True)

@@ -45,6 +45,14 @@ class HRVData:
     summary: HRVSummary | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class SegmentedData:
+    """Raw time slices and separate bounded daily totals."""
+
+    readings: tuple[NormalizedSample, ...]
+    totals: dict[str, float] | None = None
+
+
 def _timestamp(value: Any) -> datetime | None:
     if isinstance(value, bool):
         return None
@@ -137,6 +145,78 @@ def normalize_pair_series(
             continue
         latest[parsed] = NormalizedSample(parsed, effective_date, raw_time, float(raw_value))
     return tuple(latest[key] for key in sorted(latest))
+
+
+def _object_series(payload: Any, target_date: date, value_keys: tuple[str, ...], list_keys: tuple[str, ...]) -> tuple[NormalizedSample, ...]:
+    if payload is None or payload == []:
+        return ()
+    if isinstance(payload, list):
+        payload = {"data": payload}
+    if not isinstance(payload, dict):
+        raise HistorySchemaError("segmented payload is not an object")
+    points = next((payload[key] for key in list_keys if key in payload), None)
+    if points is None:
+        return ()
+    if not isinstance(points, list):
+        raise HistorySchemaError("segmented values are not an array")
+    result: dict[datetime, NormalizedSample] = {}
+    for point in points:
+        if point is None:
+            continue
+        if not isinstance(point, dict):
+            raise HistorySchemaError("segmented point is not an object")
+        raw_time = next((point[key] for key in ("timestamp", "time", "startTime", "start") if key in point), None)
+        raw_value = next((point[key] for key in value_keys if key in point), None)
+        if raw_time is None or raw_value is None:
+            continue
+        if not isinstance(raw_time, str | int | float) or isinstance(raw_time, bool):
+            raise HistorySchemaError("segmented timestamp has an invalid type")
+        if isinstance(raw_value, bool) or not isinstance(raw_value, int | float):
+            raise HistorySchemaError("segmented value has an invalid type")
+        parsed = _timestamp(raw_time)
+        if parsed is None:
+            raise HistorySchemaError("segmented timestamp has an invalid value")
+        result[parsed] = NormalizedSample(parsed, target_date, raw_time, float(raw_value))
+    return tuple(result[key] for key in sorted(result))
+
+
+def _totals(payload: Any, keys: tuple[str, ...]) -> dict[str, float] | None:
+    if not isinstance(payload, dict):
+        return None
+    result = {}
+    for key in keys:
+        value = payload.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise HistorySchemaError("daily total has an invalid type")
+        result[key] = float(value)
+    return result or None
+
+
+def normalize_steps(payload: Any, target_date: date) -> SegmentedData:
+    readings = _descriptor_segment(payload, target_date, ("stepsValues", "stepsValuesArray", "chartData", "data"), ("steps", "stepCount", "value"), ("stepsValueDescriptors", "stepsValueDescriptorsDTOList"))
+    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, ("steps", "stepCount", "value"), ("steps", "stepsValues", "stepsValuesArray", "chartData", "data")), _totals(payload, ("totalSteps", "steps")))
+
+
+def normalize_floors(payload: Any, target_date: date) -> SegmentedData:
+    readings = _descriptor_segment(payload, target_date, ("floorsValues", "floorsValuesArray", "chartData", "data"), ("floors", "floorCount", "value"), ("floorsValueDescriptors", "floorsValueDescriptorsDTOList"))
+    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, ("floors", "floorCount", "value"), ("floors", "floorValues", "floorsValuesArray", "chartData", "data")), _totals(payload, ("floorsAscended", "floorsDescended", "totalFloors")))
+
+
+def normalize_intensity(payload: Any, target_date: date, kind: str) -> SegmentedData:
+    if kind not in {"moderate", "vigorous"}:
+        raise ValueError("unsupported intensity kind")
+    keys = (f"{kind}IntensityMinutes", f"{kind}Minutes", "value")
+    readings = _descriptor_segment(payload, target_date, ("intensityValues", "intensityValuesArray", "chartData", "data"), keys, ("intensityValueDescriptors", "intensityValueDescriptorsDTOList"))
+    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, keys, (f"{kind}IntensityMinutes", f"{kind}Minutes", "intensityMinutes", "chartData", "data")), _totals(payload, ("moderateIntensityMinutes", "vigorousIntensityMinutes", "totalIntensityMinutes")))
+
+
+def _descriptor_segment(payload: Any, target_date: date, values_keys: tuple[str, ...], value_keys: tuple[str, ...], descriptor_keys: tuple[str, ...]) -> tuple[NormalizedSample, ...] | None:
+    if not isinstance(payload, dict) or not any(key in payload for key in descriptor_keys):
+        return None
+    values_key = next((key for key in values_keys if key in payload), values_keys[0])
+    return normalize_pair_series(payload, values_key=values_key, descriptor_keys=descriptor_keys, value_keys=value_keys, request_date=target_date)
 
 
 def _select_daily_report(payload: Any, target_date: date) -> dict[str, Any]:
@@ -251,7 +331,7 @@ class GarminHistorySource:
     async def async_fetch(self, target_date: date, metric: str) -> tuple[NormalizedSample, ...]:
         """Fetch one metric, retaining the historical tuple return contract."""
         result = await self.async_fetch_details(target_date, metric)
-        return result.readings if isinstance(result, HRVData) else result
+        return result.readings if isinstance(result, (HRVData, SegmentedData)) else result
 
     async def async_fetch_details(self, target_date: date, metric: str) -> tuple[NormalizedSample, ...] | HRVData:
         """Fetch a metric and retain private details needed by the archive."""
@@ -276,6 +356,12 @@ class GarminHistorySource:
                 )
             if metric == "nightly_hrv":
                 return await self.client._get_hrv_data_raw(target_date)
+            if metric == "steps":
+                return await self.client._request("GET", f"{base}/wellness-service/wellness/dailySummaryChart/{profile.display_name}", params={"date": target_date.isoformat()})
+            if metric == "floors":
+                return await self.client._request("GET", f"{base}/wellness-service/wellness/floorsChartData/daily/{target_date.isoformat()}")
+            if metric in {"intensity_moderate", "intensity_vigorous"}:
+                return await self.client._request("GET", f"{base}/wellness-service/wellness/daily/im/{target_date.isoformat()}")
             raise ValueError(f"unsupported history metric: {metric}")
 
         payload = await self.request_gate.async_request(GarminRequestPriority.BACKGROUND, request)
@@ -283,6 +369,12 @@ class GarminHistorySource:
             return normalize_body_battery(payload, target_date)
         if metric == "nightly_hrv":
             return parse_hrv_data(payload, target_date)
+        if metric == "steps":
+            return normalize_steps(payload, target_date)
+        if metric == "floors":
+            return normalize_floors(payload, target_date)
+        if metric in {"intensity_moderate", "intensity_vigorous"}:
+            return normalize_intensity(payload, target_date, metric.removeprefix("intensity_"))
         if not isinstance(payload, dict):
             return ()
         if metric == "heart_rate":

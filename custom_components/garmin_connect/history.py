@@ -25,12 +25,16 @@ from .history_recorder import (
     BODY_BATTERY_METADATA,
     HEART_RATE_METADATA,
     NIGHTLY_HRV_METADATA,
+    STEPS_METADATA,
+    FLOORS_METADATA,
+    MODERATE_INTENSITY_METADATA,
+    VIGOROUS_INTENSITY_METADATA,
     STRESS_METADATA,
     GarminHistoryRecorder,
     RecorderWriteOutcome,
     statistic_id_for,
 )
-from .history_source import GarminHistorySource, HRVData, HRVSummary
+from .history_source import GarminHistorySource, HRVData, HRVSummary, SegmentedData
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -395,6 +399,10 @@ class GarminHistoryArchive:
                     ("stress", STRESS_METADATA),
                     ("body_battery", BODY_BATTERY_METADATA),
                     ("nightly_hrv", NIGHTLY_HRV_METADATA),
+                    ("steps", STEPS_METADATA),
+                    ("floors", FLOORS_METADATA),
+                    ("intensity_moderate", MODERATE_INTENSITY_METADATA),
+                    ("intensity_vigorous", VIGOROUS_INTENSITY_METADATA),
                 ):
                     details_method = getattr(source, "async_fetch_details", None) if metric == "nightly_hrv" else None
                     if callable(details_method):
@@ -413,6 +421,8 @@ class GarminHistoryArchive:
                                 "weekly_avg": details.summary.weekly_avg,
                                 "baseline": details.summary.baseline,
                             }
+                    elif isinstance(details, SegmentedData):
+                        samples = details.readings
                     else:
                         samples = details
                     outcome: RecorderWriteOutcome = await recorder.async_write(
