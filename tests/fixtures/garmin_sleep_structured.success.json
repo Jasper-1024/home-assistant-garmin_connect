@@ -1,1 +1,1 @@
-{"_provenance":"Sanitized structured-sleep success state; bounded structure only.","_redaction_version":"3.1.0-beta.1","state":"success","sleepData":{"calendarDate":"2026-02-28","sleepScores":{"overall":{"value":null}},"sleepLevels":[]}}
+{"_provenance":"Sanitized structured-sleep success state; bounded structure only.","_redaction_version":"3.1.0-beta.1","state":"success","sleepData":{"calendarDate":"2026-02-28","sleepStartTimestampGMT":"2026-02-28T22:30:00Z","sleepEndTimestampGMT":"2026-03-01T06:30:00Z","sleepScores":{"overall":{"value":null}},"sleepLevels":[]}}

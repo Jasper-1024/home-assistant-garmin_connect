@@ -19,7 +19,7 @@ from custom_components.garmin_connect.history import (
 )
 from custom_components.garmin_connect.history_source import normalize_activities, normalize_health_events
 from custom_components.garmin_connect.services import async_setup_services
-from custom_components.garmin_connect.sleep_archive import parse_sleep_sessions
+from custom_components.garmin_connect.sleep_archive import SleepSchemaError, parse_sleep_sessions
 
 ROOT = Path(__file__).parents[1]
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -81,7 +81,13 @@ def _dispatch_fixture_contract(stem: str, state: str, fixture: dict) -> str:
         return "empty"
     if state == "schema_drift":
         assert fixture.get("unknown_structural_field") == "redacted"
-        # The adapter contract is fail-closed for this explicit drift state.
+        if stem == "garmin_sleep_structured":
+            try:
+                parse_sleep_sessions(fixture, date(2026, 2, 28))
+            except SleepSchemaError:
+                return "schema-drift"
+            raise AssertionError("sleep schema drift was accepted")
+        # The other family drift contracts are checked by their adapters.
         return "schema-drift"
     if stem == "garmin_sleep_streams":
         assert isinstance(fixture.get("sleepHeartRateValueDescriptorsDTOList"), list)
@@ -89,7 +95,7 @@ def _dispatch_fixture_contract(stem: str, state: str, fixture: dict) -> str:
         assert isinstance(payload, list)
         return "success"
     assert payload not in ({}, [], None)
-    source = json.loads((FIXTURES / f"{stem}.json").read_text())
+    source = fixture if stem == "garmin_sleep_structured" else json.loads((FIXTURES / f"{stem}.json").read_text())
     if stem == "garmin_activity_archive":
         assert normalize_activities(source["activities"], date(2026, 7, 24))
     elif stem == "garmin_health_events":
