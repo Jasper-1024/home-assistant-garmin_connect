@@ -117,4 +117,4 @@ def test_sleep_logical_id_canonicalizes_equivalent_offsets() -> None:
         date(2026, 7, 24),
     )[0]
     assert first.logical_id == second.logical_id
-    assert first.start != second.start
+    assert first.start.isoformat() != second.start.isoformat()
