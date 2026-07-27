@@ -10,7 +10,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from custom_components.garmin_connect.diagnostics import async_get_config_entry_diagnostics
-from custom_components.garmin_connect.history import HistoryCalendarEvent, HistoryStatus, HistorySyncReport
+from custom_components.garmin_connect.history import (
+    HistoryArchiveState,
+    HistoryCalendarEvent,
+    HistoryStatus,
+    HistorySyncReport,
+)
 
 ROOT = Path(__file__).parents[1]
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -81,7 +86,7 @@ def _assert_private_snapshot(value: object) -> None:
 
 @pytest.mark.asyncio
 async def test_release_privacy_snapshots_cover_diagnostics_status_action_and_calendars() -> None:
-    status = HistoryStatus("idle", current_date="2026-07-24").as_attributes()
+    status = HistoryStatus(HistoryArchiveState.IDLE, current_date="2026-07-24").as_attributes()
     report = HistorySyncReport(outcome="written")
     action_response = {
         "outcome": report.outcome,
