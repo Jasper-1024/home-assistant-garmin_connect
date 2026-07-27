@@ -104,9 +104,15 @@ def health_event_record(event: NormalizedHealthEvent) -> dict[str, Any]:
 def health_event_from_record(record: Mapping[str, Any]) -> NormalizedHealthEvent:
     if not isinstance(record, Mapping):
         raise HistorySchemaError("health event record is invalid")
-    strings = tuple(record.get(key) for key in ("source", "event_type", "category"))
+    source = record.get("source")
+    event_type = record.get("event_type")
+    category = record.get("category")
+    strings = (source, event_type, category)
     if any(value is not None and (not isinstance(value, str) or len(value) > 64) for value in strings):
         raise HistorySchemaError("health event record is invalid")
+    source = source if isinstance(source, str) else None
+    event_type = event_type if isinstance(event_type, str) else None
+    category = category if isinstance(category, str) else None
     logical_id, revision = record.get("logical_id"), record.get("revision")
     if not isinstance(logical_id, str) or len(logical_id) != 24 or any(char not in "0123456789abcdef" for char in logical_id):
         raise HistorySchemaError("health event record is invalid")
@@ -122,7 +128,7 @@ def health_event_from_record(record: Mapping[str, Any]) -> NormalizedHealthEvent
         raise HistorySchemaError("health event record is invalid") from err
     if any(record.get(key) is not None and values[key] is None for key in values):
         raise HistorySchemaError("health event record is invalid")
-    event = NormalizedHealthEvent(logical_id, revision, calendar_date, *strings, values["start"], values["end"], values["occurrence"])
+    event = NormalizedHealthEvent(logical_id, revision, calendar_date, source, event_type, category, values["start"], values["end"], values["occurrence"])
     return event
 
 
