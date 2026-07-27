@@ -91,7 +91,7 @@ class NormalizedHealthEvent:
 
 
 HistorySeries = tuple[NormalizedSample, ...]
-HistoryResult = HistorySeries | tuple[SleepSession, ...]
+HistoryResult = HistorySeries | tuple[SleepSession, ...] | tuple[NormalizedHealthEvent, ...]
 HistoryDetails = HistorySeries | HRVData | SegmentedData | SourceSeries | SnapshotData | tuple[SleepSession, ...] | tuple[NormalizedHealthEvent, ...]
 
 
