@@ -197,6 +197,7 @@ def test_optional_private_captured_fit_replay() -> None:
     raw_path = os.environ.get("GARMIN_SAKAMOTO13_FIT")
     if not raw_path:
         pytest.skip("GARMIN_SAKAMOTO13_FIT is not set")
+    assert raw_path is not None
     summary = inspect_fit(Path(raw_path), 0o600)
     assert summary["file"]["integrity_ok"] is True
     assert summary["file"]["decode_ok"] is True
