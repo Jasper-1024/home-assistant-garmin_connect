@@ -706,12 +706,12 @@ class GarminHistoryArchive:
             for records in self._health_events.values():
                 for record in records.values():
                     start = datetime.fromisoformat(record["start"]) if record.get("start") else None
-                    end = datetime.fromisoformat(record["end"]) if record.get("end") else start
+                    end = datetime.fromisoformat(record["end"]) if record.get("end") else None
                     occurrence = datetime.fromisoformat(record["occurrence"]) if record.get("occurrence") else start
                     point = occurrence or start
-                    if point is not None and start_date <= point.date() <= end_date:
+                    if start is not None and end is not None and start_date <= point.date() <= end_date:
                         summary = str(record.get("category") or record.get("event_type") or "Health event")[:64]
-                        events[(point, end or point, summary)] = HistoryCalendarEvent(point, end or point, summary)
+                        events[(start, end, summary)] = HistoryCalendarEvent(start, end, summary)
             return tuple(sorted(events.values(), key=lambda event: event.start))
         for records in self._sleep_sessions.values():
             for record in records.values():
@@ -774,6 +774,7 @@ class GarminHistoryArchive:
             except (KeyError, TypeError, ValueError, OSError):
                 self._sleep_sessions.pop(year, None)
                 self._health_events.pop(year, None)
+                self._completed_dates = {value for value in self._completed_dates if value[:4] != year}
 
     def _async_ensure_account_key(self) -> str:
         """Load or create the opaque identity persisted in the config entry."""

@@ -15,6 +15,8 @@ from custom_components.garmin_connect.history_source import (
     normalize_body_battery,
     normalize_floors,
     normalize_health_events,
+    health_event_from_record,
+    health_event_record,
     normalize_intensity,
     normalize_pair_series,
     normalize_respiration,
@@ -108,6 +110,10 @@ def test_health_event_revision_keeps_identity_and_rejects_bounds() -> None:
         normalize_health_events({"events": [{}] * 513}, date(2026, 7, 24))
     with pytest.raises(HistorySchemaError):
         normalize_health_events({"events": [{"source": "x" * 65}]}, date(2026, 7, 24))
+    record = health_event_record(first)
+    record["category"] = "changed"
+    with pytest.raises(HistorySchemaError):
+        health_event_from_record(record)
 
 def test_normalize_pair_series_rejects_incompatible_known_series() -> None:
     """A changed known field fails only this family/date."""

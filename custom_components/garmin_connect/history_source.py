@@ -90,6 +90,13 @@ class NormalizedHealthEvent:
     occurrence: datetime | None
 
 
+def _health_identity_revision(event_type: str | None, source: str | None, category: str | None, start: datetime | None, end: datetime | None, occurrence: datetime | None) -> tuple[str, str]:
+    identity = (event_type or "event", start.isoformat() if start else None, end.isoformat() if end else None, occurrence.isoformat() if occurrence else None)
+    logical_id = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()[:24]
+    revision = hashlib.sha256(json.dumps((source, event_type, category, identity), sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+    return logical_id, revision
+
+
 def health_event_record(event: NormalizedHealthEvent) -> dict[str, Any]:
     return {
         "logical_id": event.logical_id, "revision": event.revision,
@@ -128,6 +135,9 @@ def health_event_from_record(record: Mapping[str, Any]) -> NormalizedHealthEvent
         raise HistorySchemaError("health event record is invalid") from err
     if any(record.get(key) is not None and values[key] is None for key in values):
         raise HistorySchemaError("health event record is invalid")
+    expected_id, expected_revision = _health_identity_revision(event_type, source, category, values["start"], values["end"], values["occurrence"])
+    if logical_id != expected_id or revision != expected_revision:
+        raise HistorySchemaError("health event record is inconsistent")
     event = NormalizedHealthEvent(logical_id, revision, calendar_date, source, event_type, category, values["start"], values["end"], values["occurrence"])
     return event
 
@@ -178,9 +188,7 @@ def normalize_health_events(payload: Any, target_date: date) -> tuple[Normalized
         start = event_time(event, ("startTime", "startTimeGMT", "start"))
         end = event_time(event, ("endTime", "endTimeGMT", "end"))
         occurrence = event_time(event, ("occurrenceTime", "occurrenceTimeGMT", "eventTime", "timestamp", "time"))
-        identity = (event_type or "event", start.isoformat() if start else None, end.isoformat() if end else None, occurrence.isoformat() if occurrence else None)
-        logical_id = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()[:24]
-        revision = hashlib.sha256(json.dumps((source, event_type, category, identity), sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+        logical_id, revision = _health_identity_revision(event_type, source, category, start, end, occurrence)
         result[logical_id] = NormalizedHealthEvent(logical_id, revision, target_date, source, event_type, category, start, end, occurrence)
     return tuple(sorted(result.values(), key=lambda item: (item.start or item.occurrence or datetime.min.replace(tzinfo=UTC), item.logical_id)))
 
