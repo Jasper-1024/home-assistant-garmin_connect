@@ -16,6 +16,7 @@ from typing import Any, Protocol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
+from .backfill import BackfillScheduler, classify_backfill_error
 from .const import (
     CONF_HISTORY_ACCOUNT_KEY,
     DOMAIN,
@@ -308,6 +309,8 @@ class GarminHistoryArchive:
         self._fit_archives: dict[str, dict[str, dict[str, Any]]] = {}
         self._sleep_partition_stores: dict[str, Any] = {}
         self._presence: dict[str, dict[str, str]] = {}
+        self._backfill: BackfillScheduler | None = None
+        self._backfill_task: asyncio.Task[Any] | None = None
 
     @property
     def status(self) -> HistoryStatus:
@@ -406,16 +409,44 @@ class GarminHistoryArchive:
             return
 
         self._status = HistoryStatus(HistoryArchiveState.IDLE)
+        self._backfill = BackfillScheduler(
+            load_state=self._async_load_backfill_state,
+            save_state=self._async_save_backfill_state,
+            sync_date=lambda target: self.async_sync_range(target, target),
+        )
+        self._backfill_task = asyncio.create_task(self._backfill.async_run())
 
     async def async_stop(self) -> None:
         """Stop archive tasks and leave no background work behind."""
         self._started = False
+        if self._backfill is not None:
+            self._backfill.stop()
+        if self._backfill_task is not None:
+            self._backfill_task.cancel()
+            await asyncio.gather(self._backfill_task, return_exceptions=True)
+            self._backfill_task = None
         tasks = tuple(self._tasks)
         self._tasks.clear()
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _async_load_backfill_state(self) -> Any:
+        if self._store is None:
+            return None
+        catalog = await self._store.async_load()
+        return catalog.get("backfill") if isinstance(catalog, Mapping) else None
+
+    async def _async_save_backfill_state(self, state: Mapping[str, Any]) -> None:
+        if self._store is None:
+            return
+        catalog = await self._store.async_load()
+        if not isinstance(catalog, Mapping):
+            return
+        updated = dict(catalog)
+        updated["backfill"] = dict(state)
+        await self._store.async_save(updated)
 
     async def async_sync_range(self, start_date: date, end_date: date) -> HistorySyncReport:
         """Fetch and import the supported intraday metrics for an inclusive range."""
@@ -677,10 +708,10 @@ class GarminHistoryArchive:
             except asyncio.CancelledError:
                 self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated)
                 raise
-            except (AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError):
+            except (AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError) as error:
                 self._runtime_sync_failure = True
                 self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type="sync_failed")
-                return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome="failed", error_type="sync_failed")
+                return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome="failed", error_type=classify_backfill_error(error))
         self._runtime_sync_failure = False
         self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=end_date.isoformat(), processed_dates=len(processed), record_count=inserted + updated)
         return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome="written")
