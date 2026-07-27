@@ -421,7 +421,7 @@ class GarminHistoryArchive:
                         details_descriptor = inspect.getattr_static(source, "async_fetch_details")
                     except AttributeError:
                         details_descriptor = None
-                    details = None
+                    details: Any = None
                     if callable(details_descriptor):
                         bound_details = source.async_fetch_details
                         if inspect.iscoroutinefunction(details_descriptor) or inspect.iscoroutinefunction(bound_details):
