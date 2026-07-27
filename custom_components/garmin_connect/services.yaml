@@ -516,3 +516,30 @@ probe_capability:
       example: "2026-07-24"
       selector:
         date:
+
+sync_history:
+  name: Sync Garmin history
+  description: Import heart-rate and stress history for one bounded date range.
+  fields:
+    entity_id:
+      name: Garmin Connect entity
+      description: Optional entity used to select the Garmin account.
+      selector:
+        entity:
+          integration: garmin_connect
+          domain: sensor
+    date:
+      name: Date
+      description: One Garmin local calendar date.
+      selector:
+        date:
+    start_date:
+      name: Start date
+      description: Inclusive range start. Use with end_date.
+      selector:
+        date:
+    end_date:
+      name: End date
+      description: Inclusive range end. Use with start_date.
+      selector:
+        date:

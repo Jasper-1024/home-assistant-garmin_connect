@@ -19,6 +19,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
+from .history import GarminHistoryArchive, HistorySyncReport
 from .intraday_probe import (
     CAPABILITY_PROBES,
     METRICS,
@@ -43,6 +44,7 @@ SERVICE_ADD_HYDRATION = "add_hydration"
 SERVICE_ADD_NUTRITION = "add_nutrition_log"
 SERVICE_PROBE_INTRADAY = "probe_intraday"
 SERVICE_PROBE_CAPABILITY = "probe_capability"
+SERVICE_SYNC_HISTORY = "sync_history"
 
 # Service schemas
 SET_ACTIVE_GEAR_SCHEMA = vol.Schema(
@@ -175,6 +177,30 @@ PROBE_CAPABILITY_SCHEMA = vol.Schema(
 )
 
 
+def _sync_history_dates(data: dict) -> dict:
+    """Validate the mutually exclusive single-date/range inputs."""
+    if data.get("date") is not None and (
+        data.get("start_date") is not None or data.get("end_date") is not None
+    ):
+        raise vol.Invalid("date cannot be combined with start_date or end_date")
+    if (data.get("start_date") is None) != (data.get("end_date") is None):
+        raise vol.Invalid("start_date and end_date must be provided together")
+    return data
+
+
+SYNC_HISTORY_SCHEMA = vol.All(
+    vol.Schema(
+        {
+            vol.Optional("entity_id"): cv.entity_id,
+            vol.Optional("date"): vol.All(cv.string, vol.Coerce(date.fromisoformat)),
+            vol.Optional("start_date"): vol.All(cv.string, vol.Coerce(date.fromisoformat)),
+            vol.Optional("end_date"): vol.All(cv.string, vol.Coerce(date.fromisoformat)),
+        }
+    ),
+    _sync_history_dates,
+)
+
+
 def _get_client(
     hass: HomeAssistant,
     *,
@@ -225,6 +251,31 @@ def _get_client(
     return coordinators.core.client
 
 
+def _get_archive(hass: HomeAssistant, entity_id: str | None) -> GarminHistoryArchive:
+    """Resolve a history archive by the existing entity account convention."""
+    entries = hass.config_entries.async_entries(DOMAIN)
+    if not entries:
+        raise HomeAssistantError(
+            translation_domain=DOMAIN, translation_key="no_integration_configured"
+        )
+    if entity_id:
+        registry_entry = er.async_get(hass).async_get(entity_id)
+        entry_id = registry_entry.config_entry_id if registry_entry else None
+        entry = next((item for item in entries if item.entry_id == entry_id), None)
+        if entry is None:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="entity_not_found",
+                translation_placeholders={"entity_id": entity_id},
+            )
+    else:
+        entry = entries[0]
+    archive = getattr(getattr(entry, "runtime_data", None), "history_archive", None)
+    if not isinstance(archive, GarminHistoryArchive):
+        raise HomeAssistantError(translation_domain=DOMAIN, translation_key="integration_not_loaded")
+    return archive
+
+
 async def async_setup_services(hass: HomeAssistant) -> None:
     """Set up Garmin Connect services."""
 
@@ -259,6 +310,23 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             start_date,
             end_date,
         )
+
+    async def handle_sync_history(call: ServiceCall) -> ServiceResponse:
+        """Synchronize only heart-rate and stress history for a bounded range."""
+        target_date = call.data.get("date")
+        start_date = call.data.get("start_date") or target_date or dt_util.now().date()
+        end_date = call.data.get("end_date") or target_date or start_date
+        report: HistorySyncReport = await _get_archive(
+            hass, call.data.get("entity_id")
+        ).async_sync_range(start_date, end_date)
+        return {
+            "outcome": report.outcome,
+            "processed_dates": len(report.processed_dates),
+            "inserted_count": report.inserted_count,
+            "updated_count": report.updated_count,
+            "skipped_count": report.skipped_count,
+            "error_type": report.error_type,
+        }
 
     async def handle_set_active_gear(call: ServiceCall) -> None:
         """Handle set_active_gear service call."""
@@ -584,6 +652,13 @@ async def async_setup_services(hass: HomeAssistant) -> None:
     )
     hass.services.async_register(
         DOMAIN,
+        SERVICE_SYNC_HISTORY,
+        handle_sync_history,
+        schema=SYNC_HISTORY_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
+    )
+    hass.services.async_register(
+        DOMAIN,
         SERVICE_PROBE_CAPABILITY,
         handle_probe_capability,
         schema=PROBE_CAPABILITY_SCHEMA,
@@ -604,3 +679,4 @@ async def async_unload_services(hass: HomeAssistant) -> None:
     hass.services.async_remove(DOMAIN, SERVICE_ADD_NUTRITION)
     hass.services.async_remove(DOMAIN, SERVICE_PROBE_INTRADAY)
     hass.services.async_remove(DOMAIN, SERVICE_PROBE_CAPABILITY)
+    hass.services.async_remove(DOMAIN, SERVICE_SYNC_HISTORY)

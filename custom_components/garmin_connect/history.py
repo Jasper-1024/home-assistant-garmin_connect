@@ -26,6 +26,14 @@ from .const import (
     HISTORY_STORE_VERSION,
     RECORDER_COMPATIBILITY_TARGET,
 )
+from .history_recorder import (
+    HEART_RATE_METADATA,
+    STRESS_METADATA,
+    GarminHistoryRecorder,
+    RecorderWriteOutcome,
+    statistic_id_for,
+)
+from .history_source import GarminHistorySource
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,6 +44,8 @@ _ACCOUNT_KEY_ALPHABET = frozenset(
 )
 _RECORDER_SUPPORTED_VERSIONS = frozenset({"2026.7.3", "2026.7.4"})
 _RECORDER_BARRIER_TIMEOUT = 10
+_HISTORY_MIN_DATE = date(2026, 1, 1)
+_HISTORY_MAX_DAYS = 31
 
 
 class HistoryArchiveState(StrEnum):
@@ -211,12 +221,16 @@ class GarminHistoryArchive:
         *,
         recorder_checker: RecorderCompatibilityChecker | None = None,
         store_factory: Callable[..., Any] | None = None,
+        source_factory: Callable[..., GarminHistorySource] | None = None,
+        recorder_factory: Callable[..., GarminHistoryRecorder] | None = None,
     ) -> None:
         """Initialize an archive without doing I/O or creating tasks."""
         self._hass = hass
         self._entry = entry
         self._recorder_checker = recorder_checker or HomeAssistantRecorderCompatibility(hass)
         self._store_factory = store_factory
+        self._source_factory = source_factory
+        self._recorder_factory = recorder_factory
         self._store: Any | None = None
         self._started = False
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -300,11 +314,52 @@ class GarminHistoryArchive:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def async_sync_range(self, start_date: date, end_date: date) -> HistorySyncReport:
-        """Return a bounded placeholder until history synchronization is implemented."""
-        del start_date, end_date
+        """Fetch and import the supported intraday metrics for an inclusive range."""
+        validation_error = _validate_sync_range(start_date, end_date)
+        if validation_error:
+            return HistorySyncReport(outcome="invalid", error_type=validation_error)
         if self._status.state is not HistoryArchiveState.IDLE:
             return HistorySyncReport(outcome="disabled", error_type=self._status.error_type)
-        return HistorySyncReport()
+
+        runtime_data = getattr(self._entry, "runtime_data", None)
+        client = getattr(getattr(runtime_data, "core", None), "client", None)
+        request_gate = getattr(runtime_data, "request_gate", None)
+        if client is None:
+            return HistorySyncReport(outcome="failed", error_type="integration_not_loaded")
+        source = (self._source_factory or GarminHistorySource)(client, request_gate)
+        if self._recorder_factory:
+            recorder = self._recorder_factory()
+        else:
+            from homeassistant.helpers.recorder import get_instance
+
+            recorder = GarminHistoryRecorder(get_instance(self._hass))
+        processed: list[date] = []
+        inserted = 0
+        for offset in range((end_date - start_date).days + 1):
+            target = start_date.fromordinal(start_date.toordinal() + offset)
+            try:
+                for metric, metadata in (("heart_rate", HEART_RATE_METADATA), ("stress", STRESS_METADATA)):
+                    samples = await source.async_fetch(target, metric)
+                    outcome: RecorderWriteOutcome = await recorder.async_write(
+                        statistic_id_for(self._account_key(), metric), metadata, samples
+                    )
+                    if outcome.outcome != "written":
+                        return HistorySyncReport(tuple(processed), inserted, outcome=outcome.outcome, error_type=outcome.error_type)
+                    inserted += outcome.accepted_count
+                processed.append(target)
+            except asyncio.CancelledError:
+                raise
+            except (AttributeError, ImportError, TypeError, ValueError, RuntimeError):
+                return HistorySyncReport(tuple(processed), inserted, outcome="failed", error_type="sync_failed")
+        self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=end_date.isoformat(), processed_dates=len(processed), record_count=inserted)
+        return HistorySyncReport(tuple(processed), inserted, outcome="written")
+
+    def _account_key(self) -> str:
+        """Return the persisted opaque account key."""
+        account_key = self._entry.data.get(CONF_HISTORY_ACCOUNT_KEY)
+        if not isinstance(account_key, str) or not _is_valid_account_key(account_key):
+            raise RuntimeError("account identity unavailable")
+        return account_key
 
     async def async_get_calendar_events(
         self,
@@ -364,3 +419,14 @@ def _is_valid_account_key(value: str) -> bool:
     return _ACCOUNT_KEY_MIN_LENGTH <= len(value) <= _ACCOUNT_KEY_MAX_LENGTH and not (
         set(value) - _ACCOUNT_KEY_ALPHABET
     )
+
+
+def _validate_sync_range(start_date: date, end_date: date) -> str | None:
+    """Validate the bounded inclusive manual sync range."""
+    if start_date > end_date:
+        return "reversed_range"
+    if start_date < _HISTORY_MIN_DATE or end_date < _HISTORY_MIN_DATE:
+        return "date_before_minimum"
+    if (end_date - start_date).days + 1 > _HISTORY_MAX_DAYS:
+        return "range_too_large"
+    return None
