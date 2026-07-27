@@ -144,6 +144,29 @@ async def test_source_series_unwraps_and_presence_survives_restart():
 
 
 @pytest.mark.asyncio
+async def test_presence_catalog_loads_all_bounded_states():
+    """The private catalog preserves each availability classification."""
+    states = dict(zip(
+        ("a", "b", "c", "d", "e", "f"),
+        ("null", "empty", "missing", "unsupported", "returned-empty", "present"),
+        strict=True,
+    ))
+    store = _Store({
+        "account_key": "opaque-account-key-1234567890",
+        "schema_version": 1,
+        "completed_dates": [],
+        "hrv_summaries": {},
+        "presence": {"2026-01-01": states},
+    })
+    archive = _sync_archive(MagicMock(), MagicMock(), store)
+    await archive.async_start()
+
+    assert archive.get_history_presence(date(2026, 1, 1), date(2026, 1, 1)) == {
+        "2026-01-01": states
+    }
+
+
+@pytest.mark.asyncio
 async def test_archive_aggregates_import_classification_counts():
     source = MagicMock()
     source.async_fetch = AsyncMock(return_value=())

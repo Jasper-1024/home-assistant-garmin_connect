@@ -206,17 +206,22 @@ def _nested_value(payload: Any, aliases: tuple[str, ...], depth: int = 0) -> tup
 
 def _normalize_source_series(payload: Any, target_date: date, array_aliases: tuple[str, ...], value_keys: tuple[str, ...], descriptor_aliases: tuple[str, ...]) -> SourceSeries:
     if payload is None:
-        return SourceSeries((), "missing")
+        return SourceSeries((), "null")
+    if not isinstance(payload, dict):
+        return SourceSeries((), "unsupported")
+    marker = _nested_value(payload, ("presence", "state", "status", "availability"))
+    if marker is not None and isinstance(marker[0], str) and marker[0].lower() == "returned-empty":
+        return SourceSeries((), "returned-empty")
     found = _nested_value(payload, array_aliases)
     if found is None:
-        return SourceSeries((), "unsupported")
+        return SourceSeries((), "missing")
     values, array_key = found
     if values is None:
-        return SourceSeries((), "returned-empty")
+        return SourceSeries((), "null")
     if values == []:
-        return SourceSeries((), "returned-empty")
+        return SourceSeries((), "empty")
     if not isinstance(values, list):
-        raise HistorySchemaError(f"{array_key} is not an array")
+        return SourceSeries((), "unsupported")
     descriptor_found = _nested_value(payload, descriptor_aliases)
     series_payload = {array_key: values}
     if descriptor_found is not None:

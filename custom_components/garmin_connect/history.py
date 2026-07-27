@@ -66,7 +66,7 @@ _RECORDER_SUPPORTED_VERSIONS = frozenset({"2026.7.3", "2026.7.4"})
 _RECORDER_BARRIER_TIMEOUT = 10
 _HISTORY_MIN_DATE = date(2026, 1, 1)
 _HISTORY_MAX_DAYS = 31
-_PRESENCE_STATES = frozenset({"unsupported", "returned-empty", "present"})
+_PRESENCE_STATES = frozenset({"null", "empty", "missing", "unsupported", "returned-empty", "present"})
 
 
 class HistoryArchiveState(StrEnum):
