@@ -560,8 +560,16 @@ class GarminHistoryArchive:
                     inserted += getattr(outcome, "inserted_count", outcome.accepted_count)
                     updated += getattr(outcome, "updated_count", 0)
                     skipped += getattr(outcome, "skipped_count", 0)
+                try:
+                    sleep_descriptor = inspect.getattr_static(source, "async_fetch_details")
+                except AttributeError:
+                    sleep_descriptor = None
                 sleep_fetch = getattr(source, "async_fetch_details", None)
-                sleep_details = await sleep_fetch(target, "sleep_sessions") if callable(sleep_fetch) else ()
+                sleep_details = (
+                    await sleep_fetch(target, "sleep_sessions")
+                    if callable(sleep_descriptor) and callable(sleep_fetch)
+                    else ()
+                )
                 if not isinstance(sleep_details, tuple) or any(not isinstance(item, SleepSession) for item in sleep_details):
                     raise SleepSchemaError("sleep session result has invalid shape")
                 for session in sleep_details:
