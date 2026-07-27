@@ -792,6 +792,45 @@ async def test_valid_fit_survives_restart_revalidation(tmp_path: Path, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_background_fit_limit_defers_then_converges_across_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    activities = normalize_activities(
+        [{"activityId": 1100, "activityType": "running", "startTime": "2026-01-01T10:00:00Z", "durationInSeconds": 60}, {"activityId": 1101, "activityType": "cycling", "startTime": "2026-01-01T12:00:00Z", "durationInSeconds": 60}],
+        date(2026, 1, 1),
+    )
+    client = MagicMock()
+    client.download_activity = AsyncMock(return_value=b"fit")
+
+    class Source:
+        async def async_fetch(self, target, metric):
+            return ()
+
+        async def async_fetch_details(self, target, metric):
+            return activities if metric == "timed_activities" else ()
+
+    summary = {"message_counts": {"record": 1}, "message_fields": {"record": ["timestamp"]}, "time_coverage": {"start": None, "end": None}, "presence": dict.fromkeys(("heart_rate", "temperature", "gps", "cadence", "speed", "power", "training_effect", "training_load", "recovery_time", "recovery"), False), "file": {"integrity_ok": True, "decode_ok": True}}
+    monkeypatch.setattr(history_module, "inspect_fit", lambda path, mode: summary)
+    stores = {"garmin_connect.e.history_catalog": _NamedStore()}
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = _partition_archive(Source(), recorder, stores)
+    archive._entry.runtime_data.core.client = client
+    archive._hass.config.path.return_value = str(tmp_path)
+    await archive.async_start()
+    first = await archive.async_sync_range(date(2026, 1, 1), date(2026, 1, 1), fit_limit=1, include_training_status=False)
+    assert first.error_type == "fit_limit_pending"
+    assert "2026-01-01" not in stores["garmin_connect.e.history_catalog"].data["completed_dates"]
+    assert len(stores["garmin_connect.e.sleep_2026"].data["fits"]) == 1
+    restarted = _partition_archive(Source(), recorder, stores)
+    restarted._entry.runtime_data.core.client = client
+    restarted._hass.config.path.return_value = str(tmp_path)
+    await restarted.async_start()
+    second = await restarted.async_sync_range(date(2026, 1, 1), date(2026, 1, 1), fit_limit=1, include_training_status=False)
+    assert second.outcome == "written"
+    assert "2026-01-01" in stores["garmin_connect.e.history_catalog"].data["completed_dates"]
+    assert client.download_activity.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_calendar_loads_prior_year_partition_for_cross_year_sleep():
     session = parse_sleep_sessions(
         {"startTime": "2025-12-31T22:00:00Z", "endTime": "2026-01-01T06:00:00Z"},

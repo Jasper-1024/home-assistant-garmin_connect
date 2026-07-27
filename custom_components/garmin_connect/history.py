@@ -724,6 +724,7 @@ class GarminHistoryArchive:
                 if not isinstance(activity_details, tuple) or any(not isinstance(item, NormalizedActivity) for item in activity_details):
                     raise ValueError("activity result has invalid shape")
                 fit_count = 0
+                fit_deferred = False
                 for activity in activity_details:
                     year = str(activity.calendar_date.year)
                     activities_by_year.setdefault(year, {})[activity.logical_id] = {
@@ -734,8 +735,11 @@ class GarminHistoryArchive:
                     }
                     download_activity = getattr(client, "download_activity", None)
                     if callable(download_activity):
+                        if activity.logical_id in self._fit_archives.get(year, {}):
+                            continue
                         if fit_limit is not None and fit_count >= fit_limit:
-                            raise RuntimeError("fit_limit_pending")
+                            fit_deferred = True
+                            continue
                         fit_directory = Path(self._hass.config.path("garmin_connect", "fit"))
                         fit_result = await async_archive_fit(
                             client=client,
@@ -749,14 +753,18 @@ class GarminHistoryArchive:
                 processed.append(target)
                 completed_dates = self._completed_dates | {target_key}
                 await self._async_save_sleep_partitions(sleep_sessions, events_by_year, activities_by_year, self._fit_archives)
+                self._sleep_sessions = sleep_sessions
+                self._health_events = events_by_year
+                self._activities = activities_by_year
+                if fit_deferred:
+                    self._runtime_sync_failure = True
+                    self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, error_type="fit_limit_pending", **self._backfill_status_fields())
+                    return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome="failed", error_type="fit_limit_pending")
                 # Publish the catalog checkpoint only after every affected annual
                 # partition is durable. A failed partition save must be replayed.
                 await store.async_save({"schema_version": HISTORY_STORE_VERSION, "sleep_schema_version": _SLEEP_SCHEMA_VERSION, "account_key": self._account_key(), "completed_dates": sorted(completed_dates), "hrv_summaries": self._hrv_summaries, "presence": presence, "sleep_index": {year: sorted(records) for year, records in sleep_sessions.items()}, "event_index": {year: sorted(records) for year, records in events_by_year.items()}, "activity_index": {year: sorted(records) for year, records in activities_by_year.items()}})
                 self._completed_dates = completed_dates
                 self._presence = presence
-                self._sleep_sessions = sleep_sessions
-                self._health_events = events_by_year
-                self._activities = activities_by_year
             except asyncio.CancelledError:
                 self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
                 raise
