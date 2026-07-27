@@ -62,7 +62,7 @@ def _get_client_for_entry(mock_hass: MagicMock, entry_id: str) -> AsyncMock:
 
 
 async def test_setup_registers_all_services(mock_hass: MagicMock) -> None:
-    """async_setup_services must register all 11 service handlers."""
+    """async_setup_services must register all service handlers."""
     await async_setup_services(mock_hass)
 
     registered = {call[0][1] for call in mock_hass.services.async_register.call_args_list}
@@ -78,11 +78,12 @@ async def test_setup_registers_all_services(mock_hass: MagicMock) -> None:
         "add_nutrition_log",
         "probe_intraday",
         "probe_capability",
+        "sync_history",
     }
 
 
 async def test_unload_removes_all_services(mock_hass: MagicMock) -> None:
-    """async_unload_services must remove all 11 services."""
+    """async_unload_services must remove all services."""
     await async_unload_services(mock_hass)
 
     removed = {call[0][1] for call in mock_hass.services.async_remove.call_args_list}
@@ -98,6 +99,7 @@ async def test_unload_removes_all_services(mock_hass: MagicMock) -> None:
         "add_nutrition_log",
         "probe_intraday",
         "probe_capability",
+        "sync_history",
     }
 
 
