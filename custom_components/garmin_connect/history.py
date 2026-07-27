@@ -22,6 +22,7 @@ from .const import (
     HISTORY_STORE_VERSION,
     RECORDER_COMPATIBILITY_TARGET,
 )
+from .fit_archive import FitArchiveError, async_archive_fit, fit_record, inspect_fit
 from .history_recorder import (
     BODY_BATTERY_METADATA,
     DAILY_ABNORMAL_HR_METADATA,
@@ -76,7 +77,6 @@ from .history_source import (
     health_event_from_record,
     health_event_record,
 )
-from .fit_archive import FitArchiveError, async_archive_fit, fit_record, inspect_fit
 from .sleep_archive import SleepSchemaError, SleepSession, session_from_record, session_record
 
 _LOGGER = logging.getLogger(__name__)

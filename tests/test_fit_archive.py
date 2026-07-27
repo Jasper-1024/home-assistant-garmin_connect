@@ -9,8 +9,8 @@ import pytest
 from custom_components.garmin_connect.fit_archive import (
     FitArchiveError,
     async_archive_fit,
-    fit_record,
     fit_file_name,
+    fit_record,
 )
 
 
@@ -24,6 +24,18 @@ def _summary() -> dict[str, object]:
     }
 
 
+def _valid_inspector(path: Path, required_mode: int) -> dict[str, object]:
+    return _summary()
+
+
+def _crc_failure(path: Path, required_mode: int) -> dict[str, object]:
+    raise ValueError("CRC")
+
+
+def _invalid_inspector(path: Path, required_mode: int) -> dict[str, object]:
+    return {"file": {"integrity_ok": False, "decode_ok": True}}
+
+
 @pytest.mark.asyncio
 async def test_fit_archive_validates_privately_and_atomically(tmp_path: Path) -> None:
     client = AsyncMock()
@@ -33,7 +45,7 @@ async def test_fit_archive_validates_privately_and_atomically(tmp_path: Path) ->
         activity_id="12345",
         logical_id="a" * 24,
         directory=tmp_path,
-        inspect=lambda path, required_mode: _summary(),
+        inspect=_valid_inspector,
     )
     final = tmp_path / fit_file_name("a" * 24)
     assert final.read_bytes() == b"validated fit bytes"
@@ -53,7 +65,7 @@ async def test_fit_archive_validation_failure_leaves_no_partial_file(tmp_path: P
             activity_id="12345",
             logical_id="b" * 24,
             directory=tmp_path,
-            inspect=lambda path, required_mode: (_ for _ in ()).throw(ValueError("CRC")),
+            inspect=_crc_failure,
         )
     assert not (tmp_path / fit_file_name("b" * 24)).exists()
     assert not tuple(tmp_path.glob(".*.fit"))
@@ -69,7 +81,7 @@ async def test_fit_archive_rejects_crc_or_decode_failure(tmp_path: Path) -> None
             activity_id="12345",
             logical_id="c" * 24,
             directory=tmp_path,
-            inspect=lambda path, required_mode: {"file": {"integrity_ok": False, "decode_ok": True}},
+            inspect=_invalid_inspector,
         )
 
 
@@ -79,13 +91,12 @@ async def test_valid_existing_fit_is_reused_without_download(tmp_path: Path) -> 
     final = tmp_path / fit_file_name("d" * 24)
     final.write_bytes(b"existing")
     final.chmod(0o600)
-    inspect = lambda path, required_mode: _summary()
     result = await async_archive_fit(
         client=client,
         activity_id="12345",
         logical_id="d" * 24,
         directory=tmp_path,
-        inspect=inspect,
+        inspect=_valid_inspector,
     )
     client.download_activity.assert_not_awaited()
     assert result["logical_id"] == "d" * 24
@@ -104,7 +115,7 @@ async def test_bad_existing_fit_is_not_replaced(tmp_path: Path) -> None:
             activity_id="12345",
             logical_id="e" * 24,
             directory=tmp_path,
-            inspect=lambda path, required_mode: {"file": {"integrity_ok": False, "decode_ok": True}},
+            inspect=_invalid_inspector,
         )
     client.download_activity.assert_not_awaited()
     assert final.read_bytes() == b"bad existing"
@@ -120,7 +131,7 @@ async def test_cancelled_download_leaves_no_temporary_or_target_file(tmp_path: P
             activity_id="12345",
             logical_id="f" * 24,
             directory=tmp_path,
-            inspect=lambda path, required_mode: _summary(),
+            inspect=_valid_inspector,
         )
     assert not (tmp_path / fit_file_name("f" * 24)).exists()
     assert not tuple(tmp_path.glob(".*.fit"))
