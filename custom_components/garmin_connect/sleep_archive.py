@@ -81,6 +81,24 @@ def _structured_list(value: Any) -> tuple[Any, ...]:
     return tuple(_bounded_structured(item) for item in value)
 
 
+def _stage_list(value: Any) -> tuple[Any, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise SleepSchemaError("sleep stages have invalid type")
+    stages: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise SleepSchemaError("sleep stage has invalid type")
+        if any(key not in item for key in ("startGMT", "activityLevel", "activityType")):
+            raise SleepSchemaError("sleep stage has invalid shape")
+        bounded = _bounded_structured(item)
+        if not isinstance(bounded, dict):
+            raise SleepSchemaError("sleep stage has invalid shape")
+        stages.append(bounded)
+    return tuple(stages)
+
+
 def _score(payload: dict[str, Any]) -> dict[str, Any]:
     raw = payload.get("sleepScores", payload.get("score", {}))
     if raw is None:
@@ -115,7 +133,9 @@ def parse_sleep_sessions(payload: Any, target_date: date) -> tuple[SleepSession,
         if naps is not None:
             if not isinstance(naps, list):
                 raise SleepSchemaError("sleep naps have invalid type")
-            candidates.extend(("nap", item) for item in naps if isinstance(item, dict))
+            if any(not isinstance(item, dict) for item in naps):
+                raise SleepSchemaError("sleep nap has invalid type")
+            candidates.extend(("nap", item) for item in naps)
     sessions: dict[str, SleepSession] = {}
     for kind, item in candidates:
         start_raw = _first(item, ("sleepStartTimestampGMT", "startTimeGMT", "startTime", "start"))
@@ -139,7 +159,7 @@ def parse_sleep_sessions(payload: Any, target_date: date) -> tuple[SleepSession,
         sessions[logical_id] = SleepSession(
             logical_id, kind, start, end, target_date, revision, _score(item),
             _structured_list(item.get("adjustments")), _structured_list(item.get("feedback")),
-            _structured_list(item.get("restlessEvents")), _structured_list(item.get("sleepLevels")),
+            _structured_list(item.get("restlessEvents")), _stage_list(item.get("sleepLevels")),
         )
     return tuple(sorted(sessions.values(), key=lambda item: (item.start, item.logical_id)))
 
@@ -159,18 +179,40 @@ def session_record(session: SleepSession) -> dict[str, Any]:
 def session_from_record(record: dict[str, Any]) -> SleepSession:
     """Restore one validated session from an annual Store partition."""
     try:
+        logical_id = record["logical_id"]
+        kind = record["kind"]
+        start = datetime.fromisoformat(record["start"])
+        end = datetime.fromisoformat(record["end"])
+        calendar_date = date.fromisoformat(record["calendar_date"])
+        revision = record["revision"]
+        score = record["score"]
+        if (
+            not isinstance(logical_id, str)
+            or len(logical_id) != 24
+            or any(character not in "0123456789abcdef" for character in logical_id)
+            or kind not in {"main", "nap"}
+            or start.tzinfo is None
+            or end.tzinfo is None
+            or end <= start
+            or not isinstance(revision, str)
+            or len(revision) != 16
+            or any(character not in "0123456789abcdef" for character in revision)
+            or not isinstance(score, dict)
+        ):
+            raise SleepSchemaError("sleep Store record is invalid")
+        expected_id = hashlib.sha256(f"{kind}:{start.isoformat()}:{end.isoformat()}".encode()).hexdigest()[:24]
+        if logical_id != expected_id:
+            raise SleepSchemaError("sleep Store record is invalid")
+        bounded_score = _bounded_structured(score)
+        if not isinstance(bounded_score, dict):
+            raise SleepSchemaError("sleep Store record is invalid")
         return SleepSession(
-            logical_id=record["logical_id"],
-            kind=record["kind"],
-            start=datetime.fromisoformat(record["start"]),
-            end=datetime.fromisoformat(record["end"]),
-            calendar_date=date.fromisoformat(record["calendar_date"]),
-            revision=record["revision"],
-            score=record["score"],
-            adjustments=tuple(record["adjustments"]),
-            feedback=tuple(record["feedback"]),
-            restless_events=tuple(record["restless_events"]),
-            stages=tuple(record["stages"]),
+            logical_id=logical_id, kind=kind, start=start, end=end,
+            calendar_date=calendar_date, revision=revision, score=bounded_score,
+            adjustments=_structured_list(record["adjustments"]),
+            feedback=_structured_list(record["feedback"]),
+            restless_events=_structured_list(record["restless_events"]),
+            stages=_stage_list(record["stages"]),
         )
     except (KeyError, TypeError, ValueError) as err:
         raise SleepSchemaError("sleep Store record is invalid") from err

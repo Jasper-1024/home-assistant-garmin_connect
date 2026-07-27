@@ -42,6 +42,8 @@ def test_sleep_parser_keeps_main_nap_and_ignores_numeric_arrays() -> None:
 def test_sleep_parser_rejects_known_shape_drift() -> None:
     with pytest.raises(SleepSchemaError):
         parse_sleep_sessions({"sleepData": {"napEvents": "bad"}}, date(2026, 7, 24))
+    with pytest.raises(SleepSchemaError):
+        parse_sleep_sessions({"sleepData": {"napEvents": [{} , "bad"]}}, date(2026, 7, 24))
 
 
 def test_logical_id_is_stable_across_score_revisions() -> None:
@@ -75,6 +77,21 @@ def test_sleep_parser_preserves_structured_event_fields_and_rejects_numeric_even
 
     with pytest.raises(SleepSchemaError):
         parse_sleep_sessions({**payload, "sleepLevels": [1, 2]}, date(2026, 3, 29))
+
+    with pytest.raises(SleepSchemaError):
+        parse_sleep_sessions({**payload, "sleepLevels": [{"startGMT": "x"}]}, date(2026, 3, 29))
+
+
+def test_sleep_record_restore_rejects_corrupt_identity_and_fields() -> None:
+    session = parse_sleep_sessions(
+        {"startTime": "2026-07-24T00:00:00Z", "endTime": "2026-07-24T08:00:00Z"},
+        date(2026, 7, 24),
+    )[0]
+    record = session_record(session)
+    for field, value in (("kind", "unknown"), ("revision", "bad"), ("stages", ["bad"]), ("score", [])):
+        corrupt = {**record, field: value}
+        with pytest.raises(SleepSchemaError):
+            session_from_record(corrupt)
 
 
 def test_sleep_parser_handles_leap_day_and_overlap_identity() -> None:
