@@ -102,7 +102,7 @@ class GarminConnectConfigFlow(ConfigFlow, domain=DOMAIN):
         entry = self._get_reauth_entry()
         self.hass.config_entries.async_update_entry(
             entry,
-            data=self._token_data(),
+            data={**entry.data, **self._token_data()},
             options={**entry.options, CONF_IS_CN: self._is_cn},
         )
         await self.hass.config_entries.async_reload(entry.entry_id)
@@ -113,7 +113,7 @@ class GarminConnectConfigFlow(ConfigFlow, domain=DOMAIN):
         entry = self._get_reconfigure_entry()
         self.hass.config_entries.async_update_entry(
             entry,
-            data=self._token_data(),
+            data={**entry.data, **self._token_data()},
             options={**entry.options, CONF_IS_CN: self._is_cn},
         )
         await self.hass.config_entries.async_reload(entry.entry_id)

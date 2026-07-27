@@ -9,8 +9,10 @@ from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.core import HomeAssistant
 
 from .coordinator import GarminConnectConfigEntry
+from .history import GarminHistoryArchive
 
 TO_REDACT = {
+    "history_account_key",
     "token",
     "refresh_token",
     "client_id",
@@ -33,6 +35,11 @@ async def async_get_config_entry_diagnostics(
     coordinator_info: dict[str, Any] = {}
     for field in fields(coordinators):
         coordinator = getattr(coordinators, field.name)
+        if isinstance(coordinator, GarminHistoryArchive):
+            coordinator_info[field.name] = coordinator.status.as_attributes()
+            continue
+        if coordinator is None:
+            continue
         data = coordinator.data or {}
         data_keys = list(data.keys())
         coordinator_info[field.name] = {

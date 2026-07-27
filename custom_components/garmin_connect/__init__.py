@@ -25,6 +25,7 @@ from .coordinator import (
     NutritionCoordinator,
     TrainingCoordinator,
 )
+from .history import GarminHistoryArchive
 from .services import async_setup_services, async_unload_services
 
 _LOGGER = logging.getLogger(__name__)
@@ -193,6 +194,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: GarminConnectConfigEntry
         return_exceptions=True,
     )
 
+    history_archive = GarminHistoryArchive(hass, entry)
+    try:
+        await history_archive.async_start()
+    except asyncio.CancelledError:
+        await history_archive.async_stop()
+        raise
+    except Exception:
+        # The archive is optional.  Its implementation must never prevent
+        # current-value coordinators from loading.
+        _LOGGER.warning(
+            "Garmin history archive could not start for entry %s",
+            entry.entry_id,
+        )
+    coordinators.history_archive = history_archive
     entry.runtime_data = coordinators
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -214,6 +229,10 @@ async def async_options_update_listener(
 
 async def async_unload_entry(hass: HomeAssistant, entry: GarminConnectConfigEntry) -> bool:
     """Unload a config entry."""
+    history_archive = getattr(entry.runtime_data, "history_archive", None)
+    if isinstance(history_archive, GarminHistoryArchive):
+        await history_archive.async_stop()
+
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
     if unload_ok and len(hass.config_entries.async_entries(DOMAIN)) == 1:

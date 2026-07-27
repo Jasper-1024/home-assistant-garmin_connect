@@ -116,6 +116,7 @@ async def test_diagnostics_handles_none_update_interval() -> None:
 def test_to_redact_contains_expected_keys() -> None:
     """Test that the redaction set covers all sensitive fields."""
     expected = {
+        "history_account_key",
         "token",
         "refresh_token",
         "client_id",

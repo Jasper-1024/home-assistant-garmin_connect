@@ -38,6 +38,7 @@ from .coordinator import (
     GearCoordinator,
     TrainingCoordinator,
 )
+from .history import GarminHistoryArchive
 
 # Limit parallel updates to prevent API rate limiting
 PARALLEL_UPDATES = 1
@@ -72,6 +73,16 @@ class GarminConnectSensorEntityDescription(SensorEntityDescription):
 
     preserve_value: bool = False
     """Retain last known value when API returns None (weight, sleep at midnight, etc)."""
+
+
+# The archive status is lifecycle metadata rather than Garmin data, but it
+# still uses the integration's description convention for stable entity keys.
+HISTORY_STATUS_SENSOR_DESCRIPTIONS: tuple[GarminConnectSensorEntityDescription, ...] = (
+    GarminConnectSensorEntityDescription(
+        key="history_status",
+        name="History status",
+    ),
+)
 
 
 # ── CORE coordinator sensors ─────────────────────────────────────────────────
@@ -1719,6 +1730,12 @@ async def async_setup_entry(
         coordinator = getattr(coordinators, _COORDINATOR_ATTR[coord_type])
         for description in descriptions:
             entities.append(GarminConnectSensor(coordinator, description, entry.entry_id))
+
+    history_archive = getattr(coordinators, "history_archive", None)
+    if isinstance(history_archive, GarminHistoryArchive):
+        from .history_sensor import GarminHistoryStatusSensor
+
+        entities.append(GarminHistoryStatusSensor(history_archive, entry.entry_id))
 
     # Migrate the legacy entity_id created from duplicate translated names:
     # sleepTimeMinutes was previously shown as "Sleep duration", which often

@@ -188,6 +188,31 @@ async def test_reconfigure_step_shows_form() -> None:
     assert result["step_id"] == "reconfigure"
 
 
+async def test_reauth_preserves_history_account_key() -> None:
+    """Re-authentication must replace tokens without replacing archive identity."""
+    from homeassistant.config_entries import SOURCE_REAUTH
+
+    from custom_components.garmin_connect.config_flow import GarminConnectConfigFlow
+
+    mock_entry = MagicMock()
+    mock_entry.options = {}
+    mock_entry.data = {"history_account_key": "opaque-account-key-123456"}
+    flow = GarminConnectConfigFlow()
+    flow.hass = MagicMock()
+    flow.hass.config_entries.async_get_known_entry.return_value = mock_entry
+    flow.hass.config_entries.async_update_entry = MagicMock()
+    flow.hass.config_entries.async_reload = AsyncMock()
+    flow.context = {"source": SOURCE_REAUTH, "entry_id": "test_entry_id"}
+    flow._auth = _make_auth_mock()
+    flow._is_cn = False
+
+    await flow._async_finish_reauth()
+
+    updated_data = flow.hass.config_entries.async_update_entry.call_args.kwargs["data"]
+    assert updated_data["history_account_key"] == "opaque-account-key-123456"
+    assert updated_data["token"] == flow._auth.di_token
+
+
 # ── Implementation constraints ────────────────────────────────────────────────
 
 

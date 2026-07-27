@@ -8,6 +8,13 @@ DOMAIN: Final = "garmin_connect"
 CONF_TOKEN: Final = "token"
 CONF_REFRESH_TOKEN: Final = "refresh_token"
 CONF_CLIENT_ID: Final = "client_id"
+CONF_HISTORY_ACCOUNT_KEY: Final = "history_account_key"
+
+# The history archive intentionally has a separate identity from Garmin
+# credentials.  It is persisted in the config entry and never derived from
+# an account identifier.
+HISTORY_STORE_VERSION: Final = 1
+RECORDER_COMPATIBILITY_TARGET: Final = "Home Assistant 2026.7.4 Recorder path B"
 
 # Options
 CONF_IS_CN: Final = "is_cn"

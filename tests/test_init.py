@@ -14,6 +14,7 @@ from custom_components.garmin_connect.const import (
     CONF_REFRESH_TOKEN,
     CONF_TOKEN,
 )
+from custom_components.garmin_connect.history import GarminHistoryArchive
 
 from .conftest import ENTRY_DATA
 
@@ -173,6 +174,34 @@ async def test_setup_entry_registers_services_when_not_present() -> None:
     setup_services.assert_awaited_once()
 
 
+async def test_archive_startup_failure_does_not_block_current_setup() -> None:
+    """Archive startup failure must leave coordinators and sensor setup active."""
+    entry = MagicMock()
+    entry.data = dict(ENTRY_DATA)
+    entry.options = {}
+    hass = MagicMock()
+    hass.config.country = "US"
+    hass.services.has_service = MagicMock(return_value=True)
+    hass.config_entries.async_forward_entry_setups = AsyncMock()
+
+    coord = _coord_mock()
+    archive = MagicMock()
+    archive.async_start = AsyncMock(side_effect=RuntimeError("archive unavailable"))
+    with ExitStack() as stack:
+        stack.enter_context(patch("custom_components.garmin_connect.GarminAuth"))
+        stack.enter_context(patch("custom_components.garmin_connect.GarminClient"))
+        _stack_coordinators(stack, coord)
+        stack.enter_context(
+            patch("custom_components.garmin_connect.GarminHistoryArchive", return_value=archive)
+        )
+
+        result = await async_setup_entry(hass, entry)
+
+    assert result is True
+    archive.async_start.assert_awaited_once()
+    hass.config_entries.async_forward_entry_setups.assert_awaited_once()
+
+
 async def test_setup_entry_skips_services_when_already_registered() -> None:
     """Services are not re-registered when has_service returns True."""
     entry = MagicMock()
@@ -231,6 +260,37 @@ async def test_unload_entry_keeps_services_when_other_entries_exist() -> None:
 
     assert result is True
     unload_services.assert_not_awaited()
+
+
+async def test_unload_entry_stops_history_archive() -> None:
+    """Config-entry unload must stop the per-entry archive first."""
+    from custom_components.garmin_connect.coordinator import GarminConnectCoordinators
+
+    entry = MagicMock()
+    archive = MagicMock(spec=GarminHistoryArchive)
+    archive.async_stop = AsyncMock()
+    coord = _coord_mock()
+    entry.runtime_data = GarminConnectCoordinators(
+        core=coord,
+        activity=coord,
+        training=coord,
+        body=coord,
+        goals=coord,
+        gear=coord,
+        blood_pressure=coord,
+        menstrual=coord,
+        nutrition=coord,
+        history_archive=archive,
+    )
+    hass = MagicMock()
+    hass.config_entries.async_entries = MagicMock(return_value=[entry])
+    hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
+
+    with patch("custom_components.garmin_connect.async_unload_services", new=AsyncMock()):
+        result = await async_unload_entry(hass, entry)
+
+    assert result is True
+    archive.async_stop.assert_awaited_once()
 
 
 # ── Migration tests ───────────────────────────────────────────────────────────

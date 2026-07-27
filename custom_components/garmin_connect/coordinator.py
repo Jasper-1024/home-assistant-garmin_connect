@@ -9,7 +9,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ha_garmin import GarminAuth, GarminClient
 from ha_garmin.exceptions import GarminAuthError
@@ -29,6 +29,9 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from .history import GarminHistoryArchive
+
 
 @dataclass
 class GarminConnectCoordinators:
@@ -43,6 +46,7 @@ class GarminConnectCoordinators:
     blood_pressure: BloodPressureCoordinator
     menstrual: MenstrualCoordinator
     nutrition: NutritionCoordinator
+    history_archive: GarminHistoryArchive | None = None
 
 
 class BaseGarminCoordinator(DataUpdateCoordinator[dict[str, Any]]):
