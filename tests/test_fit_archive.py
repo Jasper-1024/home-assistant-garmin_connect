@@ -19,7 +19,7 @@ def _summary() -> dict[str, object]:
         "message_counts": {"record": 4},
         "message_fields": {"record": ["heart_rate", "timestamp"]},
         "time_coverage": {"start": "2026-07-24T00:00:00+00:00", "end": "2026-07-24T01:00:00+00:00"},
-        "presence": {"heart_rate": True, "gps": False, "temperature": False},
+        "presence": {key: False for key in ("heart_rate", "temperature", "gps", "cadence", "speed", "power", "training_effect", "training_load", "recovery_time", "recovery")},
         "file": {"size_bytes": 999, "integrity_ok": True, "decode_ok": True, "raw": "must not persist"},
     }
 
@@ -143,3 +143,14 @@ def test_fit_record_keeps_opaque_activity_association_and_rejects_mismatch() -> 
     assert "heart_rate" in record["summary"]["message_fields"]["record"]
     with pytest.raises(FitArchiveError):
         fit_record({"logical_id": "b" * 24, "path": fit_file_name("a" * 24), "summary": _summary()})
+
+
+def test_fit_record_rejects_raw_or_unbounded_summary_fields() -> None:
+    raw_summary = _summary()
+    raw_summary["measurement"] = 42
+    with pytest.raises(FitArchiveError):
+        fit_record({"logical_id": "a" * 24, "path": fit_file_name("a" * 24), "summary": raw_summary})
+    injected = _summary()
+    injected["message_counts"] = {"record": "177"}
+    with pytest.raises(FitArchiveError):
+        fit_record({"logical_id": "a" * 24, "path": fit_file_name("a" * 24), "summary": injected})

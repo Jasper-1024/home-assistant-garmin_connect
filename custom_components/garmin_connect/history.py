@@ -834,10 +834,19 @@ class GarminHistoryArchive:
                     raise FitArchiveError("FIT partition is invalid")
                 parsed_fits: dict[str, dict[str, Any]] = {}
                 for key, value in raw_fits.items():
-                    restored_fit = fit_record(value)
-                    if restored_fit["logical_id"] != key:
-                        raise FitArchiveError("FIT partition is invalid")
-                    parsed_fits[key] = restored_fit
+                    try:
+                        restored_fit = fit_record(value)
+                        if restored_fit["logical_id"] != key or key not in parsed_activities:
+                            continue
+                        fit_directory = Path(self._hass.config.path("garmin_connect", "fit")).resolve()
+                        fit_path = (fit_directory / restored_fit["path"]).resolve()
+                        if fit_path.parent != fit_directory or not fit_path.is_file():
+                            continue
+                        inspected = await asyncio.to_thread(inspect_fit, fit_path, 0o600)
+                        restored_fit = {"logical_id": key, "path": fit_path.name, "summary": inspected}
+                        parsed_fits[key] = fit_record(restored_fit)
+                    except (OSError, RuntimeError, TypeError, ValueError):
+                        continue
                 self._fit_archives[year] = parsed_fits
             except (KeyError, TypeError, ValueError, OSError):
                 self._sleep_sessions.pop(year, None)

@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import os
 import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, cast
+
+from .fit_inspector import inspect_fit as _inspect_fit
+
+_SUMMARY_KEYS = frozenset({"message_counts", "message_fields", "time_coverage", "presence"})
+_PRESENCE_KEYS = frozenset({"heart_rate", "temperature", "gps", "cadence", "speed", "power", "training_effect", "training_load", "recovery_time", "recovery"})
+_MAX_MESSAGES = 512
+_MAX_FIELDS = 256
+_MAX_NAME = 96
 
 
 class FitArchiveError(ValueError):
@@ -17,13 +24,7 @@ class FitArchiveError(ValueError):
 
 def inspect_fit(path: Path, required_mode: int = 0o600) -> dict[str, Any]:
     """Use the checked-in privacy-minimizing FIT inspector."""
-    inspector_path = Path(__file__).parents[2] / "scripts" / "inspect_garmin_fit.py"
-    spec = importlib.util.spec_from_file_location("garmin_fit_inspector", inspector_path)
-    if spec is None or spec.loader is None:
-        raise FitArchiveError("FIT inspector unavailable")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    inspector = cast(Callable[[Path, int], dict[str, Any]], module.inspect_fit)
+    inspector = cast(Callable[[Path, int], dict[str, Any]], _inspect_fit)
     return inspector(path, required_mode)
 
 
@@ -39,10 +40,43 @@ def _summary_without_file(summary: Mapping[str, Any], *, require_integrity: bool
     file_info = summary.get("file")
     if require_integrity and (not isinstance(file_info, Mapping) or file_info.get("integrity_ok") is not True or file_info.get("decode_ok") is not True):
         raise FitArchiveError("FIT integrity or decode failed")
-    allowed = {"message_counts", "message_fields", "time_coverage", "presence"}
+    if set(summary) - _SUMMARY_KEYS - {"file"}:
+        raise FitArchiveError("FIT summary has unknown fields")
+    allowed = set(_SUMMARY_KEYS)
     result = {key: summary[key] for key in allowed if key in summary}
+    if set(result) != _SUMMARY_KEYS:
+        raise FitArchiveError("FIT summary is incomplete")
+    counts = result["message_counts"]
+    fields = result["message_fields"]
+    coverage = result["time_coverage"]
+    if not isinstance(counts, Mapping) or len(counts) > _MAX_MESSAGES or any(
+        not isinstance(name, str) or len(name) > _MAX_NAME or not isinstance(count, int) or isinstance(count, bool) or not 0 <= count <= 1_000_000
+        for name, count in counts.items()
+    ):
+        raise FitArchiveError("FIT message counts are invalid")
+    if not isinstance(fields, Mapping) or len(fields) > _MAX_MESSAGES or any(
+        not isinstance(name, str) or len(name) > _MAX_NAME or not isinstance(names, list) or len(names) > _MAX_FIELDS
+        or any(not isinstance(field, str) or len(field) > _MAX_NAME for field in names)
+        for name, names in fields.items()
+    ):
+        raise FitArchiveError("FIT message fields are invalid")
+    if not isinstance(coverage, Mapping) or set(coverage) != {"start", "end"} or any(
+        value is not None and (not isinstance(value, str) or len(value) > 64)
+        for value in coverage.values()
+    ):
+        raise FitArchiveError("FIT time coverage is invalid")
+    for value in coverage.values():
+        if value is not None:
+            try:
+                from datetime import datetime
+                datetime.fromisoformat(value)
+            except (TypeError, ValueError) as err:
+                raise FitArchiveError("FIT time coverage is invalid") from err
     presence = result.get("presence")
-    if not isinstance(presence, Mapping):
+    if require_integrity and isinstance(presence, Mapping) and "recovery" not in presence:
+        presence = {**presence, "recovery": presence.get("recovery_time", False)}
+        result["presence"] = presence
+    if not isinstance(presence, Mapping) or set(presence) - _PRESENCE_KEYS or set(presence) != _PRESENCE_KEYS or any(not isinstance(value, bool) for value in presence.values()):
         raise FitArchiveError("FIT summary presence is invalid")
     result["presence"] = {
         key: bool(presence.get(key, False))
