@@ -71,6 +71,7 @@ async def test_invalid_range_does_not_fetch_or_write():
 async def test_sync_fetches_only_supported_metrics_and_writes_each_day():
     source = MagicMock()
     source.async_fetch = AsyncMock(return_value=(NormalizedSample(datetime(2026, 1, 1, tzinfo=UTC), date(2026, 1, 1), 1, 60.0),))
+    source.async_fetch_details = None
     recorder = MagicMock()
     recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(1))
     entry = MagicMock(data={"history_account_key": "opaque-account-key-1234567890"}, entry_id="e")
@@ -176,6 +177,7 @@ async def test_runtime_failure_can_retry():
 
 @pytest.mark.asyncio
 async def test_hrv_summary_persists_only_with_date_checkpoint():
+
     class Source:
         async def async_fetch(self, target_date, metric):
             return ()

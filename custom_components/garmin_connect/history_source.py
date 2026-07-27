@@ -214,6 +214,7 @@ def parse_hrv_data(payload: Any, target_date: date) -> HRVData:
     if raw_summary is not None and not isinstance(raw_summary, dict):
         raise HistorySchemaError("HRV summary is not an object")
     summary_data = raw_summary or {}
+
     def numeric(name: str) -> float | None:
         value = summary_data.get(name)
         if value is None:
