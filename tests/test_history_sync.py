@@ -1,6 +1,8 @@
 """Focused tests for the manual history synchronization slice."""
 
+import json
 from datetime import UTC, date, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -11,13 +13,26 @@ from custom_components.garmin_connect.history import (
     HistoryArchiveState,
     RecorderCompatibilityResult,
 )
-from custom_components.garmin_connect.history_recorder import RecorderWriteOutcome
+from custom_components.garmin_connect.history_recorder import (
+    DAILY_ABNORMAL_HR_METADATA,
+    TRAINING_ACUTE_LOAD_METADATA,
+    TRAINING_ACWR_METADATA,
+    TRAINING_CHRONIC_LOAD_METADATA,
+    TRAINING_FITNESS_TREND_METADATA,
+    TRAINING_LOAD_BALANCE_METADATA,
+    TRAINING_VO2_MAX_METADATA,
+    RecorderWriteOutcome,
+    statistic_id_for,
+)
 from custom_components.garmin_connect.history_source import (
+    DAILY_SUMMARY_FIELDS,
+    TRAINING_STATUS_FIELDS,
     HRVData,
     HRVSummary,
     NormalizedSample,
     SegmentedData,
     SourceSeries,
+    normalize_snapshot,
 )
 
 
@@ -105,6 +120,8 @@ async def test_sync_fetches_only_supported_metrics_and_writes_each_day():
         "spo2_single",
         "spo2_continuous",
         "spo2_hourly",
+        "daily_summary",
+        "training_status",
     }
     assert recorder.async_write.await_count == 26
     assert archive.status.state is HistoryArchiveState.IDLE
@@ -167,6 +184,58 @@ async def test_presence_catalog_loads_all_bounded_states():
 
 
 @pytest.mark.asyncio
+async def test_snapshot_archive_writes_present_fields_and_restarts_from_checkpoint():
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "garmin_summary_training.json").read_text()
+    )
+    target = date(2026, 7, 24)
+    daily = normalize_snapshot(fixture["daily_summary"], target, DAILY_SUMMARY_FIELDS)
+    training = normalize_snapshot(fixture["training_status"], target, TRAINING_STATUS_FIELDS)
+
+    class Source:
+        async def async_fetch_details(self, request_date, metric):
+            if metric == "daily_summary":
+                return daily
+            if metric == "training_status":
+                return training
+            return ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(1))
+    store = _Store()
+    archive = _sync_archive(Source(), recorder, store)
+    await archive.async_start()
+    report = await archive.async_sync_range(target, target)
+
+    assert report.outcome == "written"
+    snapshot_calls = [
+        call for call in recorder.async_write.await_args_list
+        if call.args[1].key.startswith(("daily_", "training_"))
+    ]
+    assert {call.args[1].key for call in snapshot_calls} == {
+        DAILY_ABNORMAL_HR_METADATA.key,
+        TRAINING_ACUTE_LOAD_METADATA.key,
+        TRAINING_CHRONIC_LOAD_METADATA.key,
+        TRAINING_LOAD_BALANCE_METADATA.key,
+        TRAINING_ACWR_METADATA.key,
+        TRAINING_VO2_MAX_METADATA.key,
+        TRAINING_FITNESS_TREND_METADATA.key,
+    }
+    assert all(call.args[2][0].timestamp == datetime(2026, 7, 24, tzinfo=UTC) for call in snapshot_calls)
+    assert all(call.args[2][0].request_date == target for call in snapshot_calls)
+    assert all("recovery" not in call.args[1].key for call in snapshot_calls)
+    assert all(call.args[0] == statistic_id_for("opaque-account-key-1234567890", call.args[1].key) for call in snapshot_calls)
+    assert store.data["presence"][target.isoformat()]["training_status:recovery_time"] == "null"
+
+    restarted = _sync_archive(Source(), recorder, _Store(store.data))
+    await restarted.async_start()
+    assert restarted.get_history_presence(target, target)[target.isoformat()]["daily_summary:abnormal_heart_rate_alerts"] == "present"
+    before = recorder.async_write.await_count
+    await restarted.async_sync_range(target, target)
+    assert recorder.async_write.await_count == before
+
+
+@pytest.mark.asyncio
 async def test_archive_aggregates_import_classification_counts():
     source = MagicMock()
     source.async_fetch = AsyncMock(return_value=())
@@ -174,6 +243,8 @@ async def test_archive_aggregates_import_classification_counts():
     recorder.async_write = AsyncMock(side_effect=[
         RecorderWriteOutcome(2, inserted_count=1, updated_count=1),
         RecorderWriteOutcome(2, skipped_count=2),
+        RecorderWriteOutcome(0),
+        RecorderWriteOutcome(0),
         RecorderWriteOutcome(0),
         RecorderWriteOutcome(0),
         RecorderWriteOutcome(0),
@@ -240,6 +311,7 @@ async def test_runtime_failure_can_retry():
     recorder.async_write = AsyncMock(
         side_effect=[
             RecorderWriteOutcome(0, "failed", "writer"),
+            RecorderWriteOutcome(0),
             RecorderWriteOutcome(0),
             RecorderWriteOutcome(0),
             RecorderWriteOutcome(0),

@@ -275,6 +275,16 @@ def test_daily_summary_and_training_snapshot_presence_and_type_drift() -> None:
         normalize_snapshot({"acuteLoad": "drift"}, date(2026, 7, 24), TRAINING_STATUS_FIELDS)
 
 
+def test_snapshot_normalization_uses_sanitized_fixture() -> None:
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "garmin_summary_training.json").read_text())
+    daily = normalize_snapshot(fixture["daily_summary"], date(2026, 7, 24), DAILY_SUMMARY_FIELDS)
+    training = normalize_snapshot(fixture["training_status"], date(2026, 7, 24), TRAINING_STATUS_FIELDS)
+    assert fixture["_cardinality"]["training_status_fields"] == len(training.fields)
+    assert daily.fields["abnormal_heart_rate_alerts"] == ("present", 2.0)
+    assert training.fields["vo2_max"] == ("present", 47.2)
+    assert training.fields["recovery_time"] == ("null", None)
+
+
 @pytest.mark.asyncio
 async def test_training_status_never_calls_training_readiness() -> None:
     client = MagicMock()
@@ -285,7 +295,7 @@ async def test_training_status_never_calls_training_readiness() -> None:
     await source.async_fetch_details(date(2026, 7, 24), "training_status")
 
     client.get_training_status.assert_awaited_once()
-    client.get_user_profile.assert_not_awaited()
+    client.get_user_profile.assert_not_called()
     client.get_training_readiness.assert_not_awaited()
 
 
@@ -298,4 +308,4 @@ async def test_daily_summary_uses_raw_client_method_without_profile() -> None:
     await source.async_fetch_details(date(2026, 7, 24), "daily_summary")
 
     client._get_user_summary_raw.assert_awaited_once_with(date(2026, 7, 24))
-    client.get_user_profile.assert_not_awaited()
+    client.get_user_profile.assert_not_called()

@@ -1,0 +1,23 @@
+{
+  "_provenance": "Sanitized synthetic fixture modeled on current Garmin daily-summary and training-status response shapes; scalar values redacted/replaced for tests.",
+  "_cardinality": {"daily_summary_fields": 1, "training_status_fields": 7, "optional_fields": 3},
+  "daily_summary": {
+    "calendarDate": "2026-07-24",
+    "activityAttributes": {"activityType": "synthetic", "deviceType": "redacted"},
+    "abnormalHeartRateAlertsCount": 2,
+    "unknownOptionalField": null
+  },
+  "training_status": {
+    "calendarDate": "2026-07-24",
+    "trainingStatus": {
+      "acuteLoad": 42,
+      "chronicLoad": 56,
+      "loadBalance": -14,
+      "acwr": 0.75,
+      "vo2MaxValue": 47.2,
+      "fitnessTrend": 1.5,
+      "recoveryTime": null
+    },
+    "optionalFutureField": null
+  }
+}
