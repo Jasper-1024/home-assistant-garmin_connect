@@ -1,6 +1,6 @@
 """Tests for structured Garmin sleep sessions."""
 
-from datetime import UTC, date, datetime
+from datetime import date
 
 import pytest
 
