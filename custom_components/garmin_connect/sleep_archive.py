@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Any
@@ -23,9 +24,10 @@ class SleepSession:
     calendar_date: date
     revision: str
     score: dict[str, Any]
-    adjustments: tuple[str, ...]
-    feedback: tuple[str, ...]
-    restless_events: tuple[str, ...]
+    adjustments: tuple[Any, ...]
+    feedback: tuple[Any, ...]
+    restless_events: tuple[Any, ...]
+    stages: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,12 +53,30 @@ def _first(mapping: dict[str, Any], names: tuple[str, ...]) -> Any:
     return next((mapping[name] for name in names if name in mapping), None)
 
 
-def _text_list(value: Any) -> tuple[str, ...]:
+def _bounded_structured(value: Any, *, depth: int = 0) -> Any:
+    """Copy bounded structured content while excluding numeric arrays."""
+    if depth > 4:
+        raise SleepSchemaError("sleep structured field is too deep")
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {
+            str(key)[:64]: _bounded_structured(item, depth=depth + 1)
+            for key, item in list(value.items())[:32]
+        }
+    if isinstance(value, list):
+        if value and all(item is None or isinstance(item, (int, float, bool)) for item in value):
+            raise SleepSchemaError("numeric sleep arrays are excluded")
+        return [_bounded_structured(item, depth=depth + 1) for item in value[:64]]
+    raise SleepSchemaError("sleep structured field has invalid type")
+
+
+def _structured_list(value: Any) -> tuple[Any, ...]:
     if value is None:
         return ()
     if not isinstance(value, list):
-        raise SleepSchemaError("sleep text collection has invalid type")
-    return tuple(item[:120] for item in value if isinstance(item, str))
+        raise SleepSchemaError("sleep structured collection has invalid type")
+    return tuple(_bounded_structured(item) for item in value)
 
 
 def _score(payload: dict[str, Any]) -> dict[str, Any]:
@@ -67,14 +87,14 @@ def _score(payload: dict[str, Any]) -> dict[str, Any]:
         raise SleepSchemaError("sleep score has invalid type")
     result: dict[str, Any] = {}
     for key, value in list(raw.items())[:16]:
-        if isinstance(value, (str, int, float, bool)) or value is None:
-            result[key[:64]] = value
-        elif isinstance(value, dict):
-            result[key[:64]] = {
-                str(child_key)[:64]: child_value
-                for child_key, child_value in list(value.items())[:8]
-                if isinstance(child_value, (str, int, float, bool)) or child_value is None
-            }
+        try:
+            result[key[:64]] = _bounded_structured(value)
+        except SleepSchemaError:
+            if isinstance(value, list) and all(
+                item is None or isinstance(item, (int, float, bool)) for item in value
+            ):
+                continue
+            raise
     return result
 
 
@@ -104,11 +124,20 @@ def parse_sleep_sessions(payload: Any, target_date: date) -> tuple[SleepSession,
         if end <= start:
             continue
         logical_id = hashlib.sha256(f"{kind}:{start.isoformat()}:{end.isoformat()}".encode()).hexdigest()[:24]
-        revision = hashlib.sha256(repr((item.get("sleepScores", item.get("score", {})), item.get("adjustments"))).encode()).hexdigest()[:16]
+        revision_payload = {
+            "score": item.get("sleepScores", item.get("score", {})),
+            "adjustments": item.get("adjustments"),
+            "feedback": item.get("feedback"),
+            "restless_events": item.get("restlessEvents"),
+            "stages": item.get("sleepLevels"),
+        }
+        revision = hashlib.sha256(
+            json.dumps(revision_payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+        ).hexdigest()[:16]
         sessions[logical_id] = SleepSession(
             logical_id, kind, start, end, target_date, revision, _score(item),
-            _text_list(item.get("adjustments")), _text_list(item.get("feedback")),
-            _text_list(item.get("restlessEvents")),
+            _structured_list(item.get("adjustments")), _structured_list(item.get("feedback")),
+            _structured_list(item.get("restlessEvents")), _structured_list(item.get("sleepLevels")),
         )
     return tuple(sorted(sessions.values(), key=lambda item: (item.start, item.logical_id)))
 
@@ -121,6 +150,7 @@ def session_record(session: SleepSession) -> dict[str, Any]:
         "calendar_date": session.calendar_date.isoformat(), "revision": session.revision,
         "score": session.score, "adjustments": list(session.adjustments),
         "feedback": list(session.feedback), "restless_events": list(session.restless_events),
+        "stages": list(session.stages),
     }
 
 
@@ -138,6 +168,7 @@ def session_from_record(record: dict[str, Any]) -> SleepSession:
             adjustments=tuple(record["adjustments"]),
             feedback=tuple(record["feedback"]),
             restless_events=tuple(record["restless_events"]),
+            stages=tuple(record["stages"]),
         )
     except (KeyError, TypeError, ValueError) as err:
         raise SleepSchemaError("sleep Store record is invalid") from err

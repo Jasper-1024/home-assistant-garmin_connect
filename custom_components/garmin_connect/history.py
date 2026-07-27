@@ -63,7 +63,7 @@ from .history_source import (
     SnapshotData,
     SourceSeries,
 )
-from .sleep_archive import SleepSchemaError, SleepSession, session_record
+from .sleep_archive import SleepSchemaError, SleepSession, session_from_record, session_record
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -577,15 +577,17 @@ class GarminHistoryArchive:
                     sleep_sessions.setdefault(year, {})[session.logical_id] = session_record(session)
                 processed.append(target)
                 completed_dates = self._completed_dates | {target_key}
-                await store.async_save({"schema_version": HISTORY_STORE_VERSION, "sleep_schema_version": _SLEEP_SCHEMA_VERSION, "account_key": self._account_key(), "completed_dates": sorted(completed_dates), "hrv_summaries": self._hrv_summaries, "presence": presence, "sleep_sessions": sleep_sessions})
                 await self._async_save_sleep_partitions(sleep_sessions)
+                # Publish the catalog checkpoint only after every affected annual
+                # partition is durable. A failed partition save must be replayed.
+                await store.async_save({"schema_version": HISTORY_STORE_VERSION, "sleep_schema_version": _SLEEP_SCHEMA_VERSION, "account_key": self._account_key(), "completed_dates": sorted(completed_dates), "hrv_summaries": self._hrv_summaries, "presence": presence, "sleep_index": {year: sorted(records) for year, records in sleep_sessions.items()}})
                 self._completed_dates = completed_dates
                 self._presence = presence
                 self._sleep_sessions = sleep_sessions
             except asyncio.CancelledError:
                 self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated)
                 raise
-            except (AttributeError, ImportError, TypeError, ValueError, RuntimeError):
+            except (AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError):
                 self._runtime_sync_failure = True
                 self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type="sync_failed")
                 return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome="failed", error_type="sync_failed")
@@ -638,6 +640,9 @@ class GarminHistoryArchive:
         del calendar
         if start_date > end_date:
             return ()
+        await self._async_load_sleep_partitions(
+            {str(year) for year in range(start_date.year, end_date.year + 1)}
+        )
         events: dict[tuple[datetime, datetime, str], HistoryCalendarEvent] = {}
         for records in self._sleep_sessions.values():
             for record in records.values():
@@ -647,6 +652,47 @@ class GarminHistoryArchive:
                     summary = "Sleep" if record["kind"] == "main" else "Nap"
                     events[(start, end, summary)] = HistoryCalendarEvent(start, end, summary)
         return tuple(sorted(events.values(), key=lambda event: event.start))
+
+    async def _async_load_sleep_partitions(self, years: set[str]) -> None:
+        """Load only requested annual partitions; ignore bad data safely."""
+        store_factory = self._store_factory
+        if store_factory is None:
+            from homeassistant.helpers.storage import Store
+
+            store_factory = Store
+        for year in years:
+            self._sleep_sessions.pop(year, None)
+            if year not in self._sleep_partition_stores:
+                self._sleep_partition_stores[year] = store_factory(
+                    self._hass,
+                    HISTORY_STORE_VERSION,
+                    f"{DOMAIN}.{self._entry.entry_id}.sleep_{year}",
+                    private=True,
+                    atomic_writes=True,
+                )
+            try:
+                partition = await self._sleep_partition_stores[year].async_load()
+                if partition is None:
+                    continue
+                if (
+                    not isinstance(partition, Mapping)
+                    or partition.get("account_key") != self._account_key()
+                    or partition.get("year") != year
+                    or partition.get("sleep_schema_version", _SLEEP_SCHEMA_VERSION) != _SLEEP_SCHEMA_VERSION
+                    or not isinstance(partition.get("sessions"), Mapping)
+                ):
+                    continue
+                parsed: dict[str, dict[str, Any]] = {}
+                for logical_id, record in partition["sessions"].items():
+                    if not isinstance(record, Mapping):
+                        raise SleepSchemaError("sleep partition record is invalid")
+                    restored = session_from_record(dict(record))
+                    if restored.logical_id != logical_id or str(restored.start.year) != year:
+                        raise SleepSchemaError("sleep partition record is invalid")
+                    parsed[logical_id] = dict(record)
+                self._sleep_sessions[year] = parsed
+            except (KeyError, TypeError, ValueError, OSError):
+                pass
 
     def _async_ensure_account_key(self) -> str:
         """Load or create the opaque identity persisted in the config entry."""
@@ -683,7 +729,7 @@ class GarminHistoryArchive:
                     "completed_dates": [],
                     "hrv_summaries": {},
                     "presence": {},
-                    "sleep_sessions": {},
+                    "sleep_index": {},
                 }
             )
             return
@@ -726,31 +772,32 @@ class GarminHistoryArchive:
                 bounded[metric] = state
             parsed_presence[key] = bounded
         self._presence = parsed_presence
-        raw_sleep = catalog.get("sleep_sessions", {})
+        raw_sleep = catalog.get("sleep_index", catalog.get("sleep_sessions", {}))
         if catalog.get("sleep_schema_version", _SLEEP_SCHEMA_VERSION) != _SLEEP_SCHEMA_VERSION:
             raise ValueError("Sleep catalog version is unsupported")
         if not isinstance(raw_sleep, Mapping):
             raise ValueError("Sleep catalog is invalid")
-        parsed_sleep: dict[str, dict[str, dict[str, Any]]] = {}
+        sleep_years: set[str] = set()
         for year, records in raw_sleep.items():
-            if not isinstance(year, str) or len(year) != 4 or not year.isdecimal() or not isinstance(records, Mapping):
+            if not isinstance(year, str) or len(year) != 4 or not year.isdecimal():
                 raise ValueError("Sleep catalog is invalid")
-            parsed_records: dict[str, dict[str, Any]] = {}
-            for logical_id, record in records.items():
-                if not isinstance(logical_id, str) or len(logical_id) > 64 or not isinstance(record, Mapping):
-                    raise ValueError("Sleep catalog is invalid")
-                if record.get("logical_id") != logical_id or record.get("kind") not in {"main", "nap"}:
-                    raise ValueError("Sleep catalog is invalid")
-                try:
-                    start = datetime.fromisoformat(record["start"])
-                    end = datetime.fromisoformat(record["end"])
-                except (KeyError, TypeError, ValueError) as err:
-                    raise ValueError("Sleep catalog is invalid") from err
-                if end <= start or len(parsed_records) >= 10000:
-                    raise ValueError("Sleep catalog is invalid")
-                parsed_records[logical_id] = dict(record)
-            parsed_sleep[year] = parsed_records
-        self._sleep_sessions = parsed_sleep
+            if isinstance(records, Mapping):
+                # Read legacy catalogs once, but never use their records as the
+                # source of truth after startup.
+                records = list(records)
+            if not isinstance(records, list) or len(records) > 10000:
+                raise ValueError("Sleep catalog is invalid")
+            if any(not isinstance(logical_id, str) or len(logical_id) > 64 for logical_id in records):
+                raise ValueError("Sleep catalog is invalid")
+            sleep_years.add(year)
+        self._sleep_sessions = {}
+        await self._async_load_sleep_partitions(sleep_years)
+        missing_years = sleep_years - set(self._sleep_sessions)
+        if missing_years:
+            self._completed_dates = {
+                value for value in self._completed_dates
+                if value[:4] not in missing_years
+            }
 
     def _set_failed(self, error_type: str) -> None:
         """Set a bounded startup failure without exposing exception details."""

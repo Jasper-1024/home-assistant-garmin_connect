@@ -35,6 +35,7 @@ from custom_components.garmin_connect.history_source import (
     SourceSeries,
     normalize_snapshot,
 )
+from custom_components.garmin_connect.sleep_archive import SleepSession, session_record
 
 
 class _Store:
@@ -50,6 +51,18 @@ class _Store:
         self.data = data
 
 
+class _NamedStore(_Store):
+    def __init__(self, data=None, *, fail_save=False):
+        self.data = data
+        self.saved = []
+        self.fail_save = fail_save
+
+    async def async_save(self, data):
+        if self.fail_save:
+            raise OSError("partition unavailable")
+        await super().async_save(data)
+
+
 def _sync_archive(source, recorder, store):
     entry = MagicMock(data={"history_account_key": "opaque-account-key-1234567890"}, entry_id="e")
     entry.runtime_data = SimpleNamespace(core=SimpleNamespace(client=object()), request_gate=object())
@@ -61,6 +74,18 @@ def _sync_archive(source, recorder, store):
         recorder_factory=lambda: recorder,
     )
     return archive
+
+
+def _partition_archive(source, recorder, stores):
+    entry = MagicMock(data={"history_account_key": "opaque-account-key-1234567890"}, entry_id="e")
+    entry.runtime_data = SimpleNamespace(core=SimpleNamespace(client=object()), request_gate=object())
+    return GarminHistoryArchive(
+        MagicMock(), entry,
+        recorder_checker=SimpleNamespace(async_check=AsyncMock(return_value=RecorderCompatibilityResult.compatible_result())),
+        store_factory=lambda _hass, _version, path, **kwargs: stores.setdefault(path, _NamedStore()),
+        source_factory=lambda *args: source,
+        recorder_factory=lambda: recorder,
+    )
 
 
 @pytest.mark.asyncio
@@ -387,3 +412,57 @@ async def test_hrv_summary_persists_only_with_date_checkpoint():
     restarted = _sync_archive(source, recorder, store)
     await restarted.async_start()
     assert restarted.get_hrv_summaries(date(2026, 1, 1), date(2026, 1, 1))[0][1].weekly_avg == 50.0
+
+
+def _sleep_session() -> SleepSession:
+    return SleepSession(
+        "sleep-id", "main",
+        datetime(2026, 1, 1, 22, tzinfo=UTC),
+        datetime(2026, 1, 2, 6, tzinfo=UTC),
+        date(2026, 1, 1), "revision", {}, (), (), (),
+    )
+
+
+@pytest.mark.asyncio
+async def test_sleep_partition_failure_does_not_publish_completed_checkpoint():
+    session = _sleep_session()
+
+    class Source:
+        async def async_fetch_details(self, target, metric):
+            return (session,) if metric == "sleep_sessions" else ()
+
+    catalog = _NamedStore({"account_key": "opaque-account-key-1234567890", "schema_version": 1})
+    stores = {"garmin_connect.e.history_catalog": catalog}
+    stores["garmin_connect.e.sleep_2026"] = _NamedStore(fail_save=True)
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = _partition_archive(Source(), recorder, stores)
+    await archive.async_start()
+
+    report = await archive.async_sync_range(date(2026, 1, 1), date(2026, 1, 1))
+
+    assert report.outcome == "failed"
+    assert "completed_dates" not in catalog.data
+
+
+@pytest.mark.asyncio
+async def test_restart_drops_missing_or_corrupt_sleep_partition_from_completed_index():
+    session = _sleep_session()
+    catalog_data = {
+        "account_key": "opaque-account-key-1234567890",
+        "schema_version": 1,
+        "completed_dates": ["2026-01-01"],
+        "sleep_schema_version": 1,
+        "sleep_index": {"2026": [session.logical_id]},
+        "hrv_summaries": {}, "presence": {},
+    }
+
+    for partition_data in (None, {"year": "2026", "sessions": {"bad": "record"}}):
+        stores = {
+            "garmin_connect.e.history_catalog": _NamedStore(catalog_data),
+            "garmin_connect.e.sleep_2026": _NamedStore(partition_data),
+        }
+        archive = _partition_archive(MagicMock(), MagicMock(), stores)
+        await archive.async_start()
+        assert "2026-01-01" not in archive._completed_dates
+        assert await archive.async_get_calendar_events("sleep", date(2026, 1, 1), date(2026, 1, 2)) == ()
