@@ -85,8 +85,24 @@ def _dispatch_fixture_contract(stem: str, state: str, fixture: dict) -> str:
     payload = fixture[marker]
     if state == "sparse":
         if stem == "garmin_fit_structural_summary":
-            assert payload == {"message_counts": {}, "message_fields": {}}
+            assert persisted_fit_summary(payload)["message_counts"] == {}
             return "empty"
+        if stem == "garmin_activity_archive":
+            assert normalize_activities([], date(2026, 7, 24)) == ()
+        elif stem == "garmin_health_events":
+            assert normalize_health_events([], date(2026, 7, 24)) == ()
+        elif stem == "garmin_respiration_spo2":
+            assert normalize_respiration({"respirationValuesArray": []}, date(2026, 7, 24)).presence == "empty"
+            assert normalize_spo2({"spO2SingleValues": []}, date(2026, 7, 24), "single").presence == "empty"
+        elif stem == "garmin_segmented_charts":
+            assert normalize_steps({"stepsValuesArray": []}, date(2026, 7, 24)).readings == ()
+        elif stem == "garmin_sleep_streams":
+            assert parse_sleep_sessions(fixture, date(2026, 7, 24)) == ()
+        elif stem == "garmin_sleep_structured":
+            assert parse_sleep_sessions(fixture, date(2026, 2, 28)) == ()
+        elif stem == "garmin_summary_training":
+            assert normalize_snapshot({}, date(2026, 7, 24), DAILY_SUMMARY_FIELDS).fields["abnormal_heart_rate_alerts"][0] == "absent"
+            assert normalize_snapshot({}, date(2026, 7, 24), TRAINING_STATUS_FIELDS).fields
         assert _is_structurally_empty(payload)
         return "empty"
     if state == "schema_drift":
