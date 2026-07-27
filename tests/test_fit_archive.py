@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import stat
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -192,13 +193,18 @@ def test_captured_structural_fixture_is_redacted_and_validated() -> None:
     assert "file" not in record["summary"]
 
 
-def test_optional_private_captured_fit_replay() -> None:
+def test_optional_private_captured_fit_replay(capsys: pytest.CaptureFixture[str]) -> None:
     """Replay a private captured FIT when explicitly supplied by a developer."""
     raw_path = os.environ.get("GARMIN_SAKAMOTO13_FIT")
     if not raw_path:
         pytest.skip("GARMIN_SAKAMOTO13_FIT is not set")
     assert raw_path is not None
-    summary = inspect_fit(Path(raw_path), 0o600)
+    capture_path = Path(raw_path)
+    assert stat.S_IMODE(capture_path.stat().st_mode) == 0o600
+    summary = inspect_fit(capture_path, 0o600)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
     assert summary["file"]["integrity_ok"] is True
     assert summary["file"]["decode_ok"] is True
     persisted = persisted_fit_summary(summary)

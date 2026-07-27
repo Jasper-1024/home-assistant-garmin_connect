@@ -15,6 +15,13 @@ privacy-safe history families and their read-only Calendar surfaces.
 No release test or instruction in this document contacts Garmin production or
 starts a full-year backfill.
 
+The executable gates are `tests/test_release_gates.py`,
+`tests/test_history_recorder.py::test_release_gate_scratch_recorder_restart_revision_and_no_state_changed`,
+and `tests/test_fit_archive.py::test_optional_private_captured_fit_replay`.
+They assert fixture state coverage and provenance, privacy-safe diagnostics/
+status/action/Calendar shapes, raw timestamp/count/revision behavior, and
+optional private replay integrity without asserting fabricated live counts.
+
 ## Canary checklist
 
 - expected sample/event/activity counts and UTC/local timestamps;
@@ -26,6 +33,11 @@ starts a full-year backfill.
 - logs, diagnostics, status, actions, and Calendar output contain no raw
   measurements, arrays, credentials, account identity, address, or GPS;
 - Recorder/Store growth is bounded and expected.
+
+The canary contract is structural: timestamps remain aware, counts are
+consistent, equal values and revisions converge, and repeated/restarted work
+does not create duplicate points or `state_changed` replay. Live counts must
+be recorded from the canary run, not copied from this document.
 
 ## Rollback
 

@@ -92,3 +92,30 @@ def test_new_series_have_distinct_stable_statistic_ids() -> None:
     }
     assert len(ids) == 2
     assert all("opaque-account-key" not in value for value in ids)
+
+
+@pytest.mark.asyncio
+async def test_release_gate_scratch_recorder_restart_revision_and_no_state_changed() -> None:
+    """Release contract: raw points converge without state_changed replay."""
+    requester = FakeRequester()
+    samples = tuple(
+        NormalizedSample(
+            datetime(2026, 7, 24, 1, minute, tzinfo=UTC),
+            date(2026, 7, 24),
+            f"2026-07-24T01:{minute:02d}:00+00:00",
+            60.0,
+        )
+        for minute in range(4)
+    )
+    statistic_id = statistic_id_for("opaque-account-key-123", "heart_rate")
+    await GarminHistoryRecorder(requester).async_write(statistic_id, HEART_RATE_METADATA, samples)
+    await GarminHistoryRecorder(requester).async_write(
+        statistic_id, HEART_RATE_METADATA, (replace(samples[2], value=61.0),)
+    )
+
+    assert len(requester.imports[0][1]) == 4
+    assert [row["start"] for row in requester.imports[0][1]] == [sample.timestamp for sample in samples]
+    assert requester.imports[1][1][0]["start"] == samples[2].timestamp
+    assert requester.imports[1][1][0]["mean"] == 61.0
+    assert len(requester.tasks) == 2
+    assert all("state_changed" not in row for _, rows, _ in requester.imports for row in rows)
