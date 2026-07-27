@@ -651,7 +651,7 @@ class GarminHistorySource:
             if metric == "sleep_sessions":
                 return await self.client._get_sleep_data_raw(target_date)
             if metric == "timed_activities":
-                return await self.client.get_activities(target_date, 100)
+                return await self.client.get_activities(0, 100)
             if metric == "health_events_daily":
                 return await self.client._request("GET", f"{base}/wellness-service/wellness/dailyEvents", params={"calendarDate": target_date.isoformat()})
             if metric == "health_events_body_battery":
@@ -711,7 +711,7 @@ class GarminHistorySource:
         if metric == "sleep_sessions":
             return parse_sleep_sessions(payload, target_date)
         if metric == "timed_activities":
-            return normalize_activities(payload, target_date)
+            return tuple(activity for activity in normalize_activities(payload, target_date) if activity.start.date() == target_date)
         if metric in {"health_events_daily", "health_events_body_battery"}:
             return normalize_health_events(payload, target_date)
         if not isinstance(payload, dict):

@@ -101,6 +101,20 @@ def test_normalize_health_events_preserves_explicit_fields_only() -> None:
     assert events[1].occurrence is not None
 
 
+@pytest.mark.asyncio
+async def test_timed_activities_uses_pagination_and_deduplicates_overlap() -> None:
+    client = MagicMock()
+    client._base_url = "https://garmin.example"
+    client.get_activities = AsyncMock(return_value={"activities": [
+        {"activityId": 1, "activityType": "running", "startTime": "2026-07-24T23:00:00Z", "endTime": "2026-07-25T00:00:00Z"},
+        {"activityId": 1, "activityType": "running", "startTime": "2026-07-24T23:00:00Z", "endTime": "2026-07-25T00:00:00Z"},
+    ]})
+    source = GarminHistorySource(client, _ImmediateGate())
+    result = await source.async_fetch_details(date(2026, 7, 24), "timed_activities")
+    client.get_activities.assert_awaited_once_with(0, 100)
+    assert len(result) == 1
+
+
 def test_health_event_revision_keeps_identity_and_rejects_bounds() -> None:
     first = normalize_health_events({"events": [{"source": "A", "type": "x", "category": "one", "occurrenceTime": "2026-07-24T00:00:00Z"}]}, date(2026, 7, 24))[0]
     revised = normalize_health_events({"events": [{"source": "B", "type": "x", "category": "two", "occurrenceTime": "2026-07-24T00:00:00Z"}]}, date(2026, 7, 24))[0]
