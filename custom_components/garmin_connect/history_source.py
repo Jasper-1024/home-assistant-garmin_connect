@@ -243,7 +243,7 @@ def _nested_value(payload: Any, aliases: tuple[str, ...], depth: int = 0) -> tup
     for alias in aliases:
         if alias in payload:
             return payload[alias], alias
-    for container in ("data", "report", "summary", "result"):
+    for container in ("data", "report", "summary", "result", "trainingStatus", "dailySummary"):
         if container in payload:
             found = _nested_value(payload[container], aliases, depth + 1)
             if found is not None:

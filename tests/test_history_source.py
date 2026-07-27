@@ -282,6 +282,11 @@ def test_snapshot_normalization_uses_sanitized_fixture() -> None:
     assert fixture["_cardinality"]["training_status_fields"] == len(training.fields)
     assert daily.fields["abnormal_heart_rate_alerts"] == ("present", 2.0)
     assert training.fields["vo2_max"] == ("present", 47.2)
+    assert training.fields["acute_load"] == ("present", 42.0)
+    assert training.fields["chronic_load"] == ("present", 56.0)
+    assert training.fields["load_balance"] == ("present", -14.0)
+    assert training.fields["acwr"] == ("present", 0.75)
+    assert training.fields["fitness_trend"] == ("present", 1.5)
     assert training.fields["recovery_time"] == ("null", None)
 
 
