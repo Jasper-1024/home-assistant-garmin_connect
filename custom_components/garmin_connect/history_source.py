@@ -140,14 +140,22 @@ def normalize_pair_series(
 
 
 def _select_daily_report(payload: Any, target_date: date) -> dict[str, Any]:
+    if payload is None:
+        return {}
     if isinstance(payload, dict):
         for key in ("bodyBatteryReports", "reports", "dailyReports"):
             if key in payload:
+                if payload[key] is None:
+                    return {}
                 return _select_daily_report(payload[key], target_date)
         return payload
+    if payload == []:
+        return {}
     if not isinstance(payload, list):
         raise HistorySchemaError("body battery reports are not an array")
     for report in payload:
+        if report is None:
+            continue
         if not isinstance(report, dict):
             raise HistorySchemaError("body battery report is not an object")
         for key in ("calendarDate", "date", "reportDate"):
@@ -176,6 +184,8 @@ def normalize_body_battery(payload: Any, target_date: date) -> tuple[NormalizedS
 
 def parse_hrv_data(payload: Any, target_date: date) -> HRVData:
     """Parse HRV readings while tolerating absent summary fields."""
+    if payload is None or payload == []:
+        return HRVData(())
     if not isinstance(payload, dict):
         raise HistorySchemaError("HRV payload is not an object")
     raw_readings = payload.get("hrvReadings", [])

@@ -12,7 +12,11 @@ from custom_components.garmin_connect.history import (
     RecorderCompatibilityResult,
 )
 from custom_components.garmin_connect.history_recorder import RecorderWriteOutcome
-from custom_components.garmin_connect.history_source import HRVData, HRVSummary, GarminHistorySource, NormalizedSample
+from custom_components.garmin_connect.history_source import (
+    HRVData,
+    HRVSummary,
+    NormalizedSample,
+)
 
 
 class _Store:
@@ -172,7 +176,7 @@ async def test_runtime_failure_can_retry():
 
 @pytest.mark.asyncio
 async def test_hrv_summary_persists_only_with_date_checkpoint():
-    class Source(GarminHistorySource):
+    class Source:
         async def async_fetch(self, target_date, metric):
             return ()
 
@@ -181,7 +185,7 @@ async def test_hrv_summary_persists_only_with_date_checkpoint():
                 return HRVData((), HRVSummary("balanced", 48.0, 72.0, 50.0, {"low": 40.0}))
             return ()
 
-    source = Source(object())
+    source = Source()
     recorder = MagicMock()
     recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
     store = _Store()
@@ -191,3 +195,7 @@ async def test_hrv_summary_persists_only_with_date_checkpoint():
     await archive.async_start()
     await archive.async_sync_range(date(2026, 1, 1), date(2026, 1, 1))
     assert store.data["hrv_summaries"]["2026-01-01"]["status"] == "balanced"
+    assert archive.get_hrv_summaries(date(2026, 1, 1), date(2026, 1, 1))[0][1].status == "balanced"
+    restarted = _sync_archive(source, recorder, store)
+    await restarted.async_start()
+    assert restarted.get_hrv_summaries(date(2026, 1, 1), date(2026, 1, 1))[0][1].weekly_avg == 50.0

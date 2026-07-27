@@ -30,8 +30,7 @@ from .history_recorder import (
     RecorderWriteOutcome,
     statistic_id_for,
 )
-from .history_source import GarminHistorySource
-from .history_source import HRVData
+from .history_source import GarminHistorySource, HRVData, HRVSummary
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -250,6 +249,22 @@ class GarminHistoryArchive:
         """Return the private, bounded HRV summary catalog seam."""
         return {key: dict(value) for key, value in self._hrv_summaries.items()}
 
+    def get_hrv_summaries(self, start_date: date, end_date: date) -> tuple[tuple[date, HRVSummary], ...]:
+        """Query the private, bounded persisted HRV summary catalog."""
+        if start_date > end_date or (end_date - start_date).days + 1 > _HISTORY_MAX_DAYS:
+            return ()
+        result: list[tuple[date, HRVSummary]] = []
+        for key, value in self._hrv_summaries.items():
+            try:
+                target = date.fromisoformat(key)
+            except ValueError:
+                continue
+            if not start_date <= target <= end_date:
+                continue
+            baseline = value.get("baseline")
+            result.append((target, HRVSummary(value.get("status"), value.get("last_night_avg"), value.get("last_night_5_min_high"), value.get("weekly_avg"), baseline)))
+        return tuple(sorted(result))
+
     async def async_start(self) -> None:
         """Initialize identity, Store catalog, and Recorder compatibility."""
         if self._started:
@@ -381,7 +396,13 @@ class GarminHistoryArchive:
                     ("body_battery", BODY_BATTERY_METADATA),
                     ("nightly_hrv", NIGHTLY_HRV_METADATA),
                 ):
-                    details = await source.async_fetch_details(target, metric) if isinstance(source, GarminHistorySource) and metric == "nightly_hrv" else await source.async_fetch(target, metric)
+                    details_method = getattr(source, "async_fetch_details", None) if metric == "nightly_hrv" else None
+                    if callable(details_method):
+                        details = details_method(target, metric)
+                        if inspect.isawaitable(details):
+                            details = await details
+                    else:
+                        details = await source.async_fetch(target, metric)
                     if isinstance(details, HRVData):
                         samples = details.readings
                         if details.summary is not None:
