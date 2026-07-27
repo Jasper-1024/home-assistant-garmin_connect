@@ -7,6 +7,7 @@ import pytest
 
 from custom_components.garmin_connect.backfill import (
     BACKFILL_START,
+    BACKFILL_INTERVAL,
     BACKOFF_429,
     BackfillScheduler,
     BackfillState,
@@ -91,11 +92,12 @@ async def test_failed_archive_seam_does_not_checkpoint_then_restart_retries() ->
     async def sync_date(target: date) -> HistorySyncReport:
         return next(outcomes)
 
-    now = datetime(2026, 2, 1, tzinfo=UTC)
-    first = BackfillScheduler(load_state=load_state, save_state=save_state, sync_date=sync_date, now=lambda: now)
+    clock = [datetime(2026, 2, 1, tzinfo=UTC)]
+    first = BackfillScheduler(load_state=load_state, save_state=save_state, sync_date=sync_date, now=lambda: clock[0])
     await first.async_run_once()
     assert "2026-01-01" not in persisted["completed_dates"]
-    restarted = BackfillScheduler(load_state=load_state, save_state=save_state, sync_date=sync_date, now=lambda: now)
+    clock[0] += BACKFILL_INTERVAL
+    restarted = BackfillScheduler(load_state=load_state, save_state=save_state, sync_date=sync_date, now=lambda: clock[0])
     await restarted.async_run_once()
     assert "2026-01-01" in persisted["completed_dates"]
 
@@ -131,7 +133,7 @@ async def test_foreground_request_priority_preempts_background_batch() -> None:
 async def test_background_fit_limit_defers_date_until_remaining_fit_converges() -> None:
     persisted: dict = {}
     calls: list[int] = []
-    now = datetime(2026, 2, 1, tzinfo=UTC)
+    clock = [datetime(2026, 2, 1, tzinfo=UTC)]
 
     async def load_state() -> dict:
         return persisted
@@ -144,9 +146,10 @@ async def test_background_fit_limit_defers_date_until_remaining_fit_converges() 
         calls.append(1)
         return HistorySyncReport(outcome="failed", error_type="fit_limit_pending") if len(calls) == 1 else HistorySyncReport(outcome="written")
 
-    scheduler = BackfillScheduler(load_state=load_state, save_state=save_state, sync_date=sync_date, now=lambda: now)
+    scheduler = BackfillScheduler(load_state=load_state, save_state=save_state, sync_date=sync_date, now=lambda: clock[0])
     await scheduler.async_run_once()
     assert persisted["completed_dates"] == []
+    clock[0] += BACKFILL_INTERVAL
     await scheduler.async_run_once()
     assert persisted["completed_dates"] == ["2026-01-01"]
     assert len(calls) == 2
