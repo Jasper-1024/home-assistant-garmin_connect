@@ -465,9 +465,13 @@ class GarminHistorySource:
         """Fetch a metric and retain private details needed by the archive."""
 
         async def request() -> Any:
-            profile = await self.client.get_user_profile()
             base = self.client._base_url
+            if metric == "daily_summary":
+                return await self.client._get_user_summary_raw(target_date)
+            if metric == "training_status":
+                return await self.client.get_training_status(target_date)
             if metric == "heart_rate":
+                profile = await self.client.get_user_profile()
                 return await self.client._request(
                     "GET",
                     f"{base}/wellness-service/wellness/dailyHeartRate/{profile.display_name}",
@@ -485,6 +489,7 @@ class GarminHistorySource:
             if metric == "nightly_hrv":
                 return await self.client._get_hrv_data_raw(target_date)
             if metric == "steps":
+                profile = await self.client.get_user_profile()
                 return await self.client._request("GET", f"{base}/wellness-service/wellness/dailySummaryChart/{profile.display_name}", params={"date": target_date.isoformat()})
             if metric == "floors":
                 return await self.client._request("GET", f"{base}/wellness-service/wellness/floorsChartData/daily/{target_date.isoformat()}")
@@ -494,10 +499,6 @@ class GarminHistorySource:
                 return await self.client._request("GET", f"{base}/wellness-service/wellness/daily/respiration/{target_date.isoformat()}")
             if metric.startswith("spo2_"):
                 return await self.client._request("GET", f"{base}/wellness-service/wellness/daily/spo2/{target_date.isoformat()}")
-            if metric == "daily_summary":
-                return await self.client._get_user_summary_raw(target_date)
-            if metric == "training_status":
-                return await self.client.get_training_status(target_date)
             raise ValueError(f"unsupported history metric: {metric}")
 
         payload = await self.request_gate.async_request(GarminRequestPriority.BACKGROUND, request)

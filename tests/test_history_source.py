@@ -285,4 +285,17 @@ async def test_training_status_never_calls_training_readiness() -> None:
     await source.async_fetch_details(date(2026, 7, 24), "training_status")
 
     client.get_training_status.assert_awaited_once()
+    client.get_user_profile.assert_not_awaited()
     client.get_training_readiness.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_daily_summary_uses_raw_client_method_without_profile() -> None:
+    client = MagicMock()
+    client._get_user_summary_raw = AsyncMock(return_value={"abnormalHeartRateAlertsCount": 1})
+    source = GarminHistorySource(client, _ImmediateGate())
+
+    await source.async_fetch_details(date(2026, 7, 24), "daily_summary")
+
+    client._get_user_summary_raw.assert_awaited_once_with(date(2026, 7, 24))
+    client.get_user_profile.assert_not_awaited()
