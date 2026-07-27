@@ -30,12 +30,12 @@ from custom_components.garmin_connect.history_source import (
     TRAINING_STATUS_FIELDS,
     HRVData,
     HRVSummary,
+    NormalizedHealthEvent,
     NormalizedSample,
     SegmentedData,
+    SnapshotData,
     SourceSeries,
     normalize_snapshot,
-    NormalizedHealthEvent,
-    SnapshotData,
 )
 from custom_components.garmin_connect.sleep_archive import (
     SleepSession,
