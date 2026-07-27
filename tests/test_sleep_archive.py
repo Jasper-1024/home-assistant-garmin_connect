@@ -155,6 +155,19 @@ def test_sleep_parser_preserves_sanitized_high_resolution_streams() -> None:
     assert session_from_record(session_record(session)) == session
 
 
+def test_sleep_stream_object_rows_use_stream_specific_values() -> None:
+    session = parse_sleep_sessions(
+        {
+            "startTime": "2026-07-24T23:45:00Z", "endTime": "2026-07-25T07:15:00Z",
+            "sleepBodyBattery": [{"timestamp": "2026-07-25T00:00:00Z", "bodyBattery": 70}],
+            "sleepRespiration": [{"timestamp": "2026-07-25T00:01:00Z", "respirationValue": 14}],
+            "sleepMovement": [{"timestamp": "2026-07-25T00:02:00Z", "movement": 1}],
+        },
+        date(2026, 7, 24),
+    )[0]
+    assert [stream.points[0].value for stream in session.streams] == [70.0, 14.0, 1.0]
+
+
 def test_sleep_stream_descriptors_reorder_columns_and_deduplicate_timestamps() -> None:
     payload = {
         "startTime": "2026-07-24T23:45:00Z", "endTime": "2026-07-25T07:15:00Z",

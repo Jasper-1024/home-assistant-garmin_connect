@@ -601,7 +601,10 @@ class GarminHistoryArchive:
                             if point.value is not None and point.value >= 0
                         )
                         stream_outcome = await recorder.async_write(
-                            statistic_id_for(self._account_key(), metadata_for_stream.key),
+                            statistic_id_for(
+                                self._account_key(),
+                                f"{metadata_for_stream.key}:{session.logical_id}",
+                            ),
                             metadata_for_stream,
                             samples,
                         )

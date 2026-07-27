@@ -453,6 +453,10 @@ async def test_sleep_partition_failure_does_not_publish_completed_checkpoint():
 async def test_sleep_streams_write_distinct_statistics_and_calendar_stays_bounded():
     fixture = json.loads((Path(__file__).parent / "fixtures" / "garmin_sleep_streams.json").read_text())
     session = parse_sleep_sessions(fixture, date(2026, 7, 24))[0]
+    assert {stream.metric: len(stream.points) for stream in session.streams} == {
+        "heart_rate": 32, "hrv": 32, "body_battery": 32, "stress": 32,
+        "respiration": 32, "spo2": 32, "movement": 32,
+    }
 
     class Source:
         async def async_fetch_details(self, target, metric):
@@ -472,7 +476,7 @@ async def test_sleep_streams_write_distinct_statistics_and_calendar_stays_bounde
         if ":sleep_" in call.args[0]
     }
     assert stream_ids == {
-        statistic_id_for("opaque-account-key-1234567890", f"sleep_{metric}")
+        statistic_id_for("opaque-account-key-1234567890", f"sleep_{metric}:" + session.logical_id)
         for metric in ("heart_rate", "hrv", "body_battery", "stress", "respiration", "spo2", "movement")
     }
     assert report.inserted_count >= 7

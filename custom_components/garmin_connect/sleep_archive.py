@@ -187,7 +187,7 @@ def _sleep_streams(item: dict[str, Any]) -> tuple[SleepStream, ...]:
         for row in values:
             if isinstance(row, dict):
                 raw_time = next((row[name] for name in ("timestamp", "time", "startGMT", "readingTimeGMT") if name in row), None)
-                raw_value = next((row[name] for name in ("value", metric, "heartRate", "hrvValue", "stressLevel", "spO2", "spo2") if name in row), None)
+                raw_value = next((row[name] for name in ("value", metric, "heartRate", "hrvValue", "stressLevel", "spO2", "spo2", "bodyBattery", "respirationValue", "movement", "activityLevel") if name in row), None)
             elif isinstance(row, list) and descriptors is not None:
                 timestamp_index = next((descriptors[key] for key in ("timestamp", "time", "startGMT", "readingTimeGMT") if key in descriptors), None)
                 value_index = next((descriptors[key] for key in ("value", metric, "heartRate", "hrvValue", "stressLevel", "spO2", "spo2") if key in descriptors), None)
