@@ -33,7 +33,7 @@ def _timestamp(value: Any) -> datetime | None:
         number = float(value) / (1000 if abs(float(value)) >= 100_000_000_000 else 1)
         try:
             return datetime.fromtimestamp(number, tz=UTC)
-        except (OverflowError, OSError, ValueError):
+        except OverflowError, OSError, ValueError:
             return None
     if isinstance(value, str) and value:
         try:
@@ -53,7 +53,11 @@ def _descriptors(payload: dict[str, Any], keys: tuple[str, ...]) -> dict[str, in
             raise HistorySchemaError(f"{key} is not a descriptor list")
         result: dict[str, int] = {}
         for item in raw:
-            if not isinstance(item, dict) or not isinstance(item.get("key"), str) or not isinstance(item.get("index"), int):
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("key"), str)
+                or not isinstance(item.get("index"), int)
+            ):
                 continue
             result[item["key"]] = item["index"]
         return result
@@ -61,8 +65,12 @@ def _descriptors(payload: dict[str, Any], keys: tuple[str, ...]) -> dict[str, in
 
 
 def normalize_pair_series(
-    payload: dict[str, Any], *, values_key: str, descriptor_keys: tuple[str, ...],
-    value_keys: tuple[str, ...], exclude_negative: bool = False,
+    payload: dict[str, Any],
+    *,
+    values_key: str,
+    descriptor_keys: tuple[str, ...],
+    value_keys: tuple[str, ...],
+    exclude_negative: bool = False,
     request_date: date | None = None,
 ) -> tuple[NormalizedSample, ...]:
     """Normalize a descriptor-driven Garmin ``[timestamp, value]`` series."""
@@ -79,7 +87,11 @@ def normalize_pair_series(
     effective_date = request_date
     latest: dict[datetime, NormalizedSample] = {}
     for point in raw_points:
-        if not isinstance(point, (list, tuple)) or timestamp_index >= len(point) or value_index >= len(point):
+        if (
+            not isinstance(point, (list, tuple))
+            or timestamp_index >= len(point)
+            or value_index >= len(point)
+        ):
             continue
         raw_time, raw_value = point[timestamp_index], point[value_index]
         parsed = _timestamp(raw_time)
@@ -109,22 +121,48 @@ class GarminHistorySource:
 
     async def async_fetch(self, target_date: date, metric: str) -> tuple[NormalizedSample, ...]:
         """Fetch and normalize one supported metric at low request priority."""
+
         async def request() -> Any:
             profile = await self.client.get_user_profile()
             base = self.client._base_url
             if metric == "heart_rate":
-                return await self.client._request("GET", f"{base}/wellness-service/wellness/dailyHeartRate/{profile.display_name}", params={"date": target_date.isoformat()})
+                return await self.client._request(
+                    "GET",
+                    f"{base}/wellness-service/wellness/dailyHeartRate/{profile.display_name}",
+                    params={"date": target_date.isoformat()},
+                )
             if metric == "stress":
-                return await self.client._request("GET", f"{base}/wellness-service/wellness/dailyStress/{target_date.isoformat()}")
+                return await self.client._request(
+                    "GET", f"{base}/wellness-service/wellness/dailyStress/{target_date.isoformat()}"
+                )
             raise ValueError(f"unsupported history metric: {metric}")
+
         payload = await self.request_gate.async_request(GarminRequestPriority.BACKGROUND, request)
         if not isinstance(payload, dict):
             return ()
         if metric == "heart_rate":
-            return normalize_pair_series(payload, values_key="heartRateValues", descriptor_keys=("heartRateValueDescriptors",), value_keys=("heartRate",), request_date=target_date)
-        return normalize_pair_series(payload, values_key="stressValuesArray", descriptor_keys=("stressValueDescriptorsDTOList", "stressValueDescriptorsDtoList"), value_keys=("stressLevel",), exclude_negative=True, request_date=target_date)
+            return normalize_pair_series(
+                payload,
+                values_key="heartRateValues",
+                descriptor_keys=("heartRateValueDescriptors",),
+                value_keys=("heartRate",),
+                request_date=target_date,
+            )
+        return normalize_pair_series(
+            payload,
+            values_key="stressValuesArray",
+            descriptor_keys=("stressValueDescriptorsDTOList", "stressValueDescriptorsDtoList"),
+            value_keys=("stressLevel",),
+            exclude_negative=True,
+            request_date=target_date,
+        )
 
 
-async def async_fetch_intraday(client: GarminClient, target_date: date, metric: str, request_gate: GarminRequestGate | None = None) -> tuple[NormalizedSample, ...]:
+async def async_fetch_intraday(
+    client: GarminClient,
+    target_date: date,
+    metric: str,
+    request_gate: GarminRequestGate | None = None,
+) -> tuple[NormalizedSample, ...]:
     """Fetch one intraday series through a shared request gate."""
     return await GarminHistorySource(client, request_gate).async_fetch(target_date, metric)

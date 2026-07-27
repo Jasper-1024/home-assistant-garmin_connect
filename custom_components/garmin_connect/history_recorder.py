@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
 from enum import StrEnum
-from typing import Any, Protocol, Sequence
+from typing import Any, Protocol
 
 from .history_source import NormalizedSample
 
@@ -59,6 +59,7 @@ class GarminHistoryRecorder:
 
     def __init__(self, recorder: _Recorder) -> None:
         self._recorder = recorder
+
     async def async_write(
         self,
         statistic_id: str,
@@ -70,12 +71,14 @@ class GarminHistoryRecorder:
             from homeassistant.components.recorder.db_schema import Statistics
             from homeassistant.components.recorder.models import StatisticMeanType
             from homeassistant.components.recorder.tasks import SynchronizeTask
-        except (ImportError, AttributeError, TypeError):
+        except ImportError, AttributeError, TypeError:
             return RecorderWriteOutcome(0, "incompatible", "recorder_symbols")
         if not statistic_id or not metric.key:
             return RecorderWriteOutcome(0, "invalid", "metric")
         if tuple(inspect.signature(self._recorder.async_import_statistics).parameters) != (
-            "metadata", "stats", "table"
+            "metadata",
+            "stats",
+            "table",
         ):
             return RecorderWriteOutcome(0, "incompatible", "recorder_signature")
         try:
@@ -89,7 +92,12 @@ class GarminHistoryRecorder:
                 "unit_of_measurement": metric.unit_of_measurement,
             }
             stats = [
-                {"start": sample.timestamp, "mean": sample.value, "min": sample.value, "max": sample.value}
+                {
+                    "start": sample.timestamp,
+                    "mean": sample.value,
+                    "min": sample.value,
+                    "max": sample.value,
+                }
                 for sample in samples
             ]
             self._recorder.async_import_statistics(metadata, stats, Statistics)
@@ -99,6 +107,6 @@ class GarminHistoryRecorder:
             await future
         except asyncio.CancelledError:
             raise
-        except (AttributeError, ImportError, TypeError, ValueError, RuntimeError):
+        except AttributeError, ImportError, TypeError, ValueError, RuntimeError:
             return RecorderWriteOutcome(0, "failed", "recorder_unavailable")
         return RecorderWriteOutcome(len(samples))

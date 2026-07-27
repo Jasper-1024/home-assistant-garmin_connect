@@ -6,9 +6,9 @@ from datetime import UTC, date, datetime
 import pytest
 
 from custom_components.garmin_connect.history_recorder import (
-    GarminHistoryRecorder,
     HEART_RATE_METADATA,
     STRESS_METADATA,
+    GarminHistoryRecorder,
     statistic_id_for,
 )
 from custom_components.garmin_connect.history_source import NormalizedSample
@@ -33,12 +33,16 @@ async def test_writer_preserves_aware_timestamps_and_equal_values_without_state_
     writer = GarminHistoryRecorder(recorder)
     samples = (
         NormalizedSample(
-            datetime(2026, 7, 24, 1, 2, tzinfo=UTC), date(2026, 7, 24),
-            "2026-07-24T01:02:00+00:00", 60.0,
+            datetime(2026, 7, 24, 1, 2, tzinfo=UTC),
+            date(2026, 7, 24),
+            "2026-07-24T01:02:00+00:00",
+            60.0,
         ),
         NormalizedSample(
-            datetime(2026, 7, 24, 1, 3, tzinfo=UTC), date(2026, 7, 24),
-            "2026-07-24T01:03:00+00:00", 60.0,
+            datetime(2026, 7, 24, 1, 3, tzinfo=UTC),
+            date(2026, 7, 24),
+            "2026-07-24T01:03:00+00:00",
+            60.0,
         ),
     )
 
