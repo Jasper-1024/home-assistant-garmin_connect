@@ -1,4 +1,5 @@
 {
+  "_redaction_version": "3.1.0-beta.1",
   "_provenance": "Sanitized synthetic fixture preserving probe/captured nesting; values redacted and non-medical test values.",
   "respiration": {
     "respirationValuesArray": [["2026-07-24T23:50:00Z", 14], ["2026-07-24T01:00:00+02:00", 12], ["2026-07-24T01:00:00+02:00", 13]],

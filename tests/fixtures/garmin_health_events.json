@@ -1,4 +1,6 @@
 {
+  "_provenance": "Sanitized captured-shaped health-event fixture; identifiers and medical scalar values redacted.",
+  "_redaction_version": "3.1.0-beta.1",
   "events": [
     {"source": "MOVE_IQ", "type": "walking", "category": "activity", "startTime": "2026-07-24T10:00:00+02:00", "endTime": "2026-07-24T10:15:00+02:00"},
     {"source": "GARMIN", "eventType": "abnormalHeartRate", "eventTime": "2026-07-24T23:00:00Z"}

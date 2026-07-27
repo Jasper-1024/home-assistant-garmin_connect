@@ -1,4 +1,5 @@
 {
+  "_redaction_version": "3.1.0-beta.1",
   "_provenance": "Sanitized synthetic fixture derived from captured/probe daily-summary and training-status response structure; scalar values are synthetic/redacted while field nesting, optional fields, and representative cardinality are preserved.",
   "_cardinality": {"daily_summary_fields": 1, "training_status_fields": 7, "optional_fields": 3},
   "daily_summary": {

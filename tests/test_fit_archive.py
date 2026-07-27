@@ -182,7 +182,7 @@ def test_fit_record_rejects_raw_or_unbounded_summary_fields() -> None:
 
 def test_captured_structural_fixture_is_redacted_and_validated() -> None:
     fixture = json.loads((Path(__file__).parent / "fixtures" / "garmin_fit_structural_summary.json").read_text())
-    assert fixture["provenance"]["redaction_version"] == "sak-13-1"
+    assert fixture["provenance"]["redaction_version"] == "3.1.0-beta.1"
     summary = fixture["summary"]
     record = fit_record({"logical_id": "1" * 24, "path": fit_file_name("1" * 24), "summary": summary})
     assert set(record["summary"]) == {"message_counts", "message_fields", "time_coverage", "presence"}

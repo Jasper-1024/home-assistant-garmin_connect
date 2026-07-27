@@ -1,4 +1,6 @@
 {
+  "_provenance": "Sanitized captured-shaped sleep stream fixture; raw values are synthetic and no credentials are present.",
+  "_redaction_version": "3.1.0-beta.1",
   "startTime": "2026-07-24T23:45:00Z",
   "endTime": "2026-07-25T07:15:00Z",
   "sleepHeartRateValueDescriptorsDTOList": [{"key": "value", "index": 0}, {"key": "timestamp", "index": 1}],

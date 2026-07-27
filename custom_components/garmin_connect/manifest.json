@@ -17,5 +17,5 @@
     "ha-garmin==0.1.31",
     "garmin-fit-sdk==21.208.0"
   ],
-  "version": "3.0.14"
+  "version": "3.1.0-beta.1"
 }

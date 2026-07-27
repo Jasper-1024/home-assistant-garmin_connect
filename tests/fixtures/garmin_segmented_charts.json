@@ -1,4 +1,5 @@
 {
+  "_redaction_version": "3.1.0-beta.1",
   "_provenance": "Sanitized synthetic fixture preserving captured Garmin chart nesting and descriptor names; scalar values redacted/replaced.",
   "steps": {
     "summary": {"totalSteps": 12345, "goal": 15000, "distance": null},
