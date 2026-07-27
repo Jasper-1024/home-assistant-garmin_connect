@@ -741,14 +741,17 @@ class GarminHistoryArchive:
             try:
                 partition = await self._sleep_partition_stores[year].async_load()
                 if partition is None:
+                    self._completed_dates = {value for value in self._completed_dates if value[:4] != year}
                     continue
                 if (
                     not isinstance(partition, Mapping)
                     or partition.get("account_key") != self._account_key()
                     or partition.get("year") != year
                     or partition.get("sleep_schema_version", _SLEEP_SCHEMA_VERSION) != _SLEEP_SCHEMA_VERSION
-                or not isinstance(partition.get("sessions", {}), Mapping)
+                    or not isinstance(partition.get("sessions", {}), Mapping)
+                    or not isinstance(partition.get("events", {}), Mapping)
                 ):
+                    self._completed_dates = {value for value in self._completed_dates if value[:4] != year}
                     continue
                 parsed: dict[str, dict[str, Any]] = {}
                 for logical_id, record in partition.get("sessions", {}).items():

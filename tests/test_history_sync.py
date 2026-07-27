@@ -589,6 +589,28 @@ async def test_corrupt_or_other_account_event_partition_is_ignored():
 
 
 @pytest.mark.asyncio
+async def test_runtime_missing_event_partition_invalidates_and_refetches():
+    catalog = _NamedStore({"account_key": "opaque-account-key-1234567890", "schema_version": 1, "completed_dates": ["2026-07-24"], "hrv_summaries": {}, "presence": {}, "sleep_index": {}, "event_index": {"2026": ["a" * 24]}})
+    stores = {"garmin_connect.e.history_catalog": catalog, "garmin_connect.e.sleep_2026": _NamedStore(None)}
+    calls = 0
+
+    class Source:
+        async def async_fetch_details(self, target, metric):
+            nonlocal calls
+            if metric == "health_events_daily":
+                calls += 1
+            return ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = _partition_archive(Source(), recorder, stores)
+    await archive.async_start()
+    assert "2026-07-24" not in archive._completed_dates
+    await archive.async_sync_range(date(2026, 7, 24), date(2026, 7, 24))
+    assert calls == 1
+
+
+@pytest.mark.asyncio
 async def test_calendar_loads_prior_year_partition_for_cross_year_sleep():
     session = parse_sleep_sessions(
         {"startTime": "2025-12-31T22:00:00Z", "endTime": "2026-01-01T06:00:00Z"},
