@@ -137,6 +137,7 @@ def test_normalize_activities_rejects_explicit_event_families() -> None:
         {"activityId": 1, "activityType": "walking", "eventTypeKey": "dailyEvent", "startTime": "2026-07-24T10:00:00Z", "durationInSeconds": 60},
         {"activityId": 2, "activityType": "walking", "sourceName": "Garmin MOVE_IQ event", "startTime": "2026-07-24T10:00:00Z", "durationInSeconds": 60},
         {"activityId": 3, "activityType": "running", "eventTime": "2026-07-24T10:00:00Z", "startTime": "2026-07-24T10:00:00Z"},
+        {"activityId": 5, "activityType": "running", "eventCategory": "daily", "startTime": "2026-07-24T10:00:00Z", "durationInSeconds": 60},
         {"activityId": 4, "activityType": "running", "source": "Garmin", "startTime": "2026-07-24T10:00:00Z", "endTime": "2026-07-24T11:00:00Z"},
     ]
     result = normalize_activities(payload, date(2026, 7, 24))

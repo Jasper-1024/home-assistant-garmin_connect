@@ -636,7 +636,7 @@ class GarminHistoryArchive:
                 if not isinstance(activity_details, tuple) or any(not isinstance(item, NormalizedActivity) for item in activity_details):
                     raise ValueError("activity result has invalid shape")
                 for activity in activity_details:
-                    year = str(activity.start.year)
+                    year = str(activity.calendar_date.year)
                     activities_by_year.setdefault(year, {})[activity.logical_id] = {
                         "logical_id": activity.logical_id, "activity_id": activity.activity_id, "revision": activity.revision, "calendar_date": activity.calendar_date.isoformat(),
                         "activity_type": activity.activity_type, "name": activity.name, "start": activity.start.isoformat(),
@@ -806,7 +806,7 @@ class GarminHistoryArchive:
                 parsed_activities: dict[str, dict[str, Any]] = {}
                 for key, value in raw_activities.items():
                     restored_activity = activity_from_record(value)
-                    if restored_activity.logical_id != key:
+                    if restored_activity.logical_id != key or str(restored_activity.calendar_date.year) != year:
                         raise SleepSchemaError("activity partition is invalid")
                     parsed_activities[key] = dict(value)
                 self._activities[year] = parsed_activities

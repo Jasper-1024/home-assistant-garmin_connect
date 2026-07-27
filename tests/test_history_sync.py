@@ -692,6 +692,25 @@ async def test_activity_partition_account_mismatch_isolated() -> None:
 
 
 @pytest.mark.asyncio
+async def test_activity_partition_uses_local_calendar_year_at_utc_year_boundary() -> None:
+    activity = normalize_activities(
+        [{"activityId": 998, "activityType": "running", "startTimeLocal": "2026-01-01T00:30:00+02:00", "durationInSeconds": 60}],
+        date(2026, 1, 1),
+    )[0]
+
+    class Source:
+        async def async_fetch_details(self, target, metric):
+            return (activity,) if metric == "timed_activities" else ()
+
+    stores = {"garmin_connect.e.history_catalog": _NamedStore()}
+    archive = _partition_archive(Source(), MagicMock(), stores)
+    await archive.async_start()
+    await archive.async_sync_range(date(2026, 1, 1), date(2026, 1, 1))
+    assert "garmin_connect.e.sleep_2026" in stores
+    assert "garmin_connect.e.sleep_2025" not in stores
+
+
+@pytest.mark.asyncio
 async def test_calendar_loads_prior_year_partition_for_cross_year_sleep():
     session = parse_sleep_sessions(
         {"startTime": "2025-12-31T22:00:00Z", "endTime": "2026-01-01T06:00:00Z"},

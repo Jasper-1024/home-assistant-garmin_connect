@@ -139,8 +139,11 @@ def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedAct
             or marker.startswith("daily")
             for marker in (*families, type_key)
         )
-        has_event_fields = any(key in item for key in ("eventId", "eventTime", "eventCategory", "eventPayload"))
-        if non_timed_family or (has_event_fields and "endTime" not in item and "endTimeGMT" not in item and "durationInSeconds" not in item and "duration" not in item):
+        has_event_fields = any(
+            key in item
+            for key in ("eventId", "eventTime", "eventCategory", "eventPayload", "eventData", "eventFields")
+        )
+        if non_timed_family or has_event_fields:
             continue
         start_raw = item.get("startTime", item.get("startTimeGMT", item.get("startTimeLocal")))
         activity_id = item.get("activityId", item.get("activityUUID"))
