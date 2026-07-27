@@ -124,8 +124,8 @@ def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedAct
         if start is None:
             raise HistorySchemaError("activity timestamp is invalid")
         end = _timestamp(item.get("endTimeGMT", item.get("endTime"))) if item.get("endTimeGMT", item.get("endTime")) is not None else None
-        def numeric(*names: str) -> float | None:
-            value = next((item[name] for name in names if name in item), None)
+        def numeric(item_data: dict[str, Any], *names: str) -> float | None:
+            value = next((item_data[name] for name in names if name in item_data), None)
             if value is None:
                 return None
             if isinstance(value, bool) or not isinstance(value, int | float):
@@ -136,8 +136,8 @@ def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedAct
         logical_id = hashlib.sha256(identity.encode()).hexdigest()[:24]
         preserved = {key: item[key] for key in ("activityName", "activityType", "startTimeLocal", "startTimeGMT", "endTimeGMT", "duration", "durationInSeconds", "trainingEffect", "aerobicTrainingEffect", "activityTrainingLoad", "recoveryTime") if key in item}
         revision = hashlib.sha256(json.dumps(preserved, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()[:16]
-        duration = numeric("durationInSeconds", "duration")
-        result[logical_id] = NormalizedActivity(logical_id, revision, activity_type, item.get("activityName") if isinstance(item.get("activityName"), str) else None, start, end, duration, numeric("trainingEffect", "aerobicTrainingEffect"), numeric("activityTrainingLoad", "trainingLoad"), numeric("recoveryTime"), target_date)
+        duration = numeric(item, "durationInSeconds", "duration")
+        result[logical_id] = NormalizedActivity(logical_id, revision, activity_type, item.get("activityName") if isinstance(item.get("activityName"), str) else None, start, end, duration, numeric(item, "trainingEffect", "aerobicTrainingEffect"), numeric(item, "activityTrainingLoad", "trainingLoad"), numeric(item, "recoveryTime"), target_date)
     return tuple(sorted(result.values(), key=lambda item: (item.start, item.logical_id)))
 
 

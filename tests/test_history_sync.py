@@ -34,9 +34,9 @@ from custom_components.garmin_connect.history_source import (
     SegmentedData,
     SnapshotData,
     SourceSeries,
+    normalize_activities,
     normalize_health_events,
     normalize_snapshot,
-    normalize_activities,
 )
 from custom_components.garmin_connect.sleep_archive import (
     SleepSession,
