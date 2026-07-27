@@ -321,7 +321,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         ).async_sync_range(start_date, end_date)
         return {
             "outcome": report.outcome,
-            "processed_dates": len(report.processed_dates),
+            "processed_dates": [item.isoformat() for item in report.processed_dates],
             "inserted_count": report.inserted_count,
             "updated_count": report.updated_count,
             "skipped_count": report.skipped_count,

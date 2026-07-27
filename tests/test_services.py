@@ -1,5 +1,6 @@
 """Tests for Garmin Connect services."""
 
+from datetime import date
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -7,6 +8,7 @@ import pytest
 from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.garmin_connect.const import DOMAIN
+from custom_components.garmin_connect.history import HistorySyncReport
 from custom_components.garmin_connect.services import (
     async_setup_services,
     async_unload_services,
@@ -133,6 +135,47 @@ async def test_probe_intraday_uses_loaded_runtime_client(
     assert probe.await_args.args[0] is client
     assert probe.await_args.args[1].isoformat() == "2026-07-24"
     assert probe.await_args.args[2] == "stress"
+
+
+async def test_sync_history_returns_processed_iso_dates_without_private_data(
+    mock_hass: MagicMock,
+) -> None:
+    """sync_history exposes dates and bounded counters, never account details."""
+    await async_setup_services(mock_hass)
+    handler = _get_handler(mock_hass, "sync_history")
+    archive = MagicMock()
+    archive.async_sync_range = AsyncMock(
+        return_value=HistorySyncReport(
+            processed_dates=(date(2026, 7, 24), date(2026, 7, 25)),
+            inserted_count=4,
+            updated_count=1,
+            skipped_count=2,
+            outcome="written",
+        )
+    )
+    call = MagicMock()
+    call.data = {
+        "entity_id": "sensor.garmin_steps",
+        "start_date": date(2026, 7, 24),
+        "end_date": date(2026, 7, 25),
+    }
+
+    with patch(
+        "custom_components.garmin_connect.services._get_archive",
+        return_value=archive,
+    ):
+        response = await handler(call)
+
+    assert response == {
+        "outcome": "written",
+        "processed_dates": ["2026-07-24", "2026-07-25"],
+        "inserted_count": 4,
+        "updated_count": 1,
+        "skipped_count": 2,
+        "error_type": None,
+    }
+    assert "account" not in str(response).lower()
+    archive.async_sync_range.assert_awaited_once_with(date(2026, 7, 24), date(2026, 7, 25))
 
 
 async def test_probe_capability_uses_loaded_runtime_client(
