@@ -72,6 +72,11 @@ class SnapshotData:
     raw_timestamp: Any
 
 
+HistorySeries = tuple[NormalizedSample, ...]
+HistoryResult = HistorySeries | tuple[SleepSession, ...]
+HistoryDetails = HistorySeries | HRVData | SegmentedData | SourceSeries | SnapshotData | tuple[SleepSession, ...]
+
+
 def normalize_snapshot(
     payload: Any,
     target_date: date,
@@ -457,12 +462,16 @@ class GarminHistorySource:
         self.client = client
         self.request_gate = request_gate or GarminRequestGate()
 
-    async def async_fetch(self, target_date: date, metric: str) -> tuple[NormalizedSample, ...]:
+    async def async_fetch(self, target_date: date, metric: str) -> HistoryResult:
         """Fetch one metric, retaining the historical tuple return contract."""
         result = await self.async_fetch_details(target_date, metric)
-        return result.readings if isinstance(result, (HRVData, SegmentedData, SourceSeries)) else () if isinstance(result, SnapshotData) else result
+        if isinstance(result, (HRVData, SegmentedData, SourceSeries)):
+            return result.readings
+        if isinstance(result, SnapshotData):
+            return ()
+        return result
 
-    async def async_fetch_details(self, target_date: date, metric: str) -> tuple[NormalizedSample, ...] | HRVData | SegmentedData | SourceSeries | SnapshotData | tuple[SleepSession, ...]:
+    async def async_fetch_details(self, target_date: date, metric: str) -> HistoryDetails:
         """Fetch a metric and retain private details needed by the archive."""
 
         async def request() -> Any:
