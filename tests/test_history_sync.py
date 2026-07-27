@@ -672,6 +672,7 @@ async def test_activity_partition_restart_and_corruption_invalidate_checkpoint()
     corrupted = _partition_archive(Source(), recorder, stores)
     await corrupted.async_start()
     assert "2026-07-24" not in corrupted._completed_dates
+    assert "2026" not in stores["garmin_connect.e.history_catalog"].data["activity_index"]
     assert await corrupted.async_get_calendar_events("activity", date(2026, 7, 24), date(2026, 7, 24)) == ()
 
 
@@ -691,6 +692,7 @@ async def test_activity_partition_account_mismatch_isolated() -> None:
     archive = _partition_archive(MagicMock(), MagicMock(), stores)
     await archive.async_start()
     assert "2026-07-24" not in archive._completed_dates
+    assert "2026" not in stores["garmin_connect.e.history_catalog"].data["activity_index"]
     assert await archive.async_get_calendar_events("activity", date(2026, 7, 24), date(2026, 7, 24)) == ()
 
 

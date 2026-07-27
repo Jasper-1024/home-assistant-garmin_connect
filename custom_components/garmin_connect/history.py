@@ -770,6 +770,7 @@ class GarminHistoryArchive:
                 partition = await self._sleep_partition_stores[year].async_load()
                 if partition is None:
                     self._completed_dates = {value for value in self._completed_dates if value[:4] != year}
+                    await self._async_invalidate_activity_index(year)
                     continue
                 if (
                     not isinstance(partition, Mapping)
@@ -780,6 +781,7 @@ class GarminHistoryArchive:
                     or not isinstance(partition.get("events", {}), Mapping)
                 ):
                     self._completed_dates = {value for value in self._completed_dates if value[:4] != year}
+                    await self._async_invalidate_activity_index(year)
                     continue
                 parsed: dict[str, dict[str, Any]] = {}
                 for logical_id, record in partition.get("sessions", {}).items():
@@ -815,6 +817,28 @@ class GarminHistoryArchive:
                 self._health_events.pop(year, None)
                 self._activities.pop(year, None)
                 self._completed_dates = {value for value in self._completed_dates if value[:4] != year}
+                await self._async_invalidate_activity_index(year)
+
+    async def _async_invalidate_activity_index(self, year: str) -> None:
+        """Best-effort removal of an invalid annual activity index entry."""
+        store = self._store
+        if store is None:
+            return
+        try:
+            catalog = await store.async_load()
+            if not isinstance(catalog, Mapping):
+                return
+            raw_index = catalog.get("activity_index")
+            if not isinstance(raw_index, Mapping) or year not in raw_index:
+                return
+            activity_index = {key: value for key, value in raw_index.items() if key != year}
+            updated = dict(catalog)
+            updated["activity_index"] = activity_index
+            await store.async_save(updated)
+        except (OSError, TypeError, ValueError):
+            # The partition and checkpoint are already invalidated in memory;
+            # a catalog write failure must not restore durability or escape.
+            return
 
     def _async_ensure_account_key(self) -> str:
         """Load or create the opaque identity persisted in the config entry."""
