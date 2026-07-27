@@ -118,9 +118,11 @@ def normalize_pair_series(
     for point in raw_points:
         if (
             not isinstance(point, (list, tuple))
-            or timestamp_index >= len(point)
-            or value_index >= len(point)
         ):
+            continue
+        if timestamp_index >= len(point) or value_index >= len(point):
+            if descriptor_present:
+                raise HistorySchemaError(f"{values_key} point is narrower than its descriptors")
             continue
         raw_time, raw_value = point[timestamp_index], point[value_index]
         if raw_time is not None and not isinstance(raw_time, str | int | float):
@@ -181,26 +183,37 @@ def _object_series(payload: Any, target_date: date, value_keys: tuple[str, ...],
 
 
 def _totals(payload: Any, keys: tuple[str, ...]) -> dict[str, float] | None:
-    if not isinstance(payload, dict):
-        return None
-    result = {}
-    for key in keys:
-        value = payload.get(key)
-        if value is None:
-            continue
-        if isinstance(value, bool) or not isinstance(value, int | float):
-            raise HistorySchemaError("daily total has an invalid type")
-        result[key] = float(value)
+    result: dict[str, float] = {}
+    key_set = set(keys)
+
+    def visit(value: Any, depth: int) -> None:
+        if depth > 3 or value is None:
+            return
+        if isinstance(value, dict):
+            for name, item in value.items():
+                if name in key_set:
+                    if item is None:
+                        continue
+                    if isinstance(item, bool) or not isinstance(item, int | float):
+                        raise HistorySchemaError("daily total has an invalid type")
+                    result[name] = float(item)
+                elif name in {"report", "summary", "data", "daily", "totals", "metrics"}:
+                    visit(item, depth + 1)
+        elif isinstance(value, list):
+            for item in value[:32]:
+                visit(item, depth + 1)
+
+    visit(payload, 0)
     return result or None
 
 
 def normalize_steps(payload: Any, target_date: date) -> SegmentedData:
-    readings = _descriptor_segment(payload, target_date, ("stepsValues", "stepsValuesArray", "chartData", "data"), ("steps", "stepCount", "value"), ("stepsValueDescriptors", "stepsValueDescriptorsDTOList"))
+    readings = _descriptor_segment(payload, target_date, ("stepsValues", "stepsValuesArray", "chartData", "data"), ("steps", "stepCount", "value"), ("stepsValueDescriptors", "stepsValueDescriptorsDTOList", "stepsValueDescriptorDTOList"))
     return SegmentedData(readings if readings is not None else _object_series(payload, target_date, ("steps", "stepCount", "value"), ("steps", "stepsValues", "stepsValuesArray", "chartData", "data")), _totals(payload, ("totalSteps", "steps")))
 
 
 def normalize_floors(payload: Any, target_date: date) -> SegmentedData:
-    readings = _descriptor_segment(payload, target_date, ("floorsValues", "floorsValuesArray", "chartData", "data"), ("floors", "floorCount", "value"), ("floorsValueDescriptors", "floorsValueDescriptorsDTOList"))
+    readings = _descriptor_segment(payload, target_date, ("floorsValues", "floorsValuesArray", "chartData", "data"), ("floors", "floorCount", "value"), ("floorsValueDescriptors", "floorsValueDescriptorsDTOList", "floorsValueDescriptorDTOList"))
     return SegmentedData(readings if readings is not None else _object_series(payload, target_date, ("floors", "floorCount", "value"), ("floors", "floorValues", "floorsValuesArray", "chartData", "data")), _totals(payload, ("floorsAscended", "floorsDescended", "floorsAscendedInMeters", "floorsDescendedInMeters", "totalFloors")))
 
 
@@ -208,7 +221,7 @@ def normalize_intensity(payload: Any, target_date: date, kind: str) -> Segmented
     if kind not in {"moderate", "vigorous"}:
         raise ValueError("unsupported intensity kind")
     keys = (f"{kind}IntensityMinutes", f"{kind}Minutes", "value")
-    readings = _descriptor_segment(payload, target_date, ("intensityValues", "intensityValuesArray", "chartData", "data"), keys, ("intensityValueDescriptors", "intensityValueDescriptorsDTOList"))
+    readings = _descriptor_segment(payload, target_date, ("intensityValues", "intensityValuesArray", "chartData", "data"), keys, ("intensityValueDescriptors", "intensityValueDescriptorsDTOList", "intensityValueDescriptorDTOList"))
     return SegmentedData(readings if readings is not None else _object_series(payload, target_date, keys, (f"{kind}IntensityMinutes", f"{kind}Minutes", "intensityMinutes", "chartData", "data")), _totals(payload, ("moderateIntensityMinutes", "vigorousIntensityMinutes", "totalIntensityMinutes")))
 
 

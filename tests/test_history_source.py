@@ -154,3 +154,33 @@ def test_floors_and_intensity_keep_distinct_semantics() -> None:
     assert [sample.value for sample in floors.readings] == [0, 2]
     assert moderate.readings[0].value == 1
     assert vigorous.readings[0].value == 3
+
+
+def test_fixture_like_nested_totals_and_singular_descriptor_spellings() -> None:
+    steps = normalize_steps({
+        "summary": {"totalSteps": 12345, "goal": 15000, "optional": None},
+        "stepsValueDescriptorDTOList": [{"key": "timestamp", "index": 1}, {"key": "steps", "index": 0}, {"key": "activityLevel", "index": 2}],
+        "stepsValuesArray": [[0, "2026-07-24T00:00:00Z", "rest"], [3, "2026-07-24T00:15:00Z", "active"]] * 8,
+    }, date(2026, 7, 24))
+    floors = normalize_floors({
+        "report": {"totals": {"floorsAscended": 10, "floorsDescended": 4}},
+        "floorsValueDescriptorDTOList": [{"key": "floorCount", "index": 1}, {"key": "timestamp", "index": 0}],
+        "floorsValuesArray": [[0, 0], [60, 2], [120, None]],
+    }, date(2026, 7, 24))
+    intensity = normalize_intensity({
+        "data": {"summary": {"moderateIntensityMinutes": 42, "vigorousIntensityMinutes": 8}, "intensityValues": []},
+        "intensityValueDescriptorDTOList": [{"key": "moderateIntensityMinutes", "index": 0}, {"key": "timestamp", "index": 1}],
+        "intensityValuesArray": [[1, 0], [2, 900000]],
+    }, date(2026, 7, 24), "moderate")
+    assert len(steps.readings) == 2
+    assert steps.totals == {"totalSteps": 12345.0}
+    assert floors.totals == {"floorsAscended": 10.0, "floorsDescended": 4.0}
+    assert intensity.totals == {"moderateIntensityMinutes": 42.0, "vigorousIntensityMinutes": 8.0}
+
+
+def test_descriptor_index_beyond_point_width_is_schema_error() -> None:
+    with pytest.raises(HistorySchemaError):
+        normalize_steps({
+            "stepsValueDescriptorDTOList": [{"key": "timestamp", "index": 0}, {"key": "steps", "index": 2}],
+            "stepsValuesArray": [["2026-07-24T00:00:00Z", 1]],
+        }, date(2026, 7, 24))
