@@ -128,12 +128,12 @@ def normalize_health_events(payload: Any, target_date: date) -> tuple[Normalized
         category = next((event[key] for key in ("category", "eventCategory") if key in event), None)
         if any(value is not None and not isinstance(value, str) for value in (source, event_type, category)):
             raise HistorySchemaError("health event identity has invalid type")
-        def event_time(names: tuple[str, ...]) -> datetime | None:
-            value = next((event[key] for key in names if key in event), None)
+        def event_time(event_data: dict[str, Any], names: tuple[str, ...]) -> datetime | None:
+            value = next((event_data[key] for key in names if key in event_data), None)
             return _timestamp(value)
-        start = event_time(("startTime", "startTimeGMT", "start"))
-        end = event_time(("endTime", "endTimeGMT", "end"))
-        occurrence = event_time(("occurrenceTime", "occurrenceTimeGMT", "eventTime", "timestamp", "time"))
+        start = event_time(event, ("startTime", "startTimeGMT", "start"))
+        end = event_time(event, ("endTime", "endTimeGMT", "end"))
+        occurrence = event_time(event, ("occurrenceTime", "occurrenceTimeGMT", "eventTime", "timestamp", "time"))
         identity = (source, event_type, category, start.isoformat() if start else None, end.isoformat() if end else None, occurrence.isoformat() if occurrence else None)
         logical_id = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()[:24]
         revision = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]

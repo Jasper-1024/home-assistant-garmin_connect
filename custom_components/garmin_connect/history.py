@@ -65,11 +65,11 @@ from .history_source import (
     GarminHistorySource,
     HRVData,
     HRVSummary,
+    NormalizedHealthEvent,
     NormalizedSample,
     SegmentedData,
     SnapshotData,
     SourceSeries,
-    NormalizedHealthEvent,
 )
 from .sleep_archive import SleepSchemaError, SleepSession, session_from_record, session_record
 
