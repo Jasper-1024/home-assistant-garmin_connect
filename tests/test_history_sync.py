@@ -786,7 +786,6 @@ async def test_valid_fit_survives_restart_revalidation(tmp_path: Path, monkeypat
 
     monkeypatch.setattr(history_module, "inspect_fit", inspect_valid_fit)
     await archive.async_start()
-    await archive._async_load_sleep_partitions({"2026"})
     assert inspected_paths == [fit_path]
     assert activity.logical_id in archive._fit_archives["2026"]
     assert partition.data["fits"][activity.logical_id]["logical_id"] == activity.logical_id
