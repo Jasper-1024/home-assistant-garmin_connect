@@ -561,6 +561,6 @@ async def async_fetch_intraday(
     target_date: date,
     metric: str,
     request_gate: GarminRequestGate | None = None,
-) -> tuple[NormalizedSample, ...]:
+) -> HistoryResult:
     """Fetch one intraday series through a shared request gate."""
     return await GarminHistorySource(client, request_gate).async_fetch(target_date, metric)
