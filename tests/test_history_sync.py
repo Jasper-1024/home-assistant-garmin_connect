@@ -824,7 +824,7 @@ async def test_background_fit_limit_defers_then_converges_across_restart(tmp_pat
     restarted._entry.runtime_data.core.client = client
     restarted._hass.config.path.return_value = str(tmp_path)
     await restarted.async_start()
-    assert set(restarted._fit_archives[2026]) == {activities[0].logical_id}
+    assert set(restarted._fit_archives["2026"]) == {activities[0].logical_id}
     second = await restarted.async_sync_range(date(2026, 1, 1), date(2026, 1, 1), fit_limit=1, include_training_status=False)
     assert second.outcome == "written"
     assert "2026-01-01" in stores["garmin_connect.e.history_catalog"].data["completed_dates"]
