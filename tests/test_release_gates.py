@@ -19,8 +19,8 @@ from custom_components.garmin_connect.history import (
 )
 from custom_components.garmin_connect.history_source import (
     DAILY_SUMMARY_FIELDS,
-    HistorySchemaError,
     TRAINING_STATUS_FIELDS,
+    HistorySchemaError,
     normalize_activities,
     normalize_health_events,
     normalize_respiration,
