@@ -73,6 +73,7 @@ from .history_source import (
     SourceSeries,
     health_event_from_record,
     health_event_record,
+    activity_from_record,
 )
 from .sleep_archive import SleepSchemaError, SleepSession, session_from_record, session_record
 
@@ -637,7 +638,7 @@ class GarminHistoryArchive:
                 for activity in activity_details:
                     year = str(activity.start.year)
                     activities_by_year.setdefault(year, {})[activity.logical_id] = {
-                        "logical_id": activity.logical_id, "revision": activity.revision, "calendar_date": activity.calendar_date.isoformat(),
+                        "logical_id": activity.logical_id, "activity_id": activity.activity_id, "revision": activity.revision, "calendar_date": activity.calendar_date.isoformat(),
                         "activity_type": activity.activity_type, "name": activity.name, "start": activity.start.isoformat(),
                         "end": activity.end.isoformat() if activity.end else None, "duration_seconds": activity.duration_seconds,
                         "training_effect": activity.training_effect, "load": activity.load, "recovery": activity.recovery,
@@ -802,7 +803,13 @@ class GarminHistoryArchive:
                 raw_activities = partition.get("activities", {})
                 if not isinstance(raw_activities, Mapping):
                     raise SleepSchemaError("activity partition is invalid")
-                self._activities[year] = {str(key): dict(value) for key, value in raw_activities.items() if isinstance(key, str) and isinstance(value, Mapping)}
+                parsed_activities: dict[str, dict[str, Any]] = {}
+                for key, value in raw_activities.items():
+                    restored_activity = activity_from_record(value)
+                    if restored_activity.logical_id != key:
+                        raise SleepSchemaError("activity partition is invalid")
+                    parsed_activities[key] = dict(value)
+                self._activities[year] = parsed_activities
             except (KeyError, TypeError, ValueError, OSError):
                 self._sleep_sessions.pop(year, None)
                 self._health_events.pop(year, None)
