@@ -79,6 +79,11 @@ def _dispatch_fixture_contract(stem: str, state: str, fixture: dict) -> str:
     if state == "schema_drift":
         assert fixture.get("unknown_structural_field") == "redacted"
         return "schema-drift"
+    if stem == "garmin_sleep_streams":
+        assert isinstance(fixture.get("sleepHeartRateValueDescriptorsDTOList"), list)
+        assert fixture["sleepHeartRateValueDescriptorsDTOList"]
+        assert isinstance(payload, list)
+        return "success"
     assert payload not in ({}, [], None)
     if stem == "garmin_fit_structural_summary":
         assert isinstance(payload.get("message_counts"), dict)
