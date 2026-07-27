@@ -17,7 +17,10 @@ from custom_components.garmin_connect.history import (
     HistoryStatus,
     HistorySyncReport,
 )
-from custom_components.garmin_connect.history_source import normalize_activities, normalize_health_events
+from custom_components.garmin_connect.history_source import (
+    normalize_activities,
+    normalize_health_events,
+)
 from custom_components.garmin_connect.services import async_setup_services
 from custom_components.garmin_connect.sleep_archive import SleepSchemaError, parse_sleep_sessions
 
