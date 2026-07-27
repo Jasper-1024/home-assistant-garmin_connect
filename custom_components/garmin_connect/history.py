@@ -544,7 +544,7 @@ class GarminHistoryArchive:
                 continue
             self._status = HistoryStatus(HistoryArchiveState.RUNNING, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
             try:
-                metrics = (
+                metrics: tuple[tuple[str, Any], ...] = (
                     ("heart_rate", HEART_RATE_METADATA),
                     ("stress", STRESS_METADATA),
                     ("body_battery", BODY_BATTERY_METADATA),
