@@ -616,6 +616,9 @@ async def test_timed_activity_archive_and_calendar_excludes_open_interval():
     activity = normalize_activities([{"activityId": 123, "activityType": "running", "activityName": "Morning Run", "startTime": "2026-07-24T23:30:00+02:00", "endTime": "2026-07-25T00:30:00+02:00", "durationInSeconds": 3600}], date(2026, 7, 24))[0]
 
     class Source:
+        async def async_fetch(self, target, metric):
+            return ()
+
         async def async_fetch_details(self, target, metric):
             return (activity,) if metric == "timed_activities" else ()
 
@@ -699,6 +702,9 @@ async def test_activity_partition_uses_local_calendar_year_at_utc_year_boundary(
     )[0]
 
     class Source:
+        async def async_fetch(self, target, metric):
+            return ()
+
         async def async_fetch_details(self, target, metric):
             return (activity,) if metric == "timed_activities" else ()
 
