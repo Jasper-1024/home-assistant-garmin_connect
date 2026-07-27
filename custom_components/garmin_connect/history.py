@@ -329,6 +329,16 @@ class GarminHistoryArchive:
         """Return the immutable, privacy-safe current status."""
         return self._status
 
+    def _backfill_status_fields(self) -> dict[str, Any]:
+        return {
+            "queued_count": self._status.queued_count,
+            "completed_count": self._status.completed_count,
+            "next_eligible_run": self._status.next_eligible_run,
+            "last_success": self._status.last_success,
+            "backoff_until": self._status.backoff_until,
+            "safe_error_class": self._status.safe_error_class,
+        }
+
     @property
     def hrv_summaries(self) -> Mapping[str, Mapping[str, Any]]:
         """Return the private, bounded HRV summary catalog seam."""
@@ -424,7 +434,7 @@ class GarminHistoryArchive:
         self._backfill = BackfillScheduler(
             load_state=self._async_load_backfill_state,
             save_state=self._async_save_backfill_state,
-            sync_date=lambda target: self.async_sync_range(target, target),
+            sync_date=lambda target: self.async_sync_range(target, target, fit_limit=1, include_training_status=False),
             reauth=self._async_backfill_reauth,
         )
         if isinstance(self._hass, HomeAssistant):
@@ -450,7 +460,12 @@ class GarminHistoryArchive:
         if self._store is None:
             return None
         catalog = await self._store.async_load()
-        return catalog.get("backfill") if isinstance(catalog, Mapping) else None
+        if not isinstance(catalog, Mapping):
+            return None
+        state = dict(catalog.get("backfill", {})) if isinstance(catalog.get("backfill", {}), Mapping) else {}
+        completed = set(state.get("completed_dates", [])) | self._completed_dates
+        state["completed_dates"] = sorted(completed)
+        return state
 
     async def _async_save_backfill_state(self, state: Mapping[str, Any]) -> None:
         if self._store is None:
@@ -473,7 +488,7 @@ class GarminHistoryArchive:
             if inspect.isawaitable(result):
                 await result
 
-    async def async_sync_range(self, start_date: date, end_date: date) -> HistorySyncReport:
+    async def async_sync_range(self, start_date: date, end_date: date, *, fit_limit: int | None = None, include_training_status: bool = True) -> HistorySyncReport:
         """Fetch and import the supported intraday metrics for an inclusive range."""
         validation_error = _validate_sync_range(start_date, end_date)
         if validation_error:
@@ -485,9 +500,9 @@ class GarminHistoryArchive:
             return HistorySyncReport(outcome="busy", error_type="sync_in_progress")
 
         async with self._sync_lock:
-            return await self._async_sync_range(start_date, end_date)
+            return await self._async_sync_range(start_date, end_date, fit_limit=fit_limit, include_training_status=include_training_status)
 
-    async def _async_sync_range(self, start_date: date, end_date: date) -> HistorySyncReport:
+    async def _async_sync_range(self, start_date: date, end_date: date, *, fit_limit: int | None = None, include_training_status: bool = True) -> HistorySyncReport:
         """Run one serialized, checkpointed manual sync."""
 
         runtime_data = getattr(self._entry, "runtime_data", None)
@@ -518,18 +533,18 @@ class GarminHistoryArchive:
         health_events: list[NormalizedHealthEvent] = []
         presence = {key: dict(value) for key, value in self._presence.items()}
         sleep_sessions = {year: dict(records) for year, records in self._sleep_sessions.items()}
-        self._status = HistoryStatus(HistoryArchiveState.RUNNING)
+        self._status = HistoryStatus(HistoryArchiveState.RUNNING, **self._backfill_status_fields())
         for offset in range((end_date - start_date).days + 1):
             target = start_date.fromordinal(start_date.toordinal() + offset)
             target_key = target.isoformat()
             if target_key in self._completed_dates:
                 skipped += 1
                 processed.append(target)
-                self._status = HistoryStatus(HistoryArchiveState.RUNNING, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated)
+                self._status = HistoryStatus(HistoryArchiveState.RUNNING, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
                 continue
-            self._status = HistoryStatus(HistoryArchiveState.RUNNING, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated)
+            self._status = HistoryStatus(HistoryArchiveState.RUNNING, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
             try:
-                for metric, metadata in (
+                metrics = (
                     ("heart_rate", HEART_RATE_METADATA),
                     ("stress", STRESS_METADATA),
                     ("body_battery", BODY_BATTERY_METADATA),
@@ -545,7 +560,10 @@ class GarminHistoryArchive:
                     ("spo2_hourly", SPO2_HOURLY_METADATA),
                     ("daily_summary", None),
                     ("training_status", None),
-                ):
+                )
+                if not include_training_status:
+                    metrics = tuple(item for item in metrics if item[0] != "training_status")
+                for metric, metadata in metrics:
                     try:
                         details_descriptor = inspect.getattr_static(source, "async_fetch_details")
                     except AttributeError:
@@ -700,6 +718,7 @@ class GarminHistoryArchive:
                 activity_details = await sleep_fetch(target, "timed_activities") if callable(sleep_descriptor) and callable(sleep_fetch) else ()
                 if not isinstance(activity_details, tuple) or any(not isinstance(item, NormalizedActivity) for item in activity_details):
                     raise ValueError("activity result has invalid shape")
+                fit_count = 0
                 for activity in activity_details:
                     year = str(activity.calendar_date.year)
                     activities_by_year.setdefault(year, {})[activity.logical_id] = {
@@ -710,6 +729,8 @@ class GarminHistoryArchive:
                     }
                     download_activity = getattr(client, "download_activity", None)
                     if callable(download_activity):
+                        if fit_limit is not None and fit_count >= fit_limit:
+                            raise RuntimeError("fit_limit_pending")
                         fit_directory = Path(self._hass.config.path("garmin_connect", "fit"))
                         fit_result = await async_archive_fit(
                             client=client,
@@ -719,6 +740,7 @@ class GarminHistoryArchive:
                             inspect=inspect_fit,
                         )
                         self._fit_archives.setdefault(year, {})[activity.logical_id] = fit_result
+                        fit_count += 1
                 processed.append(target)
                 completed_dates = self._completed_dates | {target_key}
                 await self._async_save_sleep_partitions(sleep_sessions, events_by_year, activities_by_year, self._fit_archives)
@@ -731,14 +753,14 @@ class GarminHistoryArchive:
                 self._health_events = events_by_year
                 self._activities = activities_by_year
             except asyncio.CancelledError:
-                self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated)
+                self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
                 raise
             except (AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError) as error:
                 self._runtime_sync_failure = True
                 self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type="sync_failed")
                 return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome="failed", error_type=classify_backfill_error(error))
         self._runtime_sync_failure = False
-        self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=end_date.isoformat(), processed_dates=len(processed), record_count=inserted + updated)
+        self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=end_date.isoformat(), processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
         return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome="written")
 
     async def _async_save_sleep_partitions(

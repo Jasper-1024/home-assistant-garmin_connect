@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 BACKFILL_START = date(2026, 1, 1)
@@ -42,7 +42,8 @@ class BackfillState:
             if not isinstance(value, str):
                 return None
             try:
-                return datetime.fromisoformat(value)
+                result = datetime.fromisoformat(value)
+                return result if result.tzinfo is not None and result.utcoffset() is not None else None
             except ValueError:
                 return None
         disabled = record.get("disabled_paths", [])
@@ -78,7 +79,7 @@ def next_backfill_date(state: BackfillState, today: date) -> date | None:
 class BackfillScheduler:
     """One-account scheduler; all network work is delegated to the archive."""
 
-    def __init__(self, *, load_state: Any, save_state: Any, sync_date: Any, reauth: Any = None, now: Any = datetime.now, sleep: Any = asyncio.sleep) -> None:
+    def __init__(self, *, load_state: Any, save_state: Any, sync_date: Any, reauth: Any = None, now: Any = lambda: datetime.now(UTC), sleep: Any = asyncio.sleep) -> None:
         self._load_state = load_state
         self._save_state = save_state
         self._sync_date = sync_date
@@ -105,7 +106,16 @@ class BackfillScheduler:
         try:
             report = await self._sync_date(target)
             if getattr(report, "outcome", None) != "written":
-                raise RuntimeError(getattr(report, "error_type", None) or "sync_failed")
+                error_type = getattr(report, "error_type", None) or "sync_failed"
+                backoff = now + BACKOFF_429 if error_type == "rate_limited" else self.state.backoff_until
+                disabled = self.state.disabled_paths
+                if error_type in {"forbidden_path", "reauth_required"}:
+                    disabled = disabled | {"history"}
+                    if error_type == "reauth_required" and self._reauth is not None:
+                        await self._reauth()
+                self.state = BackfillState(self.state.completed_dates, now + BACKFILL_INTERVAL, backoff, self.state.last_success, error_type, disabled)
+                await self._save_state(self.state.as_record())
+                return self.state
             self.state = BackfillState(self.state.completed_dates | {target.isoformat()}, now + BACKFILL_INTERVAL, None, now, None)
         except asyncio.CancelledError:
             raise
