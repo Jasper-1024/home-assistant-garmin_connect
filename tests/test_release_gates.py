@@ -104,7 +104,7 @@ def _dispatch_fixture_contract(stem: str, state: str, fixture: dict) -> str:
                 parse_sleep_sessions(fixture, date(2026, 2, 28))
             else:
                 return "schema-drift"
-        except HistorySchemaError:
+        except (HistorySchemaError, SleepSchemaError):
             return "schema-drift"
         raise AssertionError(f"{stem} schema drift was accepted")
     if stem == "garmin_sleep_streams":
