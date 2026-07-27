@@ -71,6 +71,9 @@ def _dispatch_fixture_contract(stem: str, state: str, fixture: dict) -> str:
     marker = FAMILY_MARKERS[stem]
     payload = fixture[marker]
     if state == "sparse":
+        if stem == "garmin_fit_structural_summary":
+            assert payload == {"message_counts": {}, "message_fields": {}}
+            return "empty"
         assert payload in ({}, [], None)
         return "empty"
     if state == "schema_drift":
