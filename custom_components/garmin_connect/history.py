@@ -63,6 +63,7 @@ from .history_source import (
     SnapshotData,
     SourceSeries,
 )
+from .sleep_archive import SleepSchemaError, SleepSession, session_record
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -76,6 +77,7 @@ _RECORDER_BARRIER_TIMEOUT = 10
 _HISTORY_MIN_DATE = date(2026, 1, 1)
 _HISTORY_MAX_DAYS = 31
 _PRESENCE_STATES = frozenset({"null", "empty", "missing", "unsupported", "returned-empty", "present", "absent"})
+_SLEEP_SCHEMA_VERSION = 1
 
 
 class HistoryArchiveState(StrEnum):
@@ -271,6 +273,8 @@ class GarminHistoryArchive:
         self._runtime_sync_failure = False
         self._recorder_adapter: Any | None = None
         self._hrv_summaries: dict[str, dict[str, Any]] = {}
+        self._sleep_sessions: dict[str, dict[str, dict[str, Any]]] = {}
+        self._sleep_partition_stores: dict[str, Any] = {}
         self._presence: dict[str, dict[str, str]] = {}
 
     @property
@@ -424,6 +428,7 @@ class GarminHistoryArchive:
         inserted = 0
         updated = 0
         presence = {key: dict(value) for key, value in self._presence.items()}
+        sleep_sessions = {year: dict(records) for year, records in self._sleep_sessions.items()}
         self._status = HistoryStatus(HistoryArchiveState.RUNNING)
         for offset in range((end_date - start_date).days + 1):
             target = start_date.fromordinal(start_date.toordinal() + offset)
@@ -555,11 +560,20 @@ class GarminHistoryArchive:
                     inserted += getattr(outcome, "inserted_count", outcome.accepted_count)
                     updated += getattr(outcome, "updated_count", 0)
                     skipped += getattr(outcome, "skipped_count", 0)
+                sleep_fetch = getattr(source, "async_fetch_details", None)
+                sleep_details = await sleep_fetch(target, "sleep_sessions") if callable(sleep_fetch) else ()
+                if not isinstance(sleep_details, tuple) or any(not isinstance(item, SleepSession) for item in sleep_details):
+                    raise SleepSchemaError("sleep session result has invalid shape")
+                for session in sleep_details:
+                    year = str(session.start.year)
+                    sleep_sessions.setdefault(year, {})[session.logical_id] = session_record(session)
                 processed.append(target)
                 completed_dates = self._completed_dates | {target_key}
-                await store.async_save({"schema_version": HISTORY_STORE_VERSION, "account_key": self._account_key(), "completed_dates": sorted(completed_dates), "hrv_summaries": self._hrv_summaries, "presence": presence})
+                await store.async_save({"schema_version": HISTORY_STORE_VERSION, "sleep_schema_version": _SLEEP_SCHEMA_VERSION, "account_key": self._account_key(), "completed_dates": sorted(completed_dates), "hrv_summaries": self._hrv_summaries, "presence": presence, "sleep_sessions": sleep_sessions})
+                await self._async_save_sleep_partitions(sleep_sessions)
                 self._completed_dates = completed_dates
                 self._presence = presence
+                self._sleep_sessions = sleep_sessions
             except asyncio.CancelledError:
                 self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated)
                 raise
@@ -570,6 +584,34 @@ class GarminHistoryArchive:
         self._runtime_sync_failure = False
         self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=end_date.isoformat(), processed_dates=len(processed), record_count=inserted + updated)
         return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome="written")
+
+    async def _async_save_sleep_partitions(
+        self, sessions_by_year: Mapping[str, Mapping[str, dict[str, Any]]]
+    ) -> None:
+        """Atomically checkpoint each annual sleep partition."""
+        store_factory = self._store_factory
+        if store_factory is None:
+            from homeassistant.helpers.storage import Store
+
+            store_factory = Store
+        for year, records in sessions_by_year.items():
+            if year not in self._sleep_partition_stores:
+                self._sleep_partition_stores[year] = store_factory(
+                    self._hass,
+                    HISTORY_STORE_VERSION,
+                    f"{DOMAIN}.{self._entry.entry_id}.sleep_{year}",
+                    private=True,
+                    atomic_writes=True,
+                )
+            await self._sleep_partition_stores[year].async_save(
+                {
+                    "schema_version": HISTORY_STORE_VERSION,
+                    "sleep_schema_version": _SLEEP_SCHEMA_VERSION,
+                    "account_key": self._account_key(),
+                    "year": year,
+                    "sessions": dict(records),
+                }
+            )
 
     def _account_key(self) -> str:
         """Return the persisted opaque account key."""
@@ -584,9 +626,19 @@ class GarminHistoryArchive:
         start_date: date,
         end_date: date,
     ) -> tuple[HistoryCalendarEvent, ...]:
-        """Return no Calendar records until the later Store slice exists."""
-        del calendar, start_date, end_date
-        return ()
+        """Return privacy-safe structured sleep and nap events."""
+        del calendar
+        if start_date > end_date:
+            return ()
+        events: dict[tuple[datetime, datetime, str], HistoryCalendarEvent] = {}
+        for records in self._sleep_sessions.values():
+            for record in records.values():
+                start = datetime.fromisoformat(record["start"])
+                end = datetime.fromisoformat(record["end"])
+                if start.date() <= end_date and end.date() >= start_date:
+                    summary = "Sleep" if record["kind"] == "main" else "Nap"
+                    events[(start, end, summary)] = HistoryCalendarEvent(start, end, summary)
+        return tuple(sorted(events.values(), key=lambda event: event.start))
 
     def _async_ensure_account_key(self) -> str:
         """Load or create the opaque identity persisted in the config entry."""
@@ -623,6 +675,7 @@ class GarminHistoryArchive:
                     "completed_dates": [],
                     "hrv_summaries": {},
                     "presence": {},
+                    "sleep_sessions": {},
                 }
             )
             return
@@ -665,6 +718,31 @@ class GarminHistoryArchive:
                 bounded[metric] = state
             parsed_presence[key] = bounded
         self._presence = parsed_presence
+        raw_sleep = catalog.get("sleep_sessions", {})
+        if catalog.get("sleep_schema_version", _SLEEP_SCHEMA_VERSION) != _SLEEP_SCHEMA_VERSION:
+            raise ValueError("Sleep catalog version is unsupported")
+        if not isinstance(raw_sleep, Mapping):
+            raise ValueError("Sleep catalog is invalid")
+        parsed_sleep: dict[str, dict[str, dict[str, Any]]] = {}
+        for year, records in raw_sleep.items():
+            if not isinstance(year, str) or len(year) != 4 or not year.isdecimal() or not isinstance(records, Mapping):
+                raise ValueError("Sleep catalog is invalid")
+            parsed_records: dict[str, dict[str, Any]] = {}
+            for logical_id, record in records.items():
+                if not isinstance(logical_id, str) or len(logical_id) > 64 or not isinstance(record, Mapping):
+                    raise ValueError("Sleep catalog is invalid")
+                if record.get("logical_id") != logical_id or record.get("kind") not in {"main", "nap"}:
+                    raise ValueError("Sleep catalog is invalid")
+                try:
+                    start = datetime.fromisoformat(record["start"])
+                    end = datetime.fromisoformat(record["end"])
+                except (KeyError, TypeError, ValueError) as err:
+                    raise ValueError("Sleep catalog is invalid") from err
+                if end <= start or len(parsed_records) >= 10000:
+                    raise ValueError("Sleep catalog is invalid")
+                parsed_records[logical_id] = dict(record)
+            parsed_sleep[year] = parsed_records
+        self._sleep_sessions = parsed_sleep
 
     def _set_failed(self, error_type: str) -> None:
         """Set a bounded startup failure without exposing exception details."""

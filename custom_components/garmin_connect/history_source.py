@@ -8,6 +8,7 @@ from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
 
 from .request_gate import GarminRequestGate, GarminRequestPriority
+from .sleep_archive import SleepSession, parse_sleep_sessions
 
 if TYPE_CHECKING:
     from ha_garmin import GarminClient
@@ -461,7 +462,7 @@ class GarminHistorySource:
         result = await self.async_fetch_details(target_date, metric)
         return result.readings if isinstance(result, (HRVData, SegmentedData, SourceSeries)) else () if isinstance(result, SnapshotData) else result
 
-    async def async_fetch_details(self, target_date: date, metric: str) -> tuple[NormalizedSample, ...] | HRVData | SegmentedData | SourceSeries | SnapshotData:
+    async def async_fetch_details(self, target_date: date, metric: str) -> tuple[NormalizedSample, ...] | HRVData | SegmentedData | SourceSeries | SnapshotData | tuple[SleepSession, ...]:
         """Fetch a metric and retain private details needed by the archive."""
 
         async def request() -> Any:
@@ -470,6 +471,8 @@ class GarminHistorySource:
                 return await self.client._get_user_summary_raw(target_date)
             if metric == "training_status":
                 return await self.client.get_training_status(target_date)
+            if metric == "sleep_sessions":
+                return await self.client._get_sleep_data_raw(target_date)
             if metric == "heart_rate":
                 profile = await self.client.get_user_profile()
                 return await self.client._request(
@@ -522,6 +525,8 @@ class GarminHistorySource:
             return normalize_snapshot(payload, target_date, DAILY_SUMMARY_FIELDS)
         if metric == "training_status":
             return normalize_snapshot(payload, target_date, TRAINING_STATUS_FIELDS)
+        if metric == "sleep_sessions":
+            return parse_sleep_sessions(payload, target_date)
         if not isinstance(payload, dict):
             return ()
         if metric == "heart_rate":

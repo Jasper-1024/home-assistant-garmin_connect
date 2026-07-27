@@ -1,0 +1,17 @@
+{
+  "_provenance": "Sanitized synthetic fixture derived from captured/probe Garmin sleep response structure; numeric arrays intentionally omitted and scalar values redacted.",
+  "sleepData": {
+    "calendarDate": "2026-02-28",
+    "sleepStartTimestampGMT": "2026-02-28T22:30:00Z",
+    "sleepEndTimestampGMT": "2026-03-01T06:30:00Z",
+    "sleepScores": {"overall": {"value": 82}, "quality": "synthetic"},
+    "adjustments": ["synthetic adjustment"],
+    "feedback": ["synthetic feedback"],
+    "restlessEvents": ["synthetic event"],
+    "sleepLevels": [["omitted numeric array"]],
+    "naps": [{
+      "startTime": "2026-02-28T13:00:00+01:00",
+      "endTime": "2026-02-28T13:30:00+01:00"
+    }]
+  }
+}
