@@ -30,12 +30,12 @@ from custom_components.garmin_connect.history_source import (
     TRAINING_STATUS_FIELDS,
     HRVData,
     HRVSummary,
-    NormalizedHealthEvent,
     NormalizedSample,
     SegmentedData,
     SnapshotData,
     SourceSeries,
     normalize_snapshot,
+    normalize_health_events,
 )
 from custom_components.garmin_connect.sleep_archive import (
     SleepSession,
@@ -544,7 +544,10 @@ async def test_restart_drops_missing_or_corrupt_sleep_partition_from_completed_i
 
 @pytest.mark.asyncio
 async def test_health_events_archive_before_checkpoint_and_calendar_restart():
-    event = NormalizedHealthEvent("a" * 24, "b" * 16, date(2026, 7, 24), "MOVE_IQ", "walking", "activity", datetime(2026, 7, 24, 10, tzinfo=UTC), datetime(2026, 7, 24, 10, 15, tzinfo=UTC), None)
+    event = normalize_health_events(
+        {"events": [{"source": "MOVE_IQ", "type": "walking", "category": "activity", "startTime": "2026-07-24T10:00:00Z", "endTime": "2026-07-24T10:15:00Z"}]},
+        date(2026, 7, 24),
+    )[0]
 
     class Source:
         async def async_fetch_details(self, target, metric):
