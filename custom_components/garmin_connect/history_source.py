@@ -90,6 +90,57 @@ class NormalizedHealthEvent:
     occurrence: datetime | None
 
 
+@dataclass(frozen=True, slots=True)
+class NormalizedActivity:
+    """Sanitized timed activity summary; route and FIT payloads excluded."""
+
+    logical_id: str
+    revision: str
+    activity_type: str
+    name: str | None
+    start: datetime
+    end: datetime | None
+    duration_seconds: float | None
+    training_effect: float | None
+    load: float | None
+    recovery: float | None
+    calendar_date: date
+
+
+def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedActivity, ...]:
+    if isinstance(payload, dict):
+        payload = next((payload[key] for key in ("activities", "activityList", "data") if isinstance(payload.get(key), list)), [payload])
+    if not isinstance(payload, list) or len(payload) > 256:
+        raise HistorySchemaError("activities have invalid type")
+    result: dict[str, NormalizedActivity] = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            raise HistorySchemaError("activity has invalid type")
+        activity_type = item.get("activityType", item.get("activityTypeKey"))
+        start_raw = item.get("startTimeLocal", item.get("startTimeGMT", item.get("startTime")))
+        if not isinstance(activity_type, str) or len(activity_type) > 64 or not isinstance(start_raw, (str, int, float)):
+            raise HistorySchemaError("activity identity has invalid type")
+        start = _timestamp(start_raw)
+        if start is None:
+            raise HistorySchemaError("activity timestamp is invalid")
+        end = _timestamp(item.get("endTimeGMT", item.get("endTime"))) if item.get("endTimeGMT", item.get("endTime")) is not None else None
+        def numeric(*names: str) -> float | None:
+            value = next((item[name] for name in names if name in item), None)
+            if value is None:
+                return None
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                raise HistorySchemaError("activity summary has invalid type")
+            return float(value)
+        stable = str(item.get("activityId", item.get("activityUUID", "")))
+        identity = stable if stable else f"{activity_type}:{start.isoformat()}:{end.isoformat() if end else None}"
+        logical_id = hashlib.sha256(identity.encode()).hexdigest()[:24]
+        preserved = {key: item[key] for key in ("activityName", "activityType", "startTimeLocal", "startTimeGMT", "endTimeGMT", "duration", "durationInSeconds", "trainingEffect", "aerobicTrainingEffect", "activityTrainingLoad", "recoveryTime") if key in item}
+        revision = hashlib.sha256(json.dumps(preserved, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()[:16]
+        duration = numeric("durationInSeconds", "duration")
+        result[logical_id] = NormalizedActivity(logical_id, revision, activity_type, item.get("activityName") if isinstance(item.get("activityName"), str) else None, start, end, duration, numeric("trainingEffect", "aerobicTrainingEffect"), numeric("activityTrainingLoad", "trainingLoad"), numeric("recoveryTime"), target_date)
+    return tuple(sorted(result.values(), key=lambda item: (item.start, item.logical_id)))
+
+
 def _health_identity_revision(event_type: str | None, source: str | None, category: str | None, start: datetime | None, end: datetime | None, occurrence: datetime | None) -> tuple[str, str]:
     identity = (event_type or "event", start.isoformat() if start else None, end.isoformat() if end else None, occurrence.isoformat() if occurrence else None)
     logical_id = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()[:24]
@@ -143,8 +194,8 @@ def health_event_from_record(record: Mapping[str, Any]) -> NormalizedHealthEvent
 
 
 HistorySeries = tuple[NormalizedSample, ...]
-HistoryResult = HistorySeries | tuple[SleepSession, ...] | tuple[NormalizedHealthEvent, ...]
-HistoryDetails = HistorySeries | HRVData | SegmentedData | SourceSeries | SnapshotData | tuple[SleepSession, ...] | tuple[NormalizedHealthEvent, ...]
+HistoryResult = HistorySeries | tuple[SleepSession, ...] | tuple[NormalizedHealthEvent, ...] | tuple[NormalizedActivity, ...]
+HistoryDetails = HistorySeries | HRVData | SegmentedData | SourceSeries | SnapshotData | tuple[SleepSession, ...] | tuple[NormalizedHealthEvent, ...] | tuple[NormalizedActivity, ...]
 
 
 def normalize_health_events(payload: Any, target_date: date) -> tuple[NormalizedHealthEvent, ...]:
@@ -599,6 +650,8 @@ class GarminHistorySource:
                 return await self.client.get_training_status(target_date)
             if metric == "sleep_sessions":
                 return await self.client._get_sleep_data_raw(target_date)
+            if metric == "timed_activities":
+                return await self.client.get_activities(target_date, 100)
             if metric == "health_events_daily":
                 return await self.client._request("GET", f"{base}/wellness-service/wellness/dailyEvents", params={"calendarDate": target_date.isoformat()})
             if metric == "health_events_body_battery":
@@ -657,6 +710,8 @@ class GarminHistorySource:
             return normalize_snapshot(payload, target_date, TRAINING_STATUS_FIELDS)
         if metric == "sleep_sessions":
             return parse_sleep_sessions(payload, target_date)
+        if metric == "timed_activities":
+            return normalize_activities(payload, target_date)
         if metric in {"health_events_daily", "health_events_body_battery"}:
             return normalize_health_events(payload, target_date)
         if not isinstance(payload, dict):

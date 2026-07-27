@@ -66,12 +66,14 @@ from .history_source import (
     HRVData,
     HRVSummary,
     NormalizedHealthEvent,
+    NormalizedActivity,
     NormalizedSample,
     SegmentedData,
     SnapshotData,
     SourceSeries,
     health_event_from_record,
     health_event_record,
+    normalize_activities,
 )
 from .sleep_archive import SleepSchemaError, SleepSession, session_from_record, session_record
 
@@ -294,6 +296,7 @@ class GarminHistoryArchive:
         self._hrv_summaries: dict[str, dict[str, Any]] = {}
         self._sleep_sessions: dict[str, dict[str, dict[str, Any]]] = {}
         self._health_events: dict[str, dict[str, dict[str, Any]]] = {}
+        self._activities: dict[str, dict[str, dict[str, Any]]] = {}
         self._sleep_partition_stores: dict[str, Any] = {}
         self._presence: dict[str, dict[str, str]] = {}
 
@@ -625,19 +628,32 @@ class GarminHistoryArchive:
                         raise ValueError("health event result has invalid shape")
                     health_events.extend(event_details)
                 events_by_year = {year: dict(records) for year, records in self._health_events.items()}
+                activities_by_year = {year: dict(records) for year, records in self._activities.items()}
                 for event in health_events:
                     year = str((event.start or event.occurrence or datetime.combine(event.calendar_date, time.min, tzinfo=UTC)).year)
                     events_by_year.setdefault(year, {})[event.logical_id] = health_event_record(event)
+                activity_details = await sleep_fetch(target, "timed_activities") if callable(sleep_descriptor) and callable(sleep_fetch) else ()
+                if not isinstance(activity_details, tuple) or any(not isinstance(item, NormalizedActivity) for item in activity_details):
+                    raise ValueError("activity result has invalid shape")
+                for activity in activity_details:
+                    year = str(activity.start.year)
+                    activities_by_year.setdefault(year, {})[activity.logical_id] = {
+                        "logical_id": activity.logical_id, "revision": activity.revision, "calendar_date": activity.calendar_date.isoformat(),
+                        "activity_type": activity.activity_type, "name": activity.name, "start": activity.start.isoformat(),
+                        "end": activity.end.isoformat() if activity.end else None, "duration_seconds": activity.duration_seconds,
+                        "training_effect": activity.training_effect, "load": activity.load, "recovery": activity.recovery,
+                    }
                 processed.append(target)
                 completed_dates = self._completed_dates | {target_key}
-                await self._async_save_sleep_partitions(sleep_sessions, events_by_year)
+                await self._async_save_sleep_partitions(sleep_sessions, events_by_year, activities_by_year)
                 # Publish the catalog checkpoint only after every affected annual
                 # partition is durable. A failed partition save must be replayed.
-                await store.async_save({"schema_version": HISTORY_STORE_VERSION, "sleep_schema_version": _SLEEP_SCHEMA_VERSION, "account_key": self._account_key(), "completed_dates": sorted(completed_dates), "hrv_summaries": self._hrv_summaries, "presence": presence, "sleep_index": {year: sorted(records) for year, records in sleep_sessions.items()}, "event_index": {year: sorted(records) for year, records in events_by_year.items()}})
+                await store.async_save({"schema_version": HISTORY_STORE_VERSION, "sleep_schema_version": _SLEEP_SCHEMA_VERSION, "account_key": self._account_key(), "completed_dates": sorted(completed_dates), "hrv_summaries": self._hrv_summaries, "presence": presence, "sleep_index": {year: sorted(records) for year, records in sleep_sessions.items()}, "event_index": {year: sorted(records) for year, records in events_by_year.items()}, "activity_index": {year: sorted(records) for year, records in activities_by_year.items()}})
                 self._completed_dates = completed_dates
                 self._presence = presence
                 self._sleep_sessions = sleep_sessions
                 self._health_events = events_by_year
+                self._activities = activities_by_year
             except asyncio.CancelledError:
                 self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated)
                 raise
@@ -652,6 +668,7 @@ class GarminHistoryArchive:
     async def _async_save_sleep_partitions(
         self, sessions_by_year: Mapping[str, Mapping[str, dict[str, Any]]],
         events_by_year: Mapping[str, Mapping[str, dict[str, Any]]] | None = None,
+        activities_by_year: Mapping[str, Mapping[str, dict[str, Any]]] | None = None,
     ) -> None:
         """Atomically checkpoint each annual sleep partition."""
         store_factory = self._store_factory
@@ -659,7 +676,7 @@ class GarminHistoryArchive:
             from homeassistant.helpers.storage import Store
 
             store_factory = Store
-        for year in set(sessions_by_year) | set(events_by_year or {}):
+        for year in set(sessions_by_year) | set(events_by_year or {}) | set(activities_by_year or {}):
             records = sessions_by_year.get(year, {})
             if year not in self._sleep_partition_stores:
                 self._sleep_partition_stores[year] = store_factory(
@@ -677,6 +694,7 @@ class GarminHistoryArchive:
                     "year": year,
                     "sessions": dict(records),
                     "events": dict((events_by_year or {}).get(year, {})),
+                    "activities": dict((activities_by_year or {}).get(year, {})),
                 }
             )
 
@@ -694,7 +712,7 @@ class GarminHistoryArchive:
         end_date: date,
     ) -> tuple[HistoryCalendarEvent, ...]:
         """Return privacy-safe structured sleep and nap events."""
-        if calendar not in {"sleep", "health"}:
+        if calendar not in {"sleep", "health", "activity"}:
             return ()
         if start_date > end_date:
             return ()
@@ -702,6 +720,15 @@ class GarminHistoryArchive:
             {str(year) for year in range(start_date.year - 1, end_date.year + 2)}
         )
         events: dict[tuple[datetime, datetime, str], HistoryCalendarEvent] = {}
+        if calendar == "activity":
+            for records in self._activities.values():
+                for record in records.values():
+                    start = datetime.fromisoformat(record["start"])
+                    end = datetime.fromisoformat(record["end"]) if record.get("end") else None
+                    if end is not None and start.date() <= end_date and end.date() >= start_date:
+                        summary = str(record.get("name") or record.get("activity_type") or "Activity")[:64]
+                        events[(start, end, summary)] = HistoryCalendarEvent(start, end, summary)
+            return tuple(sorted(events.values(), key=lambda event: event.start))
         if calendar == "health":
             for records in self._health_events.values():
                 for record in records.values():
@@ -730,6 +757,7 @@ class GarminHistoryArchive:
         for year in years:
             self._sleep_sessions.pop(year, None)
             self._health_events.pop(year, None)
+            self._activities.pop(year, None)
             if year not in self._sleep_partition_stores:
                 self._sleep_partition_stores[year] = store_factory(
                     self._hass,
@@ -772,9 +800,14 @@ class GarminHistoryArchive:
                         raise SleepSchemaError("health event partition is invalid")
                     parsed_events[logical_id] = health_event_record(restored_event)
                 self._health_events[year] = parsed_events
+                raw_activities = partition.get("activities", {})
+                if not isinstance(raw_activities, Mapping):
+                    raise SleepSchemaError("activity partition is invalid")
+                self._activities[year] = {str(key): dict(value) for key, value in raw_activities.items() if isinstance(key, str) and isinstance(value, Mapping)}
             except (KeyError, TypeError, ValueError, OSError):
                 self._sleep_sessions.pop(year, None)
                 self._health_events.pop(year, None)
+                self._activities.pop(year, None)
                 self._completed_dates = {value for value in self._completed_dates if value[:4] != year}
 
     def _async_ensure_account_key(self) -> str:
@@ -814,6 +847,7 @@ class GarminHistoryArchive:
                     "presence": {},
                     "sleep_index": {},
                     "event_index": {},
+                    "activity_index": {},
                 }
             )
             return
@@ -858,6 +892,7 @@ class GarminHistoryArchive:
         self._presence = parsed_presence
         raw_sleep = catalog.get("sleep_index", catalog.get("sleep_sessions", {}))
         raw_events = catalog.get("event_index", {})
+        raw_activities = catalog.get("activity_index", {})
         if catalog.get("sleep_schema_version", _SLEEP_SCHEMA_VERSION) != _SLEEP_SCHEMA_VERSION:
             raise ValueError("Sleep catalog version is unsupported")
         if not isinstance(raw_sleep, Mapping):
@@ -880,6 +915,12 @@ class GarminHistoryArchive:
         for year, records in raw_events.items():
             if not isinstance(year, str) or len(year) != 4 or not year.isdecimal() or not isinstance(records, list) or len(records) > 10000:
                 raise ValueError("Health event catalog is invalid")
+            sleep_years.add(year)
+        if not isinstance(raw_activities, Mapping):
+            raise ValueError("Activity catalog is invalid")
+        for year, records in raw_activities.items():
+            if not isinstance(year, str) or len(year) != 4 or not year.isdecimal() or not isinstance(records, list) or len(records) > 10000:
+                raise ValueError("Activity catalog is invalid")
             sleep_years.add(year)
         self._sleep_sessions = {}
         await self._async_load_sleep_partitions(sleep_years)

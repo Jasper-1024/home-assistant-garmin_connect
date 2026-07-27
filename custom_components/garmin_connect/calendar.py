@@ -21,6 +21,7 @@ async def async_setup_entry(
         async_add_entities([
             GarminSleepCalendar(archive, entry.entry_id),
             GarminHealthEventsCalendar(archive, entry.entry_id),
+            GarminActivityCalendar(archive, entry.entry_id),
         ])
 
 
@@ -67,4 +68,18 @@ class GarminHealthEventsCalendar(GarminSleepCalendar):
 
     async def async_get_events(self, hass: HomeAssistant, start_date: datetime, end_date: datetime) -> list[CalendarEvent]:
         events = await self._archive.async_get_calendar_events("health", start_date.date(), end_date.date())
+        return [CalendarEvent(summary=event.summary, start=event.start, end=event.end) for event in events]
+
+
+class GarminActivityCalendar(GarminSleepCalendar):
+    """Expose timed activity summaries without routes or raw streams."""
+
+    _attr_name = "Activities"
+
+    def __init__(self, archive: GarminHistoryArchive, entry_id: str) -> None:
+        super().__init__(archive, entry_id)
+        self._attr_unique_id = f"{entry_id}_activity_calendar"
+
+    async def async_get_events(self, hass: HomeAssistant, start_date: datetime, end_date: datetime) -> list[CalendarEvent]:
+        events = await self._archive.async_get_calendar_events("activity", start_date.date(), end_date.date())
         return [CalendarEvent(summary=event.summary, start=event.start, end=event.end) for event in events]

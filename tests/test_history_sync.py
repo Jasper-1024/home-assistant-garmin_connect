@@ -36,6 +36,7 @@ from custom_components.garmin_connect.history_source import (
     SourceSeries,
     normalize_health_events,
     normalize_snapshot,
+    normalize_activities,
 )
 from custom_components.garmin_connect.sleep_archive import (
     SleepSession,
@@ -608,6 +609,25 @@ async def test_runtime_missing_event_partition_invalidates_and_refetches():
     assert "2026-07-24" not in archive._completed_dates
     await archive.async_sync_range(date(2026, 7, 24), date(2026, 7, 24))
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_timed_activity_archive_and_calendar_excludes_open_interval():
+    activity = normalize_activities([{"activityId": 123, "activityType": "running", "activityName": "Morning Run", "startTime": "2026-07-24T23:30:00+02:00", "endTime": "2026-07-25T00:30:00+02:00", "durationInSeconds": 3600}], date(2026, 7, 24))[0]
+
+    class Source:
+        async def async_fetch_details(self, target, metric):
+            return (activity,) if metric == "timed_activities" else ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    catalog = _NamedStore()
+    stores = {"garmin_connect.e.history_catalog": catalog}
+    archive = _partition_archive(Source(), recorder, stores)
+    await archive.async_start()
+    await archive.async_sync_range(date(2026, 7, 24), date(2026, 7, 24))
+    events = await archive.async_get_calendar_events("activity", date(2026, 7, 24), date(2026, 7, 25))
+    assert len(events) == 1 and events[0].summary == "Morning Run"
 
 
 @pytest.mark.asyncio
