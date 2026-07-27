@@ -221,7 +221,7 @@ def _normalize_source_series(payload: Any, target_date: date, array_aliases: tup
     if values == []:
         return SourceSeries((), "empty")
     if not isinstance(values, list):
-        return SourceSeries((), "unsupported")
+        raise HistorySchemaError(f"{array_key} is not an array")
     descriptor_found = _nested_value(payload, descriptor_aliases)
     series_payload = {array_key: values}
     if descriptor_found is not None:

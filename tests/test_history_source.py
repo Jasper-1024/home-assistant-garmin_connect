@@ -226,3 +226,21 @@ def test_respiration_and_spo2_fixture_variants_preserve_revisions_and_sparse_ser
     assert normalize_respiration({}, date(2026, 7, 24)).presence == "missing"
     assert normalize_respiration([], date(2026, 7, 24)).presence == "unsupported"
     assert normalize_respiration({"status": "returned-empty"}, date(2026, 7, 24)).presence == "returned-empty"
+
+
+@pytest.mark.parametrize(
+    ("normalizer", "payload"),
+    [
+        (normalize_respiration, {"respirationValuesArray": {"drift": True}}),
+        (normalize_spo2, {"spO2SingleValues": "drift"}),
+    ],
+)
+def test_recognized_respiration_and_spo2_array_type_drift_raises(
+    normalizer, payload
+) -> None:
+    """A known series changing its array type is a schema failure."""
+    with pytest.raises(HistorySchemaError):
+        if normalizer is normalize_spo2:
+            normalizer(payload, date(2026, 7, 24), "single")
+        else:
+            normalizer(payload, date(2026, 7, 24))
