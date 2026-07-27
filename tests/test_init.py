@@ -1,7 +1,10 @@
 """Tests for Garmin Connect integration setup and migration."""
 
+import asyncio
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from custom_components.garmin_connect import (
     _migrate_entity_unique_ids,
@@ -15,7 +18,10 @@ from custom_components.garmin_connect.const import (
     CONF_TOKEN,
 )
 from custom_components.garmin_connect.history import GarminHistoryArchive
-from custom_components.garmin_connect.request_gate import GarminRequestGate
+from custom_components.garmin_connect.request_gate import (
+    GarminRequestGate,
+    GarminRequestPriority,
+)
 
 from .conftest import ENTRY_DATA
 
@@ -321,6 +327,47 @@ async def test_unload_entry_stops_history_archive() -> None:
     assert result is True
     request_gate.async_close.assert_awaited_once()
     archive.async_stop.assert_awaited_once()
+
+
+async def test_unload_entry_cancels_active_current_refresh() -> None:
+    """Unloading an entry cannot strand an in-flight current refresh."""
+    from custom_components.garmin_connect.coordinator import GarminConnectCoordinators
+
+    gate = GarminRequestGate()
+    request_started = asyncio.Event()
+
+    async def requester() -> None:
+        request_started.set()
+        await asyncio.Event().wait()
+
+    active_task = asyncio.create_task(
+        gate.async_request(GarminRequestPriority.FOREGROUND, requester)
+    )
+    await request_started.wait()
+
+    entry = MagicMock()
+    coord = _coord_mock()
+    entry.runtime_data = GarminConnectCoordinators(
+        core=coord,
+        activity=coord,
+        training=coord,
+        body=coord,
+        goals=coord,
+        gear=coord,
+        blood_pressure=coord,
+        menstrual=coord,
+        nutrition=coord,
+        request_gate=gate,
+    )
+    hass = MagicMock()
+    hass.config_entries.async_entries = MagicMock(return_value=[entry])
+    hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
+
+    with patch("custom_components.garmin_connect.async_unload_services", new=AsyncMock()):
+        assert await async_unload_entry(hass, entry) is True
+
+    with pytest.raises(asyncio.CancelledError):
+        await active_task
 
 
 # ── Migration tests ───────────────────────────────────────────────────────────
