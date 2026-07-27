@@ -1,6 +1,8 @@
 """Tests for structured Garmin sleep sessions."""
 
+import json
 from datetime import date
+from pathlib import Path
 
 import pytest
 
@@ -153,6 +155,23 @@ def test_sleep_parser_preserves_sanitized_high_resolution_streams() -> None:
     assert any(point.value is None for point in session.streams[0].points)
     assert session_record(session)["streams"]["heart_rate"]
     assert session_from_record(session_record(session)) == session
+
+
+def test_sanitized_stream_fixture_has_representative_batch_sizes() -> None:
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "garmin_sleep_streams.json").read_text()
+    )
+    session = parse_sleep_sessions(fixture, date(2026, 7, 24))[0]
+
+    assert {stream.metric: len(stream.points) for stream in session.streams} == {
+        "heart_rate": 32,
+        "hrv": 32,
+        "body_battery": 32,
+        "stress": 32,
+        "respiration": 32,
+        "spo2": 32,
+        "movement": 32,
+    }
 
 
 def test_sleep_stream_object_rows_use_stream_specific_values() -> None:
