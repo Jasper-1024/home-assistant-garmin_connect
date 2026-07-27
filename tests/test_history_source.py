@@ -12,6 +12,8 @@ from custom_components.garmin_connect.history_source import (
     normalize_floors,
     normalize_intensity,
     normalize_pair_series,
+    normalize_respiration,
+    normalize_spo2,
     normalize_steps,
     parse_hrv_data,
 )
@@ -202,3 +204,17 @@ def test_sanitized_captured_chart_fixture_preserves_nested_shapes() -> None:
     assert floors.totals == {"floorsAscended": 10.0, "floorsDescended": 4.0}
     assert intensity.totals == vigorous.totals
     assert [sample.value for sample in vigorous.readings] == [0.0, 1.0, 0.0, 2.0]
+
+
+def test_respiration_and_spo2_fixture_variants_preserve_revisions_and_sparse_series() -> None:
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "garmin_respiration_spo2.json").read_text())
+    respiration = normalize_respiration(fixture["respiration"], date(2026, 7, 24))
+    average = normalize_respiration(fixture["respiration"], date(2026, 7, 24), True)
+    single = normalize_spo2(fixture["spo2"], date(2026, 7, 24), "single")
+    continuous = normalize_spo2(fixture["spo2"], date(2026, 7, 24), "continuous")
+    hourly = normalize_spo2(fixture["spo2"], date(2026, 7, 24), "hourly")
+    assert len(respiration.readings) == 2
+    assert average.readings[0].value == 12.5
+    assert single.readings[0].value == 98
+    assert continuous.readings[0].value == 96
+    assert hourly.readings[0].value == 95

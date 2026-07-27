@@ -45,6 +45,11 @@ MODERATE_INTENSITY_METADATA = HistoryMetricMetadata("intensity_moderate", "Moder
 VIGOROUS_INTENSITY_METADATA = HistoryMetricMetadata("intensity_vigorous", "Vigorous intensity minutes", "min")
 MODERATE_INTENSITY_DAILY_METADATA = HistoryMetricMetadata("intensity_moderate_daily_total", "Moderate intensity minutes daily total", "min")
 VIGOROUS_INTENSITY_DAILY_METADATA = HistoryMetricMetadata("intensity_vigorous_daily_total", "Vigorous intensity minutes daily total", "min")
+RESPIRATION_RAW_METADATA = HistoryMetricMetadata("respiration_raw", "Respiration", "breaths/min")
+RESPIRATION_AVERAGE_METADATA = HistoryMetricMetadata("respiration_average", "Respiration average", "breaths/min")
+SPO2_SINGLE_METADATA = HistoryMetricMetadata("spo2_single", "SpO2 single", "%")
+SPO2_CONTINUOUS_METADATA = HistoryMetricMetadata("spo2_continuous", "SpO2 continuous", "%")
+SPO2_HOURLY_METADATA = HistoryMetricMetadata("spo2_hourly", "SpO2 hourly average", "%")
 
 
 @dataclass(frozen=True, slots=True)

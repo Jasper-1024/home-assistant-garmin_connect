@@ -32,6 +32,11 @@ from .history_recorder import (
     MODERATE_INTENSITY_DAILY_METADATA,
     MODERATE_INTENSITY_METADATA,
     NIGHTLY_HRV_METADATA,
+    RESPIRATION_AVERAGE_METADATA,
+    RESPIRATION_RAW_METADATA,
+    SPO2_CONTINUOUS_METADATA,
+    SPO2_HOURLY_METADATA,
+    SPO2_SINGLE_METADATA,
     STEPS_DAILY_TOTAL_METADATA,
     STEPS_METADATA,
     STRESS_METADATA,
@@ -47,6 +52,7 @@ from .history_source import (
     HRVSummary,
     NormalizedSample,
     SegmentedData,
+    SourceSeries,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -416,6 +422,11 @@ class GarminHistoryArchive:
                     ("floors", FLOORS_METADATA),
                     ("intensity_moderate", MODERATE_INTENSITY_METADATA),
                     ("intensity_vigorous", VIGOROUS_INTENSITY_METADATA),
+                    ("respiration_raw", RESPIRATION_RAW_METADATA),
+                    ("respiration_average", RESPIRATION_AVERAGE_METADATA),
+                    ("spo2_single", SPO2_SINGLE_METADATA),
+                    ("spo2_continuous", SPO2_CONTINUOUS_METADATA),
+                    ("spo2_hourly", SPO2_HOURLY_METADATA),
                 ):
                     try:
                         details_descriptor = inspect.getattr_static(source, "async_fetch_details")
@@ -428,11 +439,11 @@ class GarminHistoryArchive:
                             details = bound_details(target, metric)
                         elif callable(bound_details):
                             candidate = bound_details(target, metric)
-                            if inspect.isawaitable(candidate) or isinstance(candidate, (HRVData, SegmentedData, tuple)):
+                            if inspect.isawaitable(candidate) or isinstance(candidate, (HRVData, SegmentedData, SourceSeries, tuple)):
                                 details = candidate
                     if inspect.isawaitable(details):
                         details = await details
-                    if not isinstance(details, (HRVData, SegmentedData, tuple)):
+                    if not isinstance(details, (HRVData, SegmentedData, SourceSeries, tuple)):
                         details = await source.async_fetch(target, metric)
                     if isinstance(details, HRVData):
                         samples = details.readings
@@ -445,6 +456,8 @@ class GarminHistoryArchive:
                                 "baseline": details.summary.baseline,
                             }
                     elif isinstance(details, SegmentedData):
+                        samples = details.readings
+                    elif isinstance(details, SourceSeries):
                         samples = details.readings
                     else:
                         samples = details

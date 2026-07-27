@@ -1,0 +1,15 @@
+{
+  "_provenance": "Sanitized synthetic fixture preserving probe/captured nesting; values redacted and non-medical test values.",
+  "respiration": {
+    "respirationValuesArray": [["2026-07-24T23:50:00Z", 14], ["2026-07-24T01:00:00+02:00", 12], ["2026-07-24T01:00:00+02:00", 13]],
+    "respirationAveragesValuesArray": [["2026-07-24T01:00:00Z", 12.5]],
+    "respirationValueDescriptorsDTOList": [{"key": "timestamp", "index": 0}, {"key": "respiration", "index": 1}],
+    "optionalGoal": null
+  },
+  "spo2": {
+    "spO2SingleValues": [["2026-07-24T01:10:00Z", 97], ["2026-07-24T01:10:00Z", 98]],
+    "continuousReadingDTOList": [{"readingTimeGMT": "2026-07-24T01:15:00Z", "spO2": 96, "quality": null}],
+    "spO2HourlyAverages": [{"time": "2026-07-24T01:00:00Z", "average": 95}],
+    "spO2ValueDescriptors": [{"key": "timestamp", "index": 0}, {"key": "spO2", "index": 1}]
+  }
+}

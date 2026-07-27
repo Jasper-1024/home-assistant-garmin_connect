@@ -53,6 +53,14 @@ class SegmentedData:
     totals: dict[str, float] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class SourceSeries:
+    """One source array and its bounded availability state."""
+
+    readings: tuple[NormalizedSample, ...]
+    presence: str
+
+
 def _timestamp(value: Any) -> datetime | None:
     if isinstance(value, bool):
         return None
@@ -167,7 +175,7 @@ def _object_series(payload: Any, target_date: date, value_keys: tuple[str, ...],
             continue
         if not isinstance(point, dict):
             raise HistorySchemaError("segmented point is not an object")
-        raw_time = next((point[key] for key in ("timestamp", "time", "startTime", "start") if key in point), None)
+        raw_time = next((point[key] for key in ("timestamp", "time", "startTime", "start", "readingTime", "readingTimeGMT") if key in point), None)
         raw_value = next((point[key] for key in value_keys if key in point), None)
         if raw_time is None or raw_value is None:
             continue
@@ -180,6 +188,60 @@ def _object_series(payload: Any, target_date: date, value_keys: tuple[str, ...],
             raise HistorySchemaError("segmented timestamp has an invalid value")
         result[parsed] = NormalizedSample(parsed, target_date, raw_time, float(raw_value))
     return tuple(result[key] for key in sorted(result))
+
+
+def _nested_value(payload: Any, aliases: tuple[str, ...], depth: int = 0) -> tuple[Any, str] | None:
+    if depth > 3 or not isinstance(payload, dict):
+        return None
+    for alias in aliases:
+        if alias in payload:
+            return payload[alias], alias
+    for container in ("data", "report", "summary", "result"):
+        if container in payload:
+            found = _nested_value(payload[container], aliases, depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
+def _normalize_source_series(payload: Any, target_date: date, array_aliases: tuple[str, ...], value_keys: tuple[str, ...], descriptor_aliases: tuple[str, ...]) -> SourceSeries:
+    if payload is None:
+        return SourceSeries((), "missing")
+    found = _nested_value(payload, array_aliases)
+    if found is None:
+        return SourceSeries((), "unsupported")
+    values, array_key = found
+    if values is None:
+        return SourceSeries((), "returned-empty")
+    if values == []:
+        return SourceSeries((), "returned-empty")
+    if not isinstance(values, list):
+        raise HistorySchemaError(f"{array_key} is not an array")
+    descriptor_found = _nested_value(payload, descriptor_aliases)
+    series_payload = {array_key: values}
+    if descriptor_found is not None:
+        series_payload[descriptor_found[1]] = descriptor_found[0]
+    if values and all(isinstance(item, dict) for item in values):
+        readings = _object_series(series_payload, target_date, value_keys, (array_key,))
+    else:
+        readings = normalize_pair_series(series_payload, values_key=array_key, descriptor_keys=descriptor_aliases, value_keys=value_keys, request_date=target_date)
+    return SourceSeries(readings, "present")
+
+
+def normalize_respiration(payload: Any, target_date: date, averages: bool = False) -> SourceSeries:
+    aliases = ("respirationAveragesValuesArray",) if averages else ("respirationValuesArray",)
+    return _normalize_source_series(payload, target_date, aliases, ("respiration", "respirationValue", "value"), ("respirationValueDescriptors", "respirationValueDescriptorsDTOList"))
+
+
+def normalize_spo2(payload: Any, target_date: date, variant: str) -> SourceSeries:
+    configs = {
+        "single": (("spO2SingleValues", "spo2SingleValues", "singleValues"), ("spO2", "spo2", "value")),
+        "continuous": (("continuousReadingDTOList", "spO2ContinuousValues", "spo2ContinuousValues", "continuousValues"), ("spO2", "spo2", "reading", "value")),
+        "hourly": (("spO2HourlyAverages", "spo2HourlyAverages", "hourlyAverages"), ("spO2", "spo2", "average", "value")),
+    }
+    if variant not in configs:
+        raise ValueError("unsupported SpO2 variant")
+    return _normalize_source_series(payload, target_date, *configs[variant], ("spO2ValueDescriptors", "spO2ValueDescriptorsDTOList"))
 
 
 def _totals(payload: Any, keys: tuple[str, ...]) -> dict[str, float] | None:
@@ -345,9 +407,9 @@ class GarminHistorySource:
     async def async_fetch(self, target_date: date, metric: str) -> tuple[NormalizedSample, ...]:
         """Fetch one metric, retaining the historical tuple return contract."""
         result = await self.async_fetch_details(target_date, metric)
-        return result.readings if isinstance(result, (HRVData, SegmentedData)) else result
+        return result.readings if isinstance(result, (HRVData, SegmentedData, SourceSeries)) else result
 
-    async def async_fetch_details(self, target_date: date, metric: str) -> tuple[NormalizedSample, ...] | HRVData | SegmentedData:
+    async def async_fetch_details(self, target_date: date, metric: str) -> tuple[NormalizedSample, ...] | HRVData | SegmentedData | SourceSeries:
         """Fetch a metric and retain private details needed by the archive."""
 
         async def request() -> Any:
@@ -376,6 +438,10 @@ class GarminHistorySource:
                 return await self.client._request("GET", f"{base}/wellness-service/wellness/floorsChartData/daily/{target_date.isoformat()}")
             if metric in {"intensity_moderate", "intensity_vigorous"}:
                 return await self.client._request("GET", f"{base}/wellness-service/wellness/daily/im/{target_date.isoformat()}")
+            if metric in {"respiration_raw", "respiration_average"}:
+                return await self.client._request("GET", f"{base}/wellness-service/wellness/daily/respiration/{target_date.isoformat()}")
+            if metric.startswith("spo2_"):
+                return await self.client._request("GET", f"{base}/wellness-service/wellness/daily/spo2/{target_date.isoformat()}")
             raise ValueError(f"unsupported history metric: {metric}")
 
         payload = await self.request_gate.async_request(GarminRequestPriority.BACKGROUND, request)
@@ -389,6 +455,12 @@ class GarminHistorySource:
             return normalize_floors(payload, target_date)
         if metric in {"intensity_moderate", "intensity_vigorous"}:
             return normalize_intensity(payload, target_date, metric.removeprefix("intensity_"))
+        if metric == "respiration_raw":
+            return normalize_respiration(payload, target_date)
+        if metric == "respiration_average":
+            return normalize_respiration(payload, target_date, True)
+        if metric.startswith("spo2_"):
+            return normalize_spo2(payload, target_date, metric.removeprefix("spo2_"))
         if not isinstance(payload, dict):
             return ()
         if metric == "heart_rate":
