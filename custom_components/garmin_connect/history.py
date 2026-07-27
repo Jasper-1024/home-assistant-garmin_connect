@@ -7,7 +7,7 @@ import inspect
 import logging
 import secrets
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
 from enum import StrEnum
 from pathlib import Path
@@ -16,7 +16,7 @@ from typing import Any, Protocol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .backfill import BackfillScheduler, classify_backfill_error
+from .backfill import BackfillScheduler, BackfillState, classify_backfill_error, next_backfill_date
 from .const import (
     CONF_HISTORY_ACCOUNT_KEY,
     DOMAIN,
@@ -129,6 +129,12 @@ class HistoryStatus:
     processed_dates: int = 0
     record_count: int = 0
     error_type: str | None = None
+    queued_count: int = 0
+    completed_count: int = 0
+    next_eligible_run: str | None = None
+    last_success: str | None = None
+    backoff_until: str | None = None
+    safe_error_class: str | None = None
 
     def as_attributes(self) -> dict[str, Any]:
         """Return the bounded status attributes exposed by the sensor."""
@@ -139,6 +145,12 @@ class HistoryStatus:
             "processed_dates": self.processed_dates,
             "record_count": self.record_count,
             "error_type": self.error_type,
+            "queued_count": self.queued_count,
+            "completed_count": self.completed_count,
+            "next_eligible_run": self.next_eligible_run,
+            "last_success": self.last_success,
+            "backoff_until": self.backoff_until,
+            "safe_error_class": self.safe_error_class,
         }
 
 
@@ -413,6 +425,7 @@ class GarminHistoryArchive:
             load_state=self._async_load_backfill_state,
             save_state=self._async_save_backfill_state,
             sync_date=lambda target: self.async_sync_range(target, target),
+            reauth=self._async_backfill_reauth,
         )
         self._backfill_task = asyncio.create_task(self._backfill.async_run())
 
@@ -441,12 +454,23 @@ class GarminHistoryArchive:
     async def _async_save_backfill_state(self, state: Mapping[str, Any]) -> None:
         if self._store is None:
             return
-        catalog = await self._store.async_load()
-        if not isinstance(catalog, Mapping):
-            return
-        updated = dict(catalog)
-        updated["backfill"] = dict(state)
-        await self._store.async_save(updated)
+        async with self._sync_lock:
+            catalog = await self._store.async_load()
+            if not isinstance(catalog, Mapping):
+                return
+            updated = dict(catalog)
+            updated["backfill"] = dict(state)
+            await self._store.async_save(updated)
+        parsed = BackfillState.from_record(state)
+        queued = 0 if next_backfill_date(parsed, date.today()) is None else 1
+        self._status = replace(self._status, queued_count=queued, completed_count=len(parsed.completed_dates), next_eligible_run=parsed.next_run.isoformat() if parsed.next_run else None, last_success=parsed.last_success.isoformat() if parsed.last_success else None, backoff_until=parsed.backoff_until.isoformat() if parsed.backoff_until else None, safe_error_class=parsed.error_type)
+
+    async def _async_backfill_reauth(self) -> None:
+        callback = getattr(self._entry, "async_start_reauth", None)
+        if callable(callback):
+            result = callback(self._hass)
+            if inspect.isawaitable(result):
+                await result
 
     async def async_sync_range(self, start_date: date, end_date: date) -> HistorySyncReport:
         """Fetch and import the supported intraday metrics for an inclusive range."""

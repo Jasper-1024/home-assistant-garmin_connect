@@ -2,9 +2,12 @@
 
 from datetime import UTC, date, datetime
 
+import pytest
+
 from custom_components.garmin_connect.backfill import (
     BACKFILL_START,
     BACKOFF_429,
+    BackfillScheduler,
     BackfillState,
     classify_backfill_error,
     next_backfill_date,
@@ -35,3 +38,33 @@ def test_backfill_error_classes_are_bounded() -> None:
     assert classify_backfill_error(ResponseError()) == "rate_limited"
     assert classify_backfill_error(ForbiddenError()) == "forbidden_path"
     assert classify_backfill_error(OSError()) == "network"
+
+
+@pytest.mark.asyncio
+async def test_401_reauth_once_and_403_disable_path() -> None:
+    now = datetime(2026, 2, 1, tzinfo=UTC)
+    reauth_calls: list[int] = []
+    attempts: list[int] = []
+
+    class UnauthorizedError(Exception):
+        status_code = 401
+
+    async def sync_date(target: date) -> None:
+        attempts.append(1)
+        raise UnauthorizedError()
+
+    async def reauth() -> None:
+        reauth_calls.append(1)
+
+    async def save_state(state: dict) -> None:
+        return None
+
+    async def load_state() -> dict:
+        return {}
+
+    scheduler = BackfillScheduler(load_state=load_state, save_state=save_state, sync_date=sync_date, reauth=reauth, now=lambda: now)
+    await scheduler.async_run_once()
+    await scheduler.async_run_once()
+    assert attempts == [1]
+    assert reauth_calls == [1]
+    assert "history" in scheduler.state.disabled_paths

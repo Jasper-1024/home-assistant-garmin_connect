@@ -19,6 +19,7 @@ class BackfillState:
     backoff_until: datetime | None = None
     last_success: datetime | None = None
     error_type: str | None = None
+    disabled_paths: frozenset[str] = frozenset()
 
     def as_record(self) -> dict[str, Any]:
         return {
@@ -27,6 +28,7 @@ class BackfillState:
             "backoff_until": self.backoff_until.isoformat() if self.backoff_until else None,
             "last_success": self.last_success.isoformat() if self.last_success else None,
             "error_type": self.error_type,
+            "disabled_paths": sorted(self.disabled_paths),
         }
 
     @classmethod
@@ -43,7 +45,8 @@ class BackfillState:
                 return datetime.fromisoformat(value)
             except ValueError:
                 return None
-        return cls(frozenset(completed), parsed(record.get("next_run")), parsed(record.get("backoff_until")), parsed(record.get("last_success")), record.get("error_type") if isinstance(record.get("error_type"), str) else None)
+        disabled = record.get("disabled_paths", [])
+        return cls(frozenset(completed), parsed(record.get("next_run")), parsed(record.get("backoff_until")), parsed(record.get("last_success")), record.get("error_type") if isinstance(record.get("error_type"), str) else None, frozenset(value for value in disabled if isinstance(value, str)) if isinstance(disabled, list) else frozenset())
 
 
 def classify_backfill_error(error: BaseException) -> str:
@@ -73,10 +76,11 @@ def next_backfill_date(state: BackfillState, today: date) -> date | None:
 class BackfillScheduler:
     """One-account scheduler; all network work is delegated to the archive."""
 
-    def __init__(self, *, load_state: Any, save_state: Any, sync_date: Any, now: Any = datetime.now, sleep: Any = asyncio.sleep) -> None:
+    def __init__(self, *, load_state: Any, save_state: Any, sync_date: Any, reauth: Any = None, now: Any = datetime.now, sleep: Any = asyncio.sleep) -> None:
         self._load_state = load_state
         self._save_state = save_state
         self._sync_date = sync_date
+        self._reauth = reauth
         self._now = now
         self._sleep = sleep
         self.state = BackfillState()
@@ -88,6 +92,8 @@ class BackfillScheduler:
         if self.state.backoff_until and now < self.state.backoff_until:
             return self.state
         if self.state.next_run and now < self.state.next_run:
+            return self.state
+        if "history" in self.state.disabled_paths:
             return self.state
         target = next_backfill_date(self.state, now.date())
         if target is None:
@@ -104,7 +110,12 @@ class BackfillScheduler:
         except BaseException as error:
             error_type = classify_backfill_error(error)
             backoff = now + BACKOFF_429 if error_type == "rate_limited" else self.state.backoff_until
-            self.state = BackfillState(self.state.completed_dates, now + BACKFILL_INTERVAL, backoff, self.state.last_success, error_type)
+            disabled = self.state.disabled_paths
+            if error_type in {"forbidden_path", "reauth_required"}:
+                disabled = disabled | {"history"}
+                if error_type == "reauth_required" and self._reauth is not None:
+                    await self._reauth()
+            self.state = BackfillState(self.state.completed_dates, now + BACKFILL_INTERVAL, backoff, self.state.last_success, error_type, disabled)
         await self._save_state(self.state.as_record())
         return self.state
 
