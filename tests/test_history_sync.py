@@ -120,7 +120,7 @@ async def test_sync_fetches_only_supported_metrics_and_writes_each_day():
     source.async_fetch = AsyncMock(return_value=(NormalizedSample(datetime(2026, 1, 1, tzinfo=UTC), date(2026, 1, 1), 1, 60.0),))
     source.async_fetch_details = None
     recorder = MagicMock()
-    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(1, inserted_count=1))
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(1))
     entry = MagicMock(data={"history_account_key": "opaque-account-key-1234567890"}, entry_id="e")
     entry.runtime_data = SimpleNamespace(core=SimpleNamespace(client=object()), request_gate=object())
     archive = GarminHistoryArchive(
@@ -459,7 +459,7 @@ async def test_sleep_streams_write_distinct_statistics_and_calendar_stays_bounde
             return (session,) if metric == "sleep_sessions" else ()
 
     recorder = MagicMock()
-    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(1))
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(1, inserted_count=1))
     catalog = _NamedStore()
     stores = {"garmin_connect.e.history_catalog": catalog}
     archive = _partition_archive(Source(), recorder, stores)
