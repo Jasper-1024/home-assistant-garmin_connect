@@ -20,7 +20,6 @@ _PRESENCE_RULES: dict[str, tuple[str, ...]] = {
     "recovery_time": ("recovery",),
 }
 
-
 def inspect_fit(path: Path, required_mode: int = 0o600) -> dict[str, Any]:
     """Decode and CRC-check a FIT file without retaining measurement values."""
     try:

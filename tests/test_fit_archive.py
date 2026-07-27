@@ -19,7 +19,7 @@ def _summary() -> dict[str, object]:
         "message_counts": {"record": 4},
         "message_fields": {"record": ["heart_rate", "timestamp"]},
         "time_coverage": {"start": "2026-07-24T00:00:00+00:00", "end": "2026-07-24T01:00:00+00:00"},
-        "presence": {key: False for key in ("heart_rate", "temperature", "gps", "cadence", "speed", "power", "training_effect", "training_load", "recovery_time", "recovery")},
+        "presence": dict.fromkeys(("heart_rate", "temperature", "gps", "cadence", "speed", "power", "training_effect", "training_load", "recovery_time", "recovery"), False),
         "file": {"size_bytes": 999, "integrity_ok": True, "decode_ok": True, "raw": "must not persist"},
     }
 
