@@ -632,7 +632,7 @@ async def test_timed_activity_archive_and_calendar_excludes_open_interval():
 
 def test_activity_fixture_preserves_training_fields_and_excludes_raw_route() -> None:
     fixture = json.loads((Path(__file__).parent / "fixtures" / "garmin_activity_archive.json").read_text())
-    activity = normalize_activities(fixture["activities"], date(2026, 7, 24))[0]
+    activity = next(item for item in normalize_activities(fixture["activities"], date(2026, 7, 24)) if item.activity_id == "12345")
     assert activity.training_effect == 3.2
     assert activity.load == 82.0
     assert activity.recovery is None
