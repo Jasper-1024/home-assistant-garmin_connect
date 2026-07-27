@@ -33,10 +33,10 @@ def fit_file_name(logical_id: str) -> str:
     return f"activity_{logical_id}.fit"
 
 
-def _summary_without_file(summary: Mapping[str, Any]) -> dict[str, Any]:
+def _summary_without_file(summary: Mapping[str, Any], *, require_integrity: bool = True) -> dict[str, Any]:
     """Keep only bounded structural inspector output."""
     file_info = summary.get("file")
-    if not isinstance(file_info, Mapping) or file_info.get("integrity_ok") is not True or file_info.get("decode_ok") is not True:
+    if require_integrity and (not isinstance(file_info, Mapping) or file_info.get("integrity_ok") is not True or file_info.get("decode_ok") is not True):
         raise FitArchiveError("FIT integrity or decode failed")
     allowed = {"message_counts", "message_fields", "time_coverage", "presence"}
     result = {key: summary[key] for key in allowed if key in summary}
@@ -64,11 +64,18 @@ async def async_archive_fit(
 ) -> dict[str, Any]:
     """Download, validate, and atomically archive one FIT file."""
     try:
+        directory.mkdir(parents=True, exist_ok=True)
+        final_path = directory / fit_file_name(logical_id)
+        if final_path.exists():
+            if final_path.stat().st_mode & 0o777 != 0o600:
+                raise FitArchiveError("FIT permissions are invalid")
+            existing_summary = await asyncio.to_thread(inspect, final_path, 0o600)
+            if not isinstance(existing_summary, Mapping):
+                raise FitArchiveError("FIT summary is invalid")
+            return {"logical_id": logical_id, "path": final_path.name, "summary": _summary_without_file(existing_summary)}
         content = await client.download_activity(int(activity_id), "fit")
         if not isinstance(content, bytes) or not content:
             raise FitArchiveError("FIT download is empty")
-        directory.mkdir(parents=True, exist_ok=True)
-        final_path = directory / fit_file_name(logical_id)
         fd, temporary_name = tempfile.mkstemp(prefix=f".{logical_id}.", suffix=".fit", dir=directory)
         temporary_path = Path(temporary_name)
         try:
@@ -88,7 +95,7 @@ async def async_archive_fit(
             temporary_path.unlink(missing_ok=True)
     except asyncio.CancelledError:
         raise
-    except (OSError, TypeError, ValueError) as err:
+    except (OSError, RuntimeError, TypeError, ValueError) as err:
         raise FitArchiveError("FIT archive failed") from err
 
 
@@ -103,4 +110,4 @@ def fit_record(record: Mapping[str, Any]) -> dict[str, Any]:
         raise FitArchiveError("FIT record is invalid")
     if not isinstance(summary, Mapping):
         raise FitArchiveError("FIT record is invalid")
-    return {"logical_id": logical_id, "path": path, "summary": _summary_without_file(summary)}
+    return {"logical_id": logical_id, "path": path, "summary": _summary_without_file(summary, require_integrity=False)}
