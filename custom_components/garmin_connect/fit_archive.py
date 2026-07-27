@@ -8,7 +8,7 @@ import os
 import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, Callable, cast
+from typing import Any, cast
 
 
 class FitArchiveError(ValueError):
