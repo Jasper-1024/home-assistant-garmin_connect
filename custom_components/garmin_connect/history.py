@@ -234,6 +234,7 @@ class GarminHistoryArchive:
         self._completed_dates: set[str] = set()
         self._sync_lock = asyncio.Lock()
         self._runtime_sync_failure = False
+        self._recorder_adapter: Any | None = None
 
     @property
     def status(self) -> HistoryStatus:
@@ -337,12 +338,14 @@ class GarminHistoryArchive:
             self._status = HistoryStatus(HistoryArchiveState.FAILED, error_type="integration_not_loaded")
             return HistorySyncReport(outcome="failed", error_type="integration_not_loaded")
         source = (self._source_factory or GarminHistorySource)(client, request_gate)
-        if self._recorder_factory:
-            recorder = self._recorder_factory()
-        else:
-            from homeassistant.helpers.recorder import get_instance
+        if self._recorder_adapter is None:
+            if self._recorder_factory:
+                self._recorder_adapter = self._recorder_factory()
+            else:
+                from homeassistant.helpers.recorder import get_instance
 
-            recorder = GarminHistoryRecorder(get_instance(self._hass))
+                self._recorder_adapter = GarminHistoryRecorder(get_instance(self._hass))
+        recorder = self._recorder_adapter
         store = self._store
         if store is None:
             self._runtime_sync_failure = True
@@ -351,6 +354,7 @@ class GarminHistoryArchive:
         processed: list[date] = []
         skipped = 0
         inserted = 0
+        updated = 0
         self._status = HistoryStatus(HistoryArchiveState.RUNNING)
         for offset in range((end_date - start_date).days + 1):
             target = start_date.fromordinal(start_date.toordinal() + offset)
@@ -358,9 +362,9 @@ class GarminHistoryArchive:
             if target_key in self._completed_dates:
                 skipped += 1
                 processed.append(target)
-                self._status = HistoryStatus(HistoryArchiveState.RUNNING, current_date=target_key, processed_dates=len(processed), record_count=inserted)
+                self._status = HistoryStatus(HistoryArchiveState.RUNNING, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated)
                 continue
-            self._status = HistoryStatus(HistoryArchiveState.RUNNING, current_date=target_key, processed_dates=len(processed), record_count=inserted)
+            self._status = HistoryStatus(HistoryArchiveState.RUNNING, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated)
             try:
                 for metric, metadata in (("heart_rate", HEART_RATE_METADATA), ("stress", STRESS_METADATA)):
                     samples = await source.async_fetch(target, metric)
@@ -370,22 +374,24 @@ class GarminHistoryArchive:
                     if outcome.outcome != "written":
                         self._runtime_sync_failure = True
                         self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type=outcome.error_type or "sync_failed")
-                        return HistorySyncReport(tuple(processed), inserted, skipped_count=skipped, outcome=outcome.outcome, error_type=outcome.error_type)
-                    inserted += outcome.accepted_count
+                        return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome=outcome.outcome, error_type=outcome.error_type)
+                    inserted += getattr(outcome, "inserted_count", outcome.accepted_count)
+                    updated += getattr(outcome, "updated_count", 0)
+                    skipped += getattr(outcome, "skipped_count", 0)
                 processed.append(target)
                 completed_dates = self._completed_dates | {target_key}
                 await store.async_save({"schema_version": HISTORY_STORE_VERSION, "account_key": self._account_key(), "completed_dates": sorted(completed_dates)})
                 self._completed_dates = completed_dates
             except asyncio.CancelledError:
-                self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=target_key, processed_dates=len(processed), record_count=inserted)
+                self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated)
                 raise
             except (AttributeError, ImportError, TypeError, ValueError, RuntimeError):
                 self._runtime_sync_failure = True
                 self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type="sync_failed")
-                return HistorySyncReport(tuple(processed), inserted, skipped_count=skipped, outcome="failed", error_type="sync_failed")
+                return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome="failed", error_type="sync_failed")
         self._runtime_sync_failure = False
-        self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=end_date.isoformat(), processed_dates=len(processed), record_count=inserted)
-        return HistorySyncReport(tuple(processed), inserted, skipped_count=skipped, outcome="written")
+        self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=end_date.isoformat(), processed_dates=len(processed), record_count=inserted + updated)
+        return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome="written")
 
     def _account_key(self) -> str:
         """Return the persisted opaque account key."""

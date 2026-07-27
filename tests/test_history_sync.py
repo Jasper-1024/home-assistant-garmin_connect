@@ -90,6 +90,23 @@ async def test_sync_fetches_only_supported_metrics_and_writes_each_day():
 
 
 @pytest.mark.asyncio
+async def test_archive_aggregates_import_classification_counts():
+    source = MagicMock()
+    source.async_fetch = AsyncMock(return_value=())
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(side_effect=[
+        RecorderWriteOutcome(2, inserted_count=1, updated_count=1),
+        RecorderWriteOutcome(2, skipped_count=2),
+    ])
+    archive = _sync_archive(source, recorder, _Store())
+    await archive.async_start()
+
+    report = await archive.async_sync_range(date(2026, 1, 1), date(2026, 1, 1))
+
+    assert (report.inserted_count, report.updated_count, report.skipped_count) == (1, 1, 2)
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_persists_each_date_and_restart_skips_it():
     source = MagicMock()
     source.async_fetch = AsyncMock(return_value=())

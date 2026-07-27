@@ -36,11 +36,14 @@ STRESS_METADATA = HistoryMetricMetadata("stress", "Stress", "unitless")
 
 @dataclass(frozen=True, slots=True)
 class RecorderWriteOutcome:
-    """Privacy-safe result of one import request."""
+    """Import classification; HA Recorder still performs the actual upsert."""
 
     accepted_count: int = 0
     outcome: str = "written"
     error_type: str | None = None
+    inserted_count: int = 0
+    updated_count: int = 0
+    skipped_count: int = 0
 
 
 class _Recorder(Protocol):
@@ -59,6 +62,7 @@ class GarminHistoryRecorder:
 
     def __init__(self, recorder: _Recorder) -> None:
         self._recorder = recorder
+        self._known_values: dict[tuple[str, Any], float] = {}
 
     async def async_write(
         self,
@@ -109,4 +113,15 @@ class GarminHistoryRecorder:
             raise
         except AttributeError, ImportError, TypeError, ValueError, RuntimeError:
             return RecorderWriteOutcome(0, "failed", "recorder_unavailable")
-        return RecorderWriteOutcome(len(samples))
+        inserted = updated = skipped = 0
+        for sample in samples:
+            identity = (statistic_id, sample.timestamp)
+            previous = self._known_values.get(identity)
+            if previous is None:
+                inserted += 1
+            elif previous == sample.value:
+                skipped += 1
+            else:
+                updated += 1
+            self._known_values[identity] = sample.value
+        return RecorderWriteOutcome(len(samples), inserted_count=inserted, updated_count=updated, skipped_count=skipped)

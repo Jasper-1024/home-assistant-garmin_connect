@@ -73,3 +73,9 @@ async def test_revisions_are_sent_idempotently() -> None:
 
     assert len(recorder.imports) == 2
     assert recorder.imports[1][1][0]["mean"] == 61.0
+
+    result = await writer.async_write(statistic_id, STRESS_METADATA, (replace(sample, value=61.0),))
+    assert (result.inserted_count, result.updated_count, result.skipped_count) == (0, 0, 1)
+
+    result = await writer.async_write(statistic_id, STRESS_METADATA, (replace(sample, value=62.0),))
+    assert (result.inserted_count, result.updated_count, result.skipped_count) == (0, 1, 0)
