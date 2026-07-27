@@ -35,7 +35,11 @@ from custom_components.garmin_connect.history_source import (
     SourceSeries,
     normalize_snapshot,
 )
-from custom_components.garmin_connect.sleep_archive import SleepSession, parse_sleep_sessions, session_record
+from custom_components.garmin_connect.sleep_archive import (
+    SleepSession,
+    parse_sleep_sessions,
+    session_record,
+)
 
 
 class _Store:
