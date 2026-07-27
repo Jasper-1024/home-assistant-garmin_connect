@@ -640,6 +640,58 @@ def test_activity_fixture_preserves_training_fields_and_excludes_raw_route() -> 
 
 
 @pytest.mark.asyncio
+async def test_activity_partition_restart_and_corruption_invalidate_checkpoint() -> None:
+    activity = normalize_activities(
+        [{"activityId": 987, "activityType": "running", "activityName": "Archive run",
+          "startTime": "2026-07-24T10:00:00Z", "endTime": "2026-07-24T11:00:00Z"}],
+        date(2026, 7, 24),
+    )[0]
+
+    class Source:
+        async def async_fetch_details(self, target, metric):
+            return (activity,) if metric == "timed_activities" else ()
+
+    stores = {"garmin_connect.e.history_catalog": _NamedStore()}
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = _partition_archive(Source(), recorder, stores)
+    await archive.async_start()
+    await archive.async_sync_range(date(2026, 7, 24), date(2026, 7, 24))
+
+    restarted = _partition_archive(Source(), recorder, stores)
+    await restarted.async_start()
+    assert len(await restarted.async_get_calendar_events("activity", date(2026, 7, 24), date(2026, 7, 24))) == 1
+
+    partition = stores["garmin_connect.e.history_catalog"]
+    assert "2026-07-24" in partition.data["completed_dates"]
+    sleep_store = stores["garmin_connect.e.sleep_2026"]
+    sleep_store.data["activities"] = {activity.logical_id: {"logical_id": activity.logical_id}}
+    corrupted = _partition_archive(Source(), recorder, stores)
+    await corrupted.async_start()
+    assert "2026-07-24" not in corrupted._completed_dates
+    assert await corrupted.async_get_calendar_events("activity", date(2026, 7, 24), date(2026, 7, 24)) == ()
+
+
+@pytest.mark.asyncio
+async def test_activity_partition_account_mismatch_isolated() -> None:
+    stores = {
+        "garmin_connect.e.history_catalog": _NamedStore({
+            "account_key": "opaque-account-key-1234567890", "schema_version": 1,
+            "completed_dates": ["2026-07-24"], "hrv_summaries": {}, "presence": {},
+            "sleep_index": {}, "event_index": {}, "activity_index": {"2026": ["bad"]},
+        }),
+        "garmin_connect.e.sleep_2026": _NamedStore({
+            "account_key": "another-account", "schema_version": 1, "sleep_schema_version": 1,
+            "year": "2026", "sessions": {}, "events": {}, "activities": {},
+        }),
+    }
+    archive = _partition_archive(MagicMock(), MagicMock(), stores)
+    await archive.async_start()
+    assert "2026-07-24" not in archive._completed_dates
+    assert await archive.async_get_calendar_events("activity", date(2026, 7, 24), date(2026, 7, 24)) == ()
+
+
+@pytest.mark.asyncio
 async def test_calendar_loads_prior_year_partition_for_cross_year_sleep():
     session = parse_sleep_sessions(
         {"startTime": "2025-12-31T22:00:00Z", "endTime": "2026-01-01T06:00:00Z"},

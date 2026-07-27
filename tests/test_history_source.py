@@ -105,14 +105,16 @@ def test_normalize_health_events_preserves_explicit_fields_only() -> None:
 async def test_timed_activities_uses_pagination_and_deduplicates_overlap() -> None:
     client = MagicMock()
     client._base_url = "https://garmin.example"
-    client.get_activities = AsyncMock(return_value={"activities": [
-        {"activityId": 1, "activityType": "running", "startTime": "2026-07-24T23:00:00Z", "endTime": "2026-07-25T00:00:00Z"},
-        {"activityId": 1, "activityType": "running", "startTime": "2026-07-24T23:00:00Z", "endTime": "2026-07-25T00:00:00Z"},
-    ]})
+    activity = {"activityId": 1, "activityType": "running", "startTime": "2026-07-24T23:00:00Z", "endTime": "2026-07-25T00:00:00Z"}
+    client.get_activities = AsyncMock(side_effect=[
+        [activity] * 100,
+        [activity],
+    ])
     source = GarminHistorySource(client, _ImmediateGate())
     result = await source.async_fetch_details(date(2026, 7, 24), "timed_activities")
-    client.get_activities.assert_awaited_once_with(0, 100)
     assert len(result) == 1
+    assert result[0].activity_id == "1"
+    assert client.get_activities.call_args_list[1].args == (100, 100)
 
 
 @pytest.mark.asyncio
@@ -127,6 +129,17 @@ async def test_timed_activity_pagination_stops_on_older_page_and_excludes_move_i
     assert len(result) == 1
     assert client.get_activities.await_count == 2
     assert client.get_activities.call_args_list[1].args == (100, 100)
+
+
+def test_normalize_activities_rejects_explicit_event_families() -> None:
+    payload = [
+        {"activityId": 1, "activityType": "walking", "eventTypeKey": "dailyEvent", "startTime": "2026-07-24T10:00:00Z", "durationInSeconds": 60},
+        {"activityId": 2, "activityType": "walking", "sourceName": "Garmin MOVE_IQ event", "startTime": "2026-07-24T10:00:00Z", "durationInSeconds": 60},
+        {"activityId": 3, "activityType": "running", "eventTime": "2026-07-24T10:00:00Z", "startTime": "2026-07-24T10:00:00Z"},
+        {"activityId": 4, "activityType": "running", "source": "Garmin", "startTime": "2026-07-24T10:00:00Z", "endTime": "2026-07-24T11:00:00Z"},
+    ]
+    result = normalize_activities(payload, date(2026, 7, 24))
+    assert [item.activity_id for item in result] == ["4"]
 
 
 @pytest.mark.asyncio

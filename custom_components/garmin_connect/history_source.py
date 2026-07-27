@@ -124,9 +124,23 @@ def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedAct
         if not isinstance(item, dict):
             raise HistorySchemaError("activity has invalid type")
         activity_type = item.get("activityType", item.get("activityTypeKey"))
-        family = str(item.get("source", item.get("eventType", ""))).lower()
+        family_markers = (
+            item.get("eventType"),
+            item.get("eventTypeKey"),
+            item.get("sourceType"),
+            item.get("source"),
+            item.get("sourceName"),
+        )
+        families = tuple(str(marker).lower() for marker in family_markers if marker is not None)
         type_key = str(activity_type).lower() if activity_type is not None else ""
-        if family in {"move_iq", "moveiq", "daily", "daily_event"} or type_key in {"move_iq", "moveiq", "daily", "daily_event"}:
+        non_timed_family = any(
+            marker.replace("-", "_").replace(" ", "_") in {"move_iq", "moveiq", "daily", "daily_event"}
+            or "move_iq" in marker.replace("-", "_").replace(" ", "_")
+            or marker.startswith("daily")
+            for marker in (*families, type_key)
+        )
+        has_event_fields = any(key in item for key in ("eventId", "eventTime", "eventCategory", "eventPayload"))
+        if non_timed_family or (has_event_fields and "endTime" not in item and "endTimeGMT" not in item and "durationInSeconds" not in item and "duration" not in item):
             continue
         start_raw = item.get("startTime", item.get("startTimeGMT", item.get("startTimeLocal")))
         activity_id = item.get("activityId", item.get("activityUUID"))
