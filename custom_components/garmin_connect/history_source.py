@@ -31,7 +31,10 @@ class HRVSummary:
     """Bounded HRV summary metadata, kept separate from raw readings."""
 
     status: str | None = None
-    baseline: float | None = None
+    last_night_avg: float | None = None
+    last_night_5_min_high: float | None = None
+    weekly_avg: float | None = None
+    baseline: dict[str, float] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,9 +115,15 @@ def normalize_pair_series(
         ):
             continue
         raw_time, raw_value = point[timestamp_index], point[value_index]
-        parsed = _timestamp(raw_time)
-        if parsed is None or isinstance(raw_value, bool) or not isinstance(raw_value, int | float):
+        if raw_time is not None and not isinstance(raw_time, str | int | float):
+            raise HistorySchemaError("timestamp has an invalid type")
+        if raw_value is not None and (isinstance(raw_value, bool) or not isinstance(raw_value, int | float)):
+            raise HistorySchemaError("value has an invalid type")
+        if raw_time is None or raw_value is None:
             continue
+        parsed = _timestamp(raw_time)
+        if parsed is None:
+            raise HistorySchemaError("timestamp has an invalid value")
         if effective_date is None:
             if isinstance(raw_time, str):
                 try:
@@ -157,6 +166,7 @@ def normalize_body_battery(payload: Any, target_date: date) -> tuple[NormalizedS
         descriptor_keys=(
             "bodyBatteryValueDescriptorsDTOList",
             "bodyBatteryValueDescriptorsDtoList",
+            "bodyBatteryValueDescriptorDTOList",
             "bodyBatteryValueDescriptors",
         ),
         value_keys=("bodyBatteryValue", "bodyBatteryLevel", "value"),
@@ -179,16 +189,44 @@ def parse_hrv_data(payload: Any, target_date: date) -> HRVData:
             raise HistorySchemaError("HRV reading is not an object")
         raw_time = next((reading[key] for key in ("readingTimeGMT", "readingTimeGmt", "readingTime") if key in reading), None)
         raw_value = next((reading[key] for key in ("hrvValue", "value") if key in reading), None)
-        parsed = _timestamp(raw_time)
-        if parsed is None or isinstance(raw_value, bool) or not isinstance(raw_value, int | float):
+        if raw_time is not None and not isinstance(raw_time, str | int | float):
+            raise HistorySchemaError("HRV timestamp has an invalid type")
+        if raw_value is not None and (isinstance(raw_value, bool) or not isinstance(raw_value, int | float)):
+            raise HistorySchemaError("HRV value has an invalid type")
+        if raw_time is None or raw_value is None:
             continue
+        parsed = _timestamp(raw_time)
+        if parsed is None:
+            raise HistorySchemaError("HRV timestamp has an invalid value")
         readings.append(NormalizedSample(parsed, target_date, raw_time, float(raw_value)))
     latest = {sample.timestamp: sample for sample in readings}
-    status = payload.get("status")
-    baseline = payload.get("baseline")
-    summary_status = status if isinstance(status, str) else None
-    summary_baseline = float(baseline) if isinstance(baseline, int | float) and not isinstance(baseline, bool) else None
-    summary = HRVSummary(summary_status, summary_baseline) if summary_status is not None or summary_baseline is not None else None
+    raw_summary = payload.get("hrvSummary")
+    if raw_summary is not None and not isinstance(raw_summary, dict):
+        raise HistorySchemaError("HRV summary is not an object")
+    summary_data = raw_summary or {}
+    def numeric(name: str) -> float | None:
+        value = summary_data.get(name)
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise HistorySchemaError("HRV summary value has an invalid type")
+        return float(value)
+    raw_baseline = summary_data.get("baseline")
+    baseline: dict[str, float] | None = None
+    if raw_baseline is not None:
+        if not isinstance(raw_baseline, dict):
+            raise HistorySchemaError("HRV baseline is not an object")
+        baseline = {}
+        for key, value in list(raw_baseline.items())[:8]:
+            if not isinstance(key, str) or isinstance(value, bool) or not isinstance(value, int | float):
+                raise HistorySchemaError("HRV baseline has an invalid type")
+            baseline[key] = float(value)
+    status = summary_data.get("status")
+    if status is not None and not isinstance(status, str):
+        raise HistorySchemaError("HRV status has an invalid type")
+    if isinstance(status, str):
+        status = status[:64]
+    summary = HRVSummary(status, numeric("lastNightAvg"), numeric("lastNight5MinHigh"), numeric("weeklyAvg"), baseline) if summary_data else None
     return HRVData(tuple(latest[key] for key in sorted(latest)), summary)
 
 
@@ -200,7 +238,12 @@ class GarminHistorySource:
         self.request_gate = request_gate or GarminRequestGate()
 
     async def async_fetch(self, target_date: date, metric: str) -> tuple[NormalizedSample, ...]:
-        """Fetch and normalize one supported metric at low request priority."""
+        """Fetch one metric, retaining the historical tuple return contract."""
+        result = await self.async_fetch_details(target_date, metric)
+        return result.readings if isinstance(result, HRVData) else result
+
+    async def async_fetch_details(self, target_date: date, metric: str) -> tuple[NormalizedSample, ...] | HRVData:
+        """Fetch a metric and retain private details needed by the archive."""
 
         async def request() -> Any:
             profile = await self.client.get_user_profile()
@@ -228,7 +271,7 @@ class GarminHistorySource:
         if metric == "body_battery":
             return normalize_body_battery(payload, target_date)
         if metric == "nightly_hrv":
-            return parse_hrv_data(payload, target_date).readings
+            return parse_hrv_data(payload, target_date)
         if not isinstance(payload, dict):
             return ()
         if metric == "heart_rate":

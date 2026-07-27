@@ -12,7 +12,7 @@ from custom_components.garmin_connect.history import (
     RecorderCompatibilityResult,
 )
 from custom_components.garmin_connect.history_recorder import RecorderWriteOutcome
-from custom_components.garmin_connect.history_source import NormalizedSample
+from custom_components.garmin_connect.history_source import HRVData, HRVSummary, GarminHistorySource, NormalizedSample
 
 
 class _Store:
@@ -97,6 +97,8 @@ async def test_archive_aggregates_import_classification_counts():
     recorder.async_write = AsyncMock(side_effect=[
         RecorderWriteOutcome(2, inserted_count=1, updated_count=1),
         RecorderWriteOutcome(2, skipped_count=2),
+        RecorderWriteOutcome(0),
+        RecorderWriteOutcome(0),
     ])
     archive = _sync_archive(source, recorder, _Store())
     await archive.async_start()
@@ -149,7 +151,15 @@ async def test_runtime_failure_can_retry():
     source = MagicMock()
     source.async_fetch = AsyncMock(return_value=())
     recorder = MagicMock()
-    recorder.async_write = AsyncMock(side_effect=[RecorderWriteOutcome(0, "failed", "writer"), RecorderWriteOutcome(0), RecorderWriteOutcome(0)])
+    recorder.async_write = AsyncMock(
+        side_effect=[
+            RecorderWriteOutcome(0, "failed", "writer"),
+            RecorderWriteOutcome(0),
+            RecorderWriteOutcome(0),
+            RecorderWriteOutcome(0),
+            RecorderWriteOutcome(0),
+        ]
+    )
     archive = _sync_archive(source, recorder, _Store())
     await archive.async_start()
 
@@ -158,3 +168,26 @@ async def test_runtime_failure_can_retry():
 
     assert first.outcome == "failed"
     assert second.outcome == "written"
+
+
+@pytest.mark.asyncio
+async def test_hrv_summary_persists_only_with_date_checkpoint():
+    class Source(GarminHistorySource):
+        async def async_fetch(self, target_date, metric):
+            return ()
+
+        async def async_fetch_details(self, target_date, metric):
+            if metric == "nightly_hrv":
+                return HRVData((), HRVSummary("balanced", 48.0, 72.0, 50.0, {"low": 40.0}))
+            return ()
+
+    source = Source(object())
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    store = _Store()
+    entry = MagicMock(data={"history_account_key": "opaque-account-key-1234567890"}, entry_id="e")
+    entry.runtime_data = SimpleNamespace(core=SimpleNamespace(client=object()), request_gate=object())
+    archive = GarminHistoryArchive(MagicMock(), entry, recorder_checker=SimpleNamespace(async_check=AsyncMock(return_value=RecorderCompatibilityResult.compatible_result())), store_factory=lambda *args, **kwargs: store, source_factory=lambda *args: source, recorder_factory=lambda: recorder)
+    await archive.async_start()
+    await archive.async_sync_range(date(2026, 1, 1), date(2026, 1, 1))
+    assert store.data["hrv_summaries"]["2026-01-01"]["status"] == "balanced"

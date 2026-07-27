@@ -22,15 +22,16 @@ from .const import (
     RECORDER_COMPATIBILITY_TARGET,
 )
 from .history_recorder import (
-    HEART_RATE_METADATA,
-    STRESS_METADATA,
     BODY_BATTERY_METADATA,
+    HEART_RATE_METADATA,
     NIGHTLY_HRV_METADATA,
+    STRESS_METADATA,
     GarminHistoryRecorder,
     RecorderWriteOutcome,
     statistic_id_for,
 )
 from .history_source import GarminHistorySource
+from .history_source import HRVData
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -237,11 +238,17 @@ class GarminHistoryArchive:
         self._sync_lock = asyncio.Lock()
         self._runtime_sync_failure = False
         self._recorder_adapter: Any | None = None
+        self._hrv_summaries: dict[str, dict[str, Any]] = {}
 
     @property
     def status(self) -> HistoryStatus:
         """Return the immutable, privacy-safe current status."""
         return self._status
+
+    @property
+    def hrv_summaries(self) -> Mapping[str, Mapping[str, Any]]:
+        """Return the private, bounded HRV summary catalog seam."""
+        return {key: dict(value) for key, value in self._hrv_summaries.items()}
 
     async def async_start(self) -> None:
         """Initialize identity, Store catalog, and Recorder compatibility."""
@@ -374,7 +381,19 @@ class GarminHistoryArchive:
                     ("body_battery", BODY_BATTERY_METADATA),
                     ("nightly_hrv", NIGHTLY_HRV_METADATA),
                 ):
-                    samples = await source.async_fetch(target, metric)
+                    details = await source.async_fetch_details(target, metric) if isinstance(source, GarminHistorySource) and metric == "nightly_hrv" else await source.async_fetch(target, metric)
+                    if isinstance(details, HRVData):
+                        samples = details.readings
+                        if details.summary is not None:
+                            self._hrv_summaries[target_key] = {
+                                "status": details.summary.status,
+                                "last_night_avg": details.summary.last_night_avg,
+                                "last_night_5_min_high": details.summary.last_night_5_min_high,
+                                "weekly_avg": details.summary.weekly_avg,
+                                "baseline": details.summary.baseline,
+                            }
+                    else:
+                        samples = details
                     outcome: RecorderWriteOutcome = await recorder.async_write(
                         statistic_id_for(self._account_key(), metric), metadata, samples
                     )
@@ -387,7 +406,7 @@ class GarminHistoryArchive:
                     skipped += getattr(outcome, "skipped_count", 0)
                 processed.append(target)
                 completed_dates = self._completed_dates | {target_key}
-                await store.async_save({"schema_version": HISTORY_STORE_VERSION, "account_key": self._account_key(), "completed_dates": sorted(completed_dates)})
+                await store.async_save({"schema_version": HISTORY_STORE_VERSION, "account_key": self._account_key(), "completed_dates": sorted(completed_dates), "hrv_summaries": self._hrv_summaries})
                 self._completed_dates = completed_dates
             except asyncio.CancelledError:
                 self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated)
@@ -450,6 +469,7 @@ class GarminHistoryArchive:
                     "schema_version": HISTORY_STORE_VERSION,
                     "account_key": account_key,
                     "completed_dates": [],
+                    "hrv_summaries": {},
                 }
             )
             return
@@ -470,6 +490,9 @@ class GarminHistoryArchive:
                 raise ValueError("Store checkpoint is invalid")
             parsed_dates.add(item)
         self._completed_dates = parsed_dates
+        summaries = catalog.get("hrv_summaries", {})
+        if isinstance(summaries, Mapping):
+            self._hrv_summaries = {key: dict(value) for key, value in summaries.items() if isinstance(key, str) and isinstance(value, Mapping)}
 
     def _set_failed(self, error_type: str) -> None:
         """Set a bounded startup failure without exposing exception details."""

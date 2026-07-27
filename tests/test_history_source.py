@@ -6,8 +6,8 @@ import pytest
 
 from custom_components.garmin_connect.history_source import (
     HistorySchemaError,
-    normalize_pair_series,
     normalize_body_battery,
+    normalize_pair_series,
     parse_hrv_data,
 )
 
@@ -113,3 +113,22 @@ def test_hrv_raw_readings_tolerate_missing_summary_and_keep_zero() -> None:
     )
     assert [sample.value for sample in parsed.readings] == [43.0, 0.0]
     assert parsed.summary is None
+
+
+def test_hrv_nested_summary_is_separate_and_typed() -> None:
+    parsed = parse_hrv_data({"hrvReadings": [], "hrvSummary": {"status": "balanced", "lastNightAvg": 48, "lastNight5MinHigh": 72, "weeklyAvg": 50, "baseline": {"low": 40, "high": 60}}}, date(2026, 7, 24))
+    assert parsed.readings == ()
+    assert parsed.summary is not None
+    assert parsed.summary.baseline == {"low": 40.0, "high": 60.0}
+
+
+def test_body_battery_singular_descriptor_is_supported() -> None:
+    samples = normalize_body_battery({"bodyBatteryValueDescriptorDTOList": [{"key": "timestamp", "index": 0}, {"key": "bodyBatteryValue", "index": 1}], "bodyBatteryValuesArray": [["2026-07-24T01:00:00Z", 0]]}, date(2026, 7, 24))
+    assert samples[0].value == 0
+
+
+def test_known_type_drift_is_rejected_but_null_is_missing() -> None:
+    with pytest.raises(HistorySchemaError):
+        normalize_pair_series({"heartRateValues": [["bad", 60]]}, values_key="heartRateValues", descriptor_keys=(), value_keys=("heartRate",))
+    samples = normalize_pair_series({"heartRateValues": [["2026-07-24T01:00:00Z", None], ["2026-07-24T01:01:00Z", 0]]}, values_key="heartRateValues", descriptor_keys=(), value_keys=("heartRate",))
+    assert [sample.value for sample in samples] == [0]
