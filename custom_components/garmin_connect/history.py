@@ -52,6 +52,7 @@ class HistoryArchiveState(StrEnum):
     """Observable states of the history archive."""
 
     IDLE = "idle"
+    RUNNING = "running"
     COMPATIBILITY_DISABLED = "compatibility-disabled"
     FAILED = "failed"
 
@@ -235,6 +236,8 @@ class GarminHistoryArchive:
         self._started = False
         self._tasks: set[asyncio.Task[Any]] = set()
         self._status = HistoryStatus(HistoryArchiveState.IDLE)
+        self._completed_dates: set[str] = set()
+        self._sync_lock = asyncio.Lock()
 
     @property
     def status(self) -> HistoryStatus:
@@ -320,6 +323,14 @@ class GarminHistoryArchive:
             return HistorySyncReport(outcome="invalid", error_type=validation_error)
         if self._status.state is not HistoryArchiveState.IDLE:
             return HistorySyncReport(outcome="disabled", error_type=self._status.error_type)
+        if self._sync_lock.locked():
+            return HistorySyncReport(outcome="busy", error_type="sync_in_progress")
+
+        async with self._sync_lock:
+            return await self._async_sync_range(start_date, end_date)
+
+    async def _async_sync_range(self, start_date: date, end_date: date) -> HistorySyncReport:
+        """Run one serialized, checkpointed manual sync."""
 
         runtime_data = getattr(self._entry, "runtime_data", None)
         client = getattr(getattr(runtime_data, "core", None), "client", None)
@@ -334,9 +345,16 @@ class GarminHistoryArchive:
 
             recorder = GarminHistoryRecorder(get_instance(self._hass))
         processed: list[date] = []
+        skipped = 0
         inserted = 0
+        self._status = HistoryStatus(HistoryArchiveState.RUNNING)
         for offset in range((end_date - start_date).days + 1):
             target = start_date.fromordinal(start_date.toordinal() + offset)
+            target_key = target.isoformat()
+            if target_key in self._completed_dates:
+                skipped += 1
+                continue
+            self._status = HistoryStatus(HistoryArchiveState.RUNNING, current_date=target_key, processed_dates=len(processed), record_count=inserted)
             try:
                 for metric, metadata in (("heart_rate", HEART_RATE_METADATA), ("stress", STRESS_METADATA)):
                     samples = await source.async_fetch(target, metric)
@@ -344,15 +362,19 @@ class GarminHistoryArchive:
                         statistic_id_for(self._account_key(), metric), metadata, samples
                     )
                     if outcome.outcome != "written":
-                        return HistorySyncReport(tuple(processed), inserted, outcome=outcome.outcome, error_type=outcome.error_type)
+                        return HistorySyncReport(tuple(processed), inserted, skipped_count=skipped, outcome=outcome.outcome, error_type=outcome.error_type)
                     inserted += outcome.accepted_count
                 processed.append(target)
+                completed_dates = self._completed_dates | {target_key}
+                await self._store.async_save({"schema_version": HISTORY_STORE_VERSION, "account_key": self._account_key(), "completed_dates": sorted(completed_dates)})
+                self._completed_dates = completed_dates
             except asyncio.CancelledError:
                 raise
             except (AttributeError, ImportError, TypeError, ValueError, RuntimeError):
-                return HistorySyncReport(tuple(processed), inserted, outcome="failed", error_type="sync_failed")
+                self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type="sync_failed")
+                return HistorySyncReport(tuple(processed), inserted, skipped_count=skipped, outcome="failed", error_type="sync_failed")
         self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=end_date.isoformat(), processed_dates=len(processed), record_count=inserted)
-        return HistorySyncReport(tuple(processed), inserted, outcome="written")
+        return HistorySyncReport(tuple(processed), inserted, skipped_count=skipped, outcome="written")
 
     def _account_key(self) -> str:
         """Return the persisted opaque account key."""
@@ -403,11 +425,16 @@ class GarminHistoryArchive:
                 {
                     "schema_version": HISTORY_STORE_VERSION,
                     "account_key": account_key,
+                    "completed_dates": [],
                 }
             )
             return
         if not isinstance(catalog, Mapping) or catalog.get("account_key") != account_key:
             raise ValueError("Store identity mismatch")
+        completed = catalog.get("completed_dates", [])
+        if not isinstance(completed, list) or any(not isinstance(item, str) for item in completed):
+            raise ValueError("Store checkpoint is invalid")
+        self._completed_dates = set(completed)
 
     def _set_failed(self, error_type: str) -> None:
         """Set a bounded startup failure without exposing exception details."""

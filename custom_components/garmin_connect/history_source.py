@@ -53,13 +53,12 @@ def _descriptors(payload: dict[str, Any], keys: tuple[str, ...]) -> dict[str, in
             raise HistorySchemaError(f"{key} is not a descriptor list")
         result: dict[str, int] = {}
         for item in raw:
-            if (
-                not isinstance(item, dict)
-                or not isinstance(item.get("key"), str)
-                or not isinstance(item.get("index"), int)
-            ):
-                continue
-            result[item["key"]] = item["index"]
+            if not isinstance(item, dict) or not isinstance(item.get("key"), str) or not isinstance(item.get("index"), int) or isinstance(item.get("index"), bool):
+                raise HistorySchemaError(f"{key} contains a malformed descriptor")
+            index = item["index"]
+            if index < 0 or item["key"] in result or index in result.values():
+                raise HistorySchemaError(f"{key} contains an invalid descriptor index")
+            result[item["key"]] = index
         return result
     return {}
 
@@ -82,6 +81,8 @@ def normalize_pair_series(
     if not isinstance(raw_points, list):
         raise HistorySchemaError(f"{values_key} is not an array")
     positions = _descriptors(payload, descriptor_keys)
+    if positions and ("timestamp" not in positions or not any(key in positions for key in value_keys)):
+        raise HistorySchemaError("descriptor list lacks required fields")
     timestamp_index = positions.get("timestamp", 0)
     value_index = next((positions[key] for key in value_keys if key in positions), 1)
     effective_date = request_date
