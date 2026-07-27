@@ -269,7 +269,9 @@ def test_daily_summary_and_training_snapshot_presence_and_type_drift() -> None:
         TRAINING_STATUS_FIELDS,
     )
     assert daily.fields["abnormal_heart_rate_alerts"] == ("present", 2.0)
-    assert training.fields["recovery_time"] == ("null", None)
+    assert training.fields["recovery_time"] == ("present", 3600.0)
+    assert normalize_snapshot({"trainingStatus": {"recoveryTime": None}}, date(2026, 7, 24), TRAINING_STATUS_FIELDS).fields["recovery_time"] == ("null", None)
+    assert normalize_snapshot({"trainingStatus": {}}, date(2026, 7, 24), TRAINING_STATUS_FIELDS).fields["recovery_time"] == ("absent", None)
     assert training.fields["vo2_max"] == ("absent", None)
     with pytest.raises(HistorySchemaError):
         normalize_snapshot({"acuteLoad": "drift"}, date(2026, 7, 24), TRAINING_STATUS_FIELDS)
@@ -287,7 +289,7 @@ def test_snapshot_normalization_uses_sanitized_fixture() -> None:
     assert training.fields["load_balance"] == ("present", -14.0)
     assert training.fields["acwr"] == ("present", 0.75)
     assert training.fields["fitness_trend"] == ("present", 1.5)
-    assert training.fields["recovery_time"] == ("null", None)
+    assert training.fields["recovery_time"] == ("present", 3600.0)
 
 
 @pytest.mark.asyncio

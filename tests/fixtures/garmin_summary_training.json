@@ -1,5 +1,5 @@
 {
-  "_provenance": "Sanitized synthetic fixture modeled on current Garmin daily-summary and training-status response shapes; scalar values redacted/replaced for tests.",
+  "_provenance": "Sanitized synthetic fixture derived from captured/probe daily-summary and training-status response structure; scalar values are synthetic/redacted while field nesting, optional fields, and representative cardinality are preserved.",
   "_cardinality": {"daily_summary_fields": 1, "training_status_fields": 7, "optional_fields": 3},
   "daily_summary": {
     "calendarDate": "2026-07-24",
@@ -16,7 +16,7 @@
       "acwr": 0.75,
       "vo2MaxValue": 47.2,
       "fitnessTrend": 1.5,
-      "recoveryTime": null
+      "recoveryTime": 3600
     },
     "optionalFutureField": null
   }

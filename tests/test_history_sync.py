@@ -20,6 +20,7 @@ from custom_components.garmin_connect.history_recorder import (
     TRAINING_CHRONIC_LOAD_METADATA,
     TRAINING_FITNESS_TREND_METADATA,
     TRAINING_LOAD_BALANCE_METADATA,
+    TRAINING_RECOVERY_TIME_METADATA,
     TRAINING_VO2_MAX_METADATA,
     RecorderWriteOutcome,
     statistic_id_for,
@@ -220,12 +221,16 @@ async def test_snapshot_archive_writes_present_fields_and_restarts_from_checkpoi
         TRAINING_ACWR_METADATA.key,
         TRAINING_VO2_MAX_METADATA.key,
         TRAINING_FITNESS_TREND_METADATA.key,
+        TRAINING_RECOVERY_TIME_METADATA.key,
     }
     assert all(call.args[2][0].timestamp == datetime(2026, 7, 24, tzinfo=UTC) for call in snapshot_calls)
     assert all(call.args[2][0].request_date == target for call in snapshot_calls)
-    assert all("recovery" not in call.args[1].key for call in snapshot_calls)
+    recovery_call = next(call for call in snapshot_calls if call.args[1].key == TRAINING_RECOVERY_TIME_METADATA.key)
+    assert recovery_call.args[0] == statistic_id_for("opaque-account-key-1234567890", TRAINING_RECOVERY_TIME_METADATA.key)
+    assert recovery_call.args[2][0].timestamp == datetime(2026, 7, 24, tzinfo=UTC)
+    assert recovery_call.args[1].unit_of_measurement == "s"
     assert all(call.args[0] == statistic_id_for("opaque-account-key-1234567890", call.args[1].key) for call in snapshot_calls)
-    assert store.data["presence"][target.isoformat()]["training_status:recovery_time"] == "null"
+    assert store.data["presence"][target.isoformat()]["training_status:recovery_time"] == "present"
 
     restarted = _sync_archive(Source(), recorder, _Store(store.data))
     await restarted.async_start()
