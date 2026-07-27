@@ -519,7 +519,10 @@ probe_capability:
 
 sync_history:
   name: Sync Garmin history
-  description: Import heart-rate and stress history for one bounded date range.
+  description: >
+    Import heart-rate and stress history for one bounded date range. The
+    inserted, updated, and skipped counts are adapter bookkeeping
+    classifications, not authoritative Recorder database audit counts.
   fields:
     entity_id:
       name: Garmin Connect entity

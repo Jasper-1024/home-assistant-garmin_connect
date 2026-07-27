@@ -312,7 +312,11 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         )
 
     async def handle_sync_history(call: ServiceCall) -> ServiceResponse:
-        """Synchronize only heart-rate and stress history for a bounded range."""
+        """Synchronize supported history and return adapter bookkeeping only.
+
+        Count fields classify this adapter operation; they are not authoritative
+        Recorder database audit counts.
+        """
         target_date = call.data.get("date")
         start_date = call.data.get("start_date") or target_date or dt_util.now().date()
         end_date = call.data.get("end_date") or target_date or start_date
@@ -322,6 +326,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         return {
             "outcome": report.outcome,
             "processed_dates": [item.isoformat() for item in report.processed_dates],
+            "count_basis": "adapter_classification",
             "inserted_count": report.inserted_count,
             "updated_count": report.updated_count,
             "skipped_count": report.skipped_count,

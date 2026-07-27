@@ -169,6 +169,7 @@ async def test_sync_history_returns_processed_iso_dates_without_private_data(
     assert response == {
         "outcome": "written",
         "processed_dates": ["2026-07-24", "2026-07-25"],
+        "count_basis": "adapter_classification",
         "inserted_count": 4,
         "updated_count": 1,
         "skipped_count": 2,
