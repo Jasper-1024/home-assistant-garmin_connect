@@ -26,6 +26,7 @@ from .coordinator import (
     TrainingCoordinator,
 )
 from .history import GarminHistoryArchive
+from .request_gate import GarminRequestGate
 from .services import async_setup_services, async_unload_services
 
 _LOGGER = logging.getLogger(__name__)
@@ -164,17 +165,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: GarminConnectConfigEntry
     auth.di_client_id = entry.data[CONF_CLIENT_ID]
 
     client = GarminClient(auth, is_cn=is_cn)
+    request_gate = GarminRequestGate()
 
     coordinators = GarminConnectCoordinators(
-        core=CoreCoordinator(hass, entry, client, auth),
-        activity=ActivityCoordinator(hass, entry, client, auth),
-        training=TrainingCoordinator(hass, entry, client, auth),
-        body=BodyCoordinator(hass, entry, client, auth),
-        goals=GoalsCoordinator(hass, entry, client, auth),
-        gear=GearCoordinator(hass, entry, client, auth),
-        blood_pressure=BloodPressureCoordinator(hass, entry, client, auth),
-        menstrual=MenstrualCoordinator(hass, entry, client, auth),
-        nutrition=NutritionCoordinator(hass, entry, client, auth),
+        core=CoreCoordinator(hass, entry, client, auth, request_gate),
+        activity=ActivityCoordinator(hass, entry, client, auth, request_gate),
+        training=TrainingCoordinator(hass, entry, client, auth, request_gate),
+        body=BodyCoordinator(hass, entry, client, auth, request_gate),
+        goals=GoalsCoordinator(hass, entry, client, auth, request_gate),
+        gear=GearCoordinator(hass, entry, client, auth, request_gate),
+        blood_pressure=BloodPressureCoordinator(hass, entry, client, auth, request_gate),
+        menstrual=MenstrualCoordinator(hass, entry, client, auth, request_gate),
+        nutrition=NutritionCoordinator(hass, entry, client, auth, request_gate),
+        request_gate=request_gate,
     )
 
     try:
@@ -229,6 +232,10 @@ async def async_options_update_listener(
 
 async def async_unload_entry(hass: HomeAssistant, entry: GarminConnectConfigEntry) -> bool:
     """Unload a config entry."""
+    request_gate = getattr(entry.runtime_data, "request_gate", None)
+    if isinstance(request_gate, GarminRequestGate):
+        await request_gate.async_close()
+
     history_archive = getattr(entry.runtime_data, "history_archive", None)
     if isinstance(history_archive, GarminHistoryArchive):
         await history_archive.async_stop()

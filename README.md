@@ -78,7 +78,7 @@ After setup, configure these options via the integration's **Configure** button:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| Scan interval | 300 | How often to fetch data in seconds (60–3600) |
+| Scan interval | 900 | How often to fetch data in seconds (60–3600) |
 
 ## Data updates
 

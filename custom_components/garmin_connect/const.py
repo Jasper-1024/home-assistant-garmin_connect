@@ -19,6 +19,6 @@ RECORDER_COMPATIBILITY_TARGET: Final = "Home Assistant 2026.7.4 Recorder path B"
 # Options
 CONF_IS_CN: Final = "is_cn"
 CONF_SCAN_INTERVAL: Final = "scan_interval"
-DEFAULT_SCAN_INTERVAL: Final = 300  # 5 minutes
+DEFAULT_SCAN_INTERVAL: Final = 900  # 15 minutes
 MIN_SCAN_INTERVAL: Final = 60  # 1 minute
 MAX_SCAN_INTERVAL: Final = 3600  # 1 hour

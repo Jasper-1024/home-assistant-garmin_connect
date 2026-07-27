@@ -1,0 +1,140 @@
+"""Tests for coordinator request-gate integration."""
+
+from __future__ import annotations
+
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from ha_garmin.exceptions import GarminAuthError
+from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.update_coordinator import UpdateFailed
+
+from custom_components.garmin_connect.const import (
+    CONF_CLIENT_ID,
+    CONF_REFRESH_TOKEN,
+    CONF_SCAN_INTERVAL,
+    CONF_TOKEN,
+    DEFAULT_SCAN_INTERVAL,
+)
+from custom_components.garmin_connect.coordinator import (
+    ActivityCoordinator,
+    BloodPressureCoordinator,
+    BodyCoordinator,
+    CoreCoordinator,
+    GearCoordinator,
+    GoalsCoordinator,
+    MenstrualCoordinator,
+    NutritionCoordinator,
+    TrainingCoordinator,
+)
+from custom_components.garmin_connect.request_gate import GarminRequestGate
+
+_COORDINATORS = (
+    CoreCoordinator,
+    ActivityCoordinator,
+    TrainingCoordinator,
+    BodyCoordinator,
+    GoalsCoordinator,
+    GearCoordinator,
+    BloodPressureCoordinator,
+    MenstrualCoordinator,
+    NutritionCoordinator,
+)
+
+
+def _inputs() -> tuple[MagicMock, MagicMock, MagicMock, MagicMock]:
+    """Build isolated coordinator dependencies."""
+    hass = MagicMock()
+    hass.config.time_zone = "UTC"
+    entry = MagicMock()
+    entry.data = {
+        CONF_TOKEN: "token",
+        CONF_REFRESH_TOKEN: "refresh-token",
+        CONF_CLIENT_ID: "client-id",
+    }
+    entry.options = {}
+    client = MagicMock()
+    auth = MagicMock()
+    auth.di_token = entry.data[CONF_TOKEN]
+    auth.di_refresh_token = entry.data[CONF_REFRESH_TOKEN]
+    auth.di_client_id = entry.data[CONF_CLIENT_ID]
+    return hass, entry, client, auth
+
+
+def test_all_current_coordinators_can_share_one_account_gate() -> None:
+    """Every coordinator constructed for one entry uses the same gate."""
+    hass, entry, client, auth = _inputs()
+    gate = GarminRequestGate()
+
+    coordinators = [constructor(hass, entry, client, auth, gate) for constructor in _COORDINATORS]
+
+    assert all(coordinator.request_gate is gate for coordinator in coordinators)
+
+
+def test_default_and_explicit_scan_intervals() -> None:
+    """The new default applies without overriding an explicit valid option."""
+    hass, entry, client, auth = _inputs()
+
+    default_coordinator = CoreCoordinator(hass, entry, client, auth, GarminRequestGate())
+    entry.options = {CONF_SCAN_INTERVAL: 600}
+    explicit_coordinator = CoreCoordinator(hass, entry, client, auth, GarminRequestGate())
+
+    assert DEFAULT_SCAN_INTERVAL == 900
+    assert default_coordinator.update_interval.total_seconds() == DEFAULT_SCAN_INTERVAL
+    assert explicit_coordinator.update_interval.total_seconds() == 600
+
+
+async def test_coordinators_serialize_current_fetches_through_shared_gate() -> None:
+    """Two coordinators for one entry never run their Garmin requests together."""
+    hass, entry, client, auth = _inputs()
+    gate = GarminRequestGate()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+
+    async def first_fetch() -> dict:
+        first_started.set()
+        await release_first.wait()
+        return {"source": "core"}
+
+    async def second_fetch() -> dict:
+        second_started.set()
+        return {"source": "activity"}
+
+    client.fetch_core_data = first_fetch
+    client.fetch_activity_data = second_fetch
+    core = CoreCoordinator(hass, entry, client, auth, gate)
+    activity = ActivityCoordinator(hass, entry, client, auth, gate)
+
+    first_task = asyncio.create_task(core._async_update_data())
+    await first_started.wait()
+    second_task = asyncio.create_task(activity._async_update_data())
+    await asyncio.sleep(0)
+    assert not second_started.is_set()
+
+    release_first.set()
+    assert await first_task == {"source": "core"}
+    assert await second_task == {"source": "activity"}
+
+    await gate.async_close()
+
+
+async def test_auth_errors_keep_config_entry_auth_semantics() -> None:
+    """A Garmin auth failure remains a Home Assistant auth failure."""
+    hass, entry, client, auth = _inputs()
+    client.fetch_core_data = AsyncMock(side_effect=GarminAuthError("expired"))
+    coordinator = CoreCoordinator(hass, entry, client, auth, GarminRequestGate())
+
+    with pytest.raises(ConfigEntryAuthFailed):
+        await coordinator._async_update_data()
+
+
+async def test_fetch_errors_keep_update_failed_semantics() -> None:
+    """A non-auth fetch failure remains an UpdateFailed."""
+    hass, entry, client, auth = _inputs()
+    client.fetch_core_data = AsyncMock(side_effect=RuntimeError("network down"))
+    coordinator = CoreCoordinator(hass, entry, client, auth, GarminRequestGate())
+
+    with pytest.raises(UpdateFailed, match="network down"):
+        await coordinator._async_update_data()

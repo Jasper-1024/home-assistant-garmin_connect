@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
@@ -26,6 +27,7 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
 )
+from .request_gate import GarminRequestGate, GarminRequestPriority
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,6 +48,7 @@ class GarminConnectCoordinators:
     blood_pressure: BloodPressureCoordinator
     menstrual: MenstrualCoordinator
     nutrition: NutritionCoordinator
+    request_gate: GarminRequestGate | None = None
     history_archive: GarminHistoryArchive | None = None
 
 
@@ -62,6 +65,7 @@ class BaseGarminCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         auth: GarminAuth,
         name: str,
         update_interval: timedelta,
+        request_gate: GarminRequestGate | None = None,
     ) -> None:
         """Initialize."""
         super().__init__(
@@ -73,7 +77,23 @@ class BaseGarminCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.client = client
         self.auth = auth
+        self.request_gate = request_gate or GarminRequestGate()
         self._refresh_lock = asyncio.Lock()
+
+    async def _async_fetch(
+        self, requester: Callable[[], Awaitable[dict[str, Any]]]
+    ) -> dict[str, Any]:
+        """Run one current-value fetch through the account request gate."""
+
+        async def request_and_update_tokens() -> dict[str, Any]:
+            data = await requester()
+            await self._update_tokens_if_changed()
+            return data
+
+        return await self.request_gate.async_request(
+            GarminRequestPriority.FOREGROUND,
+            request_and_update_tokens,
+        )
 
     async def _update_tokens_if_changed(self) -> None:
         """Update stored tokens if they changed during refresh."""
@@ -103,16 +123,24 @@ class CoreCoordinator(BaseGarminCoordinator):
         entry: ConfigEntry,
         client: GarminClient,
         auth: GarminAuth,
+        request_gate: GarminRequestGate | None = None,
     ) -> None:
         """Initialize."""
         scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-        super().__init__(hass, entry, client, auth, "core", timedelta(seconds=scan_interval))
+        super().__init__(
+            hass,
+            entry,
+            client,
+            auth,
+            "core",
+            timedelta(seconds=scan_interval),
+            request_gate,
+        )
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch core data from Garmin Connect."""
         try:
-            data = await self.client.fetch_core_data()
-            await self._update_tokens_if_changed()
+            data = await self._async_fetch(self.client.fetch_core_data)
         except GarminAuthError as err:
             raise ConfigEntryAuthFailed("Authentication failed") from err
         except Exception as err:
@@ -129,16 +157,24 @@ class ActivityCoordinator(BaseGarminCoordinator):
         entry: ConfigEntry,
         client: GarminClient,
         auth: GarminAuth,
+        request_gate: GarminRequestGate | None = None,
     ) -> None:
         """Initialize."""
         scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-        super().__init__(hass, entry, client, auth, "activity", timedelta(seconds=scan_interval))
+        super().__init__(
+            hass,
+            entry,
+            client,
+            auth,
+            "activity",
+            timedelta(seconds=scan_interval),
+            request_gate,
+        )
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch activity data from Garmin Connect."""
         try:
-            data = await self.client.fetch_activity_data()
-            await self._update_tokens_if_changed()
+            data = await self._async_fetch(self.client.fetch_activity_data)
         except GarminAuthError as err:
             raise ConfigEntryAuthFailed("Authentication failed") from err
         except Exception as err:
@@ -155,16 +191,24 @@ class TrainingCoordinator(BaseGarminCoordinator):
         entry: ConfigEntry,
         client: GarminClient,
         auth: GarminAuth,
+        request_gate: GarminRequestGate | None = None,
     ) -> None:
         """Initialize."""
         scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-        super().__init__(hass, entry, client, auth, "training", timedelta(seconds=scan_interval))
+        super().__init__(
+            hass,
+            entry,
+            client,
+            auth,
+            "training",
+            timedelta(seconds=scan_interval),
+            request_gate,
+        )
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch training data from Garmin Connect."""
         try:
-            data = await self.client.fetch_training_data()
-            await self._update_tokens_if_changed()
+            data = await self._async_fetch(self.client.fetch_training_data)
         except GarminAuthError as err:
             raise ConfigEntryAuthFailed("Authentication failed") from err
         except Exception as err:
@@ -181,16 +225,24 @@ class BodyCoordinator(BaseGarminCoordinator):
         entry: ConfigEntry,
         client: GarminClient,
         auth: GarminAuth,
+        request_gate: GarminRequestGate | None = None,
     ) -> None:
         """Initialize."""
         scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-        super().__init__(hass, entry, client, auth, "body", timedelta(seconds=scan_interval))
+        super().__init__(
+            hass,
+            entry,
+            client,
+            auth,
+            "body",
+            timedelta(seconds=scan_interval),
+            request_gate,
+        )
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch body data from Garmin Connect."""
         try:
-            data = await self.client.fetch_body_data()
-            await self._update_tokens_if_changed()
+            data = await self._async_fetch(self.client.fetch_body_data)
         except GarminAuthError as err:
             raise ConfigEntryAuthFailed("Authentication failed") from err
         except Exception as err:
@@ -207,16 +259,24 @@ class GoalsCoordinator(BaseGarminCoordinator):
         entry: ConfigEntry,
         client: GarminClient,
         auth: GarminAuth,
+        request_gate: GarminRequestGate | None = None,
     ) -> None:
         """Initialize."""
         scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-        super().__init__(hass, entry, client, auth, "goals", timedelta(seconds=scan_interval))
+        super().__init__(
+            hass,
+            entry,
+            client,
+            auth,
+            "goals",
+            timedelta(seconds=scan_interval),
+            request_gate,
+        )
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch goals data from Garmin Connect."""
         try:
-            data = await self.client.fetch_goals_data()
-            await self._update_tokens_if_changed()
+            data = await self._async_fetch(self.client.fetch_goals_data)
         except GarminAuthError as err:
             raise ConfigEntryAuthFailed("Authentication failed") from err
         except Exception as err:
@@ -233,16 +293,26 @@ class GearCoordinator(BaseGarminCoordinator):
         entry: ConfigEntry,
         client: GarminClient,
         auth: GarminAuth,
+        request_gate: GarminRequestGate | None = None,
     ) -> None:
         """Initialize."""
         scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-        super().__init__(hass, entry, client, auth, "gear", timedelta(seconds=scan_interval))
+        super().__init__(
+            hass,
+            entry,
+            client,
+            auth,
+            "gear",
+            timedelta(seconds=scan_interval),
+            request_gate,
+        )
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch gear data from Garmin Connect."""
         try:
-            data = await self.client.fetch_gear_data(timezone=self.hass.config.time_zone)
-            await self._update_tokens_if_changed()
+            data = await self._async_fetch(
+                lambda: self.client.fetch_gear_data(timezone=self.hass.config.time_zone)
+            )
         except GarminAuthError as err:
             raise ConfigEntryAuthFailed("Authentication failed") from err
         except Exception as err:
@@ -259,6 +329,7 @@ class BloodPressureCoordinator(BaseGarminCoordinator):
         entry: ConfigEntry,
         client: GarminClient,
         auth: GarminAuth,
+        request_gate: GarminRequestGate | None = None,
     ) -> None:
         """Initialize."""
         scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
@@ -269,13 +340,13 @@ class BloodPressureCoordinator(BaseGarminCoordinator):
             auth,
             "blood_pressure",
             timedelta(seconds=scan_interval),
+            request_gate,
         )
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch blood pressure data from Garmin Connect."""
         try:
-            data = await self.client.fetch_blood_pressure_data()
-            await self._update_tokens_if_changed()
+            data = await self._async_fetch(self.client.fetch_blood_pressure_data)
         except GarminAuthError as err:
             raise ConfigEntryAuthFailed("Authentication failed") from err
         except Exception as err:
@@ -292,16 +363,24 @@ class MenstrualCoordinator(BaseGarminCoordinator):
         entry: ConfigEntry,
         client: GarminClient,
         auth: GarminAuth,
+        request_gate: GarminRequestGate | None = None,
     ) -> None:
         """Initialize."""
         scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-        super().__init__(hass, entry, client, auth, "menstrual", timedelta(seconds=scan_interval))
+        super().__init__(
+            hass,
+            entry,
+            client,
+            auth,
+            "menstrual",
+            timedelta(seconds=scan_interval),
+            request_gate,
+        )
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch menstrual data from Garmin Connect."""
         try:
-            data = await self.client.fetch_menstrual_data()
-            await self._update_tokens_if_changed()
+            data = await self._async_fetch(self.client.fetch_menstrual_data)
         except GarminAuthError as err:
             raise ConfigEntryAuthFailed("Authentication failed") from err
         except Exception as err:
@@ -318,16 +397,24 @@ class NutritionCoordinator(BaseGarminCoordinator):
         entry: ConfigEntry,
         client: GarminClient,
         auth: GarminAuth,
+        request_gate: GarminRequestGate | None = None,
     ) -> None:
         """Initialize."""
         scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-        super().__init__(hass, entry, client, auth, "nutrition", timedelta(seconds=scan_interval))
+        super().__init__(
+            hass,
+            entry,
+            client,
+            auth,
+            "nutrition",
+            timedelta(seconds=scan_interval),
+            request_gate,
+        )
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch nutrition data from Garmin Connect."""
         try:
-            data = await self.client.fetch_nutrition_data()
-            await self._update_tokens_if_changed()
+            data = await self._async_fetch(self.client.fetch_nutrition_data)
         except GarminAuthError as err:
             raise ConfigEntryAuthFailed("Authentication failed") from err
         except Exception as err:

@@ -15,6 +15,7 @@ from custom_components.garmin_connect.const import (
     CONF_TOKEN,
 )
 from custom_components.garmin_connect.history import GarminHistoryArchive
+from custom_components.garmin_connect.request_gate import GarminRequestGate
 
 from .conftest import ENTRY_DATA
 
@@ -110,6 +111,31 @@ async def test_setup_entry_stores_all_coordinators() -> None:
         "nutrition",
     ):
         assert getattr(entry.runtime_data, field) is coord
+
+
+async def test_setup_entry_passes_one_gate_to_all_coordinators() -> None:
+    """All current coordinators for one entry share the account gate."""
+    entry = MagicMock()
+    entry.data = dict(ENTRY_DATA)
+    entry.options = {}
+    hass = MagicMock()
+    hass.config.country = "US"
+    hass.services.has_service = MagicMock(return_value=True)
+    hass.config_entries.async_forward_entry_setups = AsyncMock()
+
+    coord = _coord_mock()
+    with ExitStack() as stack:
+        stack.enter_context(patch("custom_components.garmin_connect.GarminAuth"))
+        stack.enter_context(patch("custom_components.garmin_connect.GarminClient"))
+        constructor_patches = [
+            stack.enter_context(patch(target, return_value=coord)) for target in _COORD_TARGETS
+        ]
+        await async_setup_entry(hass, entry)
+
+    gates = [constructor.call_args.args[4] for constructor in constructor_patches]
+    assert isinstance(gates[0], GarminRequestGate)
+    assert all(gate is gates[0] for gate in gates)
+    assert entry.runtime_data.request_gate is gates[0]
 
 
 async def test_setup_entry_restores_di_tokens_onto_auth() -> None:
@@ -269,6 +295,8 @@ async def test_unload_entry_stops_history_archive() -> None:
     entry = MagicMock()
     archive = MagicMock(spec=GarminHistoryArchive)
     archive.async_stop = AsyncMock()
+    request_gate = MagicMock(spec=GarminRequestGate)
+    request_gate.async_close = AsyncMock()
     coord = _coord_mock()
     entry.runtime_data = GarminConnectCoordinators(
         core=coord,
@@ -280,6 +308,7 @@ async def test_unload_entry_stops_history_archive() -> None:
         blood_pressure=coord,
         menstrual=coord,
         nutrition=coord,
+        request_gate=request_gate,
         history_archive=archive,
     )
     hass = MagicMock()
@@ -290,6 +319,7 @@ async def test_unload_entry_stops_history_archive() -> None:
         result = await async_unload_entry(hass, entry)
 
     assert result is True
+    request_gate.async_close.assert_awaited_once()
     archive.async_stop.assert_awaited_once()
 
 
