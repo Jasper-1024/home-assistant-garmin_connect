@@ -71,9 +71,9 @@ from .history_source import (
     SegmentedData,
     SnapshotData,
     SourceSeries,
+    activity_from_record,
     health_event_from_record,
     health_event_record,
-    activity_from_record,
 )
 from .sleep_archive import SleepSchemaError, SleepSession, session_from_record, session_record
 
