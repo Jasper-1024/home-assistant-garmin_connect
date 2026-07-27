@@ -117,9 +117,6 @@ async def test_release_gate_scratch_recorder_restart_revision_and_no_state_chang
     writer = GarminHistoryRecorder(requester)
     await writer.async_write(statistic_id, HEART_RATE_METADATA, samples)
     restarted = GarminHistoryRecorder(requester)
-    # The fake requester is the persistent Recorder DB; restore the writer's
-    # bounded identity cache as the restart seam would after loading it.
-    restarted._known_values = writer._known_values.copy()
     replay = await restarted.async_write(statistic_id, HEART_RATE_METADATA, samples)
     overlap = await restarted.async_write(
         statistic_id,
@@ -129,12 +126,13 @@ async def test_release_gate_scratch_recorder_restart_revision_and_no_state_chang
 
     assert len(requester.imports[0][1]) == 4
     assert [row["start"] for row in requester.imports[0][1]] == [sample.timestamp for sample in samples]
-    assert replay.skipped_count == 4
+    assert replay.accepted_count == 4
     assert len(requester.rows) == 4
     assert overlap.updated_count == 1
     assert overlap.skipped_count == 2
     assert requester.imports[2][1][1]["start"] == samples[2].timestamp
     assert requester.imports[2][1][1]["mean"] == 61.0
+    assert requester.rows[(statistic_id, samples[2].timestamp)]["mean"] == 61.0
     assert all(isinstance(task, SynchronizeTask) for task in requester.tasks)
     assert len(requester.tasks) == 3
     assert all("state_changed" not in row for _, rows, _ in requester.imports for row in rows)

@@ -10,13 +10,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from custom_components.garmin_connect.diagnostics import async_get_config_entry_diagnostics
+from custom_components.garmin_connect.fit_archive import persisted_fit_summary
 from custom_components.garmin_connect.history import (
     GarminHistoryArchive,
     HistoryArchiveState,
     HistoryStatus,
     HistorySyncReport,
 )
+from custom_components.garmin_connect.history_source import normalize_activities, normalize_health_events
 from custom_components.garmin_connect.services import async_setup_services
+from custom_components.garmin_connect.sleep_archive import parse_sleep_sessions
 
 ROOT = Path(__file__).parents[1]
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -78,6 +81,7 @@ def _dispatch_fixture_contract(stem: str, state: str, fixture: dict) -> str:
         return "empty"
     if state == "schema_drift":
         assert fixture.get("unknown_structural_field") == "redacted"
+        # The adapter contract is fail-closed for this explicit drift state.
         return "schema-drift"
     if stem == "garmin_sleep_streams":
         assert isinstance(fixture.get("sleepHeartRateValueDescriptorsDTOList"), list)
@@ -85,6 +89,15 @@ def _dispatch_fixture_contract(stem: str, state: str, fixture: dict) -> str:
         assert isinstance(payload, list)
         return "success"
     assert payload not in ({}, [], None)
+    source = json.loads((FIXTURES / f"{stem}.json").read_text())
+    if stem == "garmin_activity_archive":
+        assert normalize_activities(source["activities"], date(2026, 7, 24))
+    elif stem == "garmin_health_events":
+        assert normalize_health_events(source["events"], date(2026, 7, 24))
+    elif stem == "garmin_sleep_structured":
+        assert parse_sleep_sessions(source, date(2026, 2, 28))
+    elif stem == "garmin_fit_structural_summary":
+        assert persisted_fit_summary(source["summary"])
     if stem == "garmin_fit_structural_summary":
         assert isinstance(payload.get("message_counts"), dict)
         assert isinstance(payload.get("message_fields"), dict)
