@@ -450,6 +450,70 @@ async def test_sleep_partition_failure_does_not_publish_completed_checkpoint():
 
 
 @pytest.mark.asyncio
+async def test_sleep_streams_write_distinct_statistics_and_calendar_stays_bounded():
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "garmin_sleep_streams.json").read_text())
+    session = parse_sleep_sessions(fixture, date(2026, 7, 24))[0]
+
+    class Source:
+        async def async_fetch_details(self, target, metric):
+            return (session,) if metric == "sleep_sessions" else ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(1))
+    catalog = _NamedStore()
+    stores = {"garmin_connect.e.history_catalog": catalog}
+    archive = _partition_archive(Source(), recorder, stores)
+    await archive.async_start()
+    report = await archive.async_sync_range(date(2026, 7, 24), date(2026, 7, 24))
+
+    stream_ids = {
+        call.args[0]
+        for call in recorder.async_write.await_args_list
+        if ":sleep_" in call.args[0]
+    }
+    assert stream_ids == {
+        statistic_id_for("opaque-account-key-1234567890", f"sleep_{metric}")
+        for metric in ("heart_rate", "hrv", "body_battery", "stress", "respiration", "spo2", "movement")
+    }
+    assert report.inserted_count >= 7
+    events = await archive.async_get_calendar_events("sleep", date(2026, 7, 24), date(2026, 7, 25))
+    assert events[0].summary == "Sleep"
+    assert not hasattr(events[0], "streams")
+
+
+@pytest.mark.asyncio
+async def test_sleep_stream_failure_does_not_checkpoint_and_retry_converges():
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "garmin_sleep_streams.json").read_text())
+    session = parse_sleep_sessions(fixture, date(2026, 7, 24))[0]
+
+    class Source:
+        async def async_fetch_details(self, target, metric):
+            return (session,) if metric == "sleep_sessions" else ()
+
+    failed = False
+
+    async def write(statistic_id, metadata, samples):
+        nonlocal failed
+        if ":sleep_" in statistic_id and not failed:
+            failed = True
+            return RecorderWriteOutcome(0, "failed", "writer")
+        return RecorderWriteOutcome(len(samples), inserted_count=len(samples))
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(side_effect=write)
+    catalog = _NamedStore()
+    stores = {"garmin_connect.e.history_catalog": catalog}
+    archive = _partition_archive(Source(), recorder, stores)
+    await archive.async_start()
+    first = await archive.async_sync_range(date(2026, 7, 24), date(2026, 7, 24))
+    second = await archive.async_sync_range(date(2026, 7, 24), date(2026, 7, 24))
+
+    assert first.outcome == "failed"
+    assert second.outcome == "written"
+    assert catalog.data["completed_dates"] == ["2026-07-24"]
+
+
+@pytest.mark.asyncio
 async def test_restart_drops_missing_or_corrupt_sleep_partition_from_completed_index():
     session = _sleep_session()
     catalog_data = {

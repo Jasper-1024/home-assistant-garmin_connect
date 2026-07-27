@@ -38,6 +38,13 @@ from .history_recorder import (
     SPO2_CONTINUOUS_METADATA,
     SPO2_HOURLY_METADATA,
     SPO2_SINGLE_METADATA,
+    SLEEP_BODY_BATTERY_METADATA,
+    SLEEP_HEART_RATE_METADATA,
+    SLEEP_HRV_METADATA,
+    SLEEP_MOVEMENT_METADATA,
+    SLEEP_RESPIRATION_METADATA,
+    SLEEP_SPO2_METADATA,
+    SLEEP_STRESS_METADATA,
     STEPS_DAILY_TOTAL_METADATA,
     STEPS_METADATA,
     STRESS_METADATA,
@@ -78,6 +85,15 @@ _HISTORY_MIN_DATE = date(2026, 1, 1)
 _HISTORY_MAX_DAYS = 31
 _PRESENCE_STATES = frozenset({"null", "empty", "missing", "unsupported", "returned-empty", "present", "absent"})
 _SLEEP_SCHEMA_VERSION = 1
+_SLEEP_STREAM_METADATA = {
+    "heart_rate": SLEEP_HEART_RATE_METADATA,
+    "hrv": SLEEP_HRV_METADATA,
+    "body_battery": SLEEP_BODY_BATTERY_METADATA,
+    "stress": SLEEP_STRESS_METADATA,
+    "respiration": SLEEP_RESPIRATION_METADATA,
+    "spo2": SLEEP_SPO2_METADATA,
+    "movement": SLEEP_MOVEMENT_METADATA,
+}
 
 
 class HistoryArchiveState(StrEnum):
@@ -575,6 +591,25 @@ class GarminHistoryArchive:
                 for session in sleep_details:
                     year = str(session.start.year)
                     sleep_sessions.setdefault(year, {})[session.logical_id] = session_record(session)
+                    for stream in session.streams:
+                        metadata_for_stream = _SLEEP_STREAM_METADATA.get(stream.metric)
+                        if metadata_for_stream is None:
+                            raise SleepSchemaError("sleep stream metric is unsupported")
+                        samples = tuple(
+                            NormalizedSample(point.timestamp, session.calendar_date, point.raw_timestamp, point.value)
+                            for point in stream.points
+                            if point.value is not None and point.value >= 0
+                        )
+                        stream_outcome = await recorder.async_write(
+                            statistic_id_for(self._account_key(), metadata_for_stream.key),
+                            metadata_for_stream,
+                            samples,
+                        )
+                        if stream_outcome.outcome != "written":
+                            raise RuntimeError(stream_outcome.error_type or "sleep_stream_write_failed")
+                        inserted += getattr(stream_outcome, "inserted_count", stream_outcome.accepted_count)
+                        updated += getattr(stream_outcome, "updated_count", 0)
+                        skipped += getattr(stream_outcome, "skipped_count", 0)
                 processed.append(target)
                 completed_dates = self._completed_dates | {target_key}
                 await self._async_save_sleep_partitions(sleep_sessions)

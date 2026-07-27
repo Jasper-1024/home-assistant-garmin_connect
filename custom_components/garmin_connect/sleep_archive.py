@@ -14,6 +14,23 @@ class SleepSchemaError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class SleepStreamPoint:
+    """One bounded raw sleep stream point."""
+
+    timestamp: datetime
+    raw_timestamp: Any
+    value: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class SleepStream:
+    """One named high-resolution stream associated with a sleep session."""
+
+    metric: str
+    points: tuple[SleepStreamPoint, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class SleepSession:
     """One logical sleep or nap interval, excluding numeric arrays."""
 
@@ -28,6 +45,7 @@ class SleepSession:
     feedback: tuple[Any, ...]
     restless_events: tuple[Any, ...]
     stages: tuple[Any, ...] = ()
+    streams: tuple[SleepStream, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +117,46 @@ def _stage_list(value: Any) -> tuple[Any, ...]:
     return tuple(stages)
 
 
+_STREAM_FIELDS = {
+    "heart_rate": ("sleepHeartRate", "sleepHeartRateValues", "heartRateValues"),
+    "hrv": ("hrvData", "sleepHrv", "sleepHrvValues", "hrvReadings"),
+    "body_battery": ("sleepBodyBattery", "sleepBodyBatteryValues", "bodyBatteryValuesArray", "bodyBattery"),
+    "stress": ("sleepStress", "sleepStressValues", "stressValuesArray", "stress"),
+    "respiration": ("sleepRespiration", "sleepRespirationValues", "respirationValuesArray", "respiration"),
+    "spo2": ("sleepSpO2", "sleepSpo2", "sleepSpO2Values", "spO2ContinuousValues"),
+    "movement": ("sleepMovement", "sleepMovementValues"),
+}
+
+
+def _sleep_streams(item: dict[str, Any]) -> tuple[SleepStream, ...]:
+    result: list[SleepStream] = []
+    for metric, aliases in _STREAM_FIELDS.items():
+        key = next((alias for alias in aliases if alias in item), None)
+        if key is None:
+            continue
+        values = item[key]
+        if values is None:
+            result.append(SleepStream(metric, ()))
+            continue
+        if not isinstance(values, list):
+            raise SleepSchemaError("sleep stream has invalid type")
+        points: list[SleepStreamPoint] = []
+        for row in values[:4096]:
+            if isinstance(row, dict):
+                raw_time = next((row[name] for name in ("timestamp", "time", "startGMT", "readingTimeGMT") if name in row), None)
+                raw_value = next((row[name] for name in ("value", metric, "heartRate", "hrvValue", "stressLevel", "spO2", "spo2") if name in row), None)
+            elif isinstance(row, list) and len(row) >= 2:
+                raw_time, raw_value = row[0], row[1]
+            else:
+                raise SleepSchemaError("sleep stream point has invalid type")
+            parsed_time = _parse_time(raw_time)
+            if raw_value is not None and (isinstance(raw_value, bool) or not isinstance(raw_value, int | float)):
+                raise SleepSchemaError("sleep stream value has invalid type")
+            points.append(SleepStreamPoint(parsed_time, raw_time, None if raw_value is None else float(raw_value)))
+        result.append(SleepStream(metric, tuple(points)))
+    return tuple(result)
+
+
 def _score(payload: dict[str, Any]) -> dict[str, Any]:
     raw = payload.get("sleepScores", payload.get("score", {}))
     if raw is None:
@@ -154,6 +212,7 @@ def parse_sleep_sessions(payload: Any, target_date: date) -> tuple[SleepSession,
             "feedback": item.get("feedback"),
             "restless_events": item.get("restlessEvents"),
             "stages": item.get("sleepLevels"),
+            "streams": {key: item.get(key) for aliases in _STREAM_FIELDS.values() for key in aliases if key in item},
         }
         revision = hashlib.sha256(
             json.dumps(revision_payload, sort_keys=True, separators=(",", ":"), default=str).encode()
@@ -162,6 +221,7 @@ def parse_sleep_sessions(payload: Any, target_date: date) -> tuple[SleepSession,
             logical_id, kind, start, end, target_date, revision, _score(item),
             _structured_list(item.get("adjustments")), _structured_list(item.get("feedback")),
             _structured_list(item.get("restlessEvents")), _stage_list(item.get("sleepLevels")),
+            _sleep_streams(item),
         )
     return tuple(sorted(sessions.values(), key=lambda item: (item.start, item.logical_id)))
 
@@ -175,6 +235,13 @@ def session_record(session: SleepSession) -> dict[str, Any]:
         "score": session.score, "adjustments": list(session.adjustments),
         "feedback": list(session.feedback), "restless_events": list(session.restless_events),
         "stages": list(session.stages),
+        "streams": {
+            stream.metric: [
+                {"timestamp": point.timestamp.isoformat(), "raw_timestamp": point.raw_timestamp, "value": point.value}
+                for point in stream.points
+            ]
+            for stream in session.streams
+        },
     }
 
 
@@ -210,6 +277,23 @@ def session_from_record(record: dict[str, Any]) -> SleepSession:
         bounded_score = _bounded_structured(score)
         if not isinstance(bounded_score, dict):
             raise SleepSchemaError("sleep Store record is invalid")
+        raw_streams = record.get("streams", {})
+        if not isinstance(raw_streams, dict):
+            raise SleepSchemaError("sleep Store record is invalid")
+        streams: list[SleepStream] = []
+        for metric, points in raw_streams.items():
+            if metric not in _STREAM_FIELDS or not isinstance(points, list):
+                raise SleepSchemaError("sleep Store record is invalid")
+            restored_points = []
+            for point in points:
+                if not isinstance(point, dict):
+                    raise SleepSchemaError("sleep Store record is invalid")
+                timestamp = _parse_time(point["timestamp"])
+                value = point["value"]
+                if value is not None and (isinstance(value, bool) or not isinstance(value, int | float)):
+                    raise SleepSchemaError("sleep Store record is invalid")
+                restored_points.append(SleepStreamPoint(timestamp, point["raw_timestamp"], None if value is None else float(value)))
+            streams.append(SleepStream(metric, tuple(restored_points)))
         return SleepSession(
             logical_id=logical_id, kind=kind, start=start, end=end,
             calendar_date=calendar_date, revision=revision, score=bounded_score,
@@ -217,6 +301,7 @@ def session_from_record(record: dict[str, Any]) -> SleepSession:
             feedback=_structured_list(record["feedback"]),
             restless_events=_structured_list(record["restless_events"]),
             stages=_stage_list(record.get("stages")),
+            streams=tuple(streams),
         )
     except (KeyError, TypeError, ValueError) as err:
         raise SleepSchemaError("sleep Store record is invalid") from err

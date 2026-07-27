@@ -130,3 +130,26 @@ def test_sleep_logical_id_canonicalizes_equivalent_offsets() -> None:
     )[0]
     assert first.logical_id == second.logical_id
     assert first.start.isoformat() != second.start.isoformat()
+
+
+def test_sleep_parser_preserves_sanitized_high_resolution_streams() -> None:
+    point_rows = [["2026-07-24T23:55:00Z", 60], ["2026-07-25T00:05:00Z", None], ["2026-07-24T23:50:00Z", 60]]
+    payload = {
+        "startTime": "2026-07-24T23:45:00Z",
+        "endTime": "2026-07-25T07:15:00Z",
+        "sleepHeartRate": point_rows,
+        "hrvData": point_rows,
+        "sleepBodyBattery": point_rows,
+        "sleepStress": [["2026-07-25T00:00:00Z", -1], ["2026-07-25T00:01:00Z", 0]],
+        "sleepRespiration": point_rows,
+        "sleepSpO2": point_rows,
+        "sleepMovement": point_rows,
+    }
+    session = parse_sleep_sessions(payload, date(2026, 7, 24))[0]
+    assert {stream.metric for stream in session.streams} == {
+        "heart_rate", "hrv", "body_battery", "stress", "respiration", "spo2", "movement",
+    }
+    assert session.streams[0].points[0].timestamp.tzinfo is not None
+    assert session.streams[0].points[1].value is None
+    assert session_record(session)["streams"]["heart_rate"]
+    assert session_from_record(session_record(session)) == session
