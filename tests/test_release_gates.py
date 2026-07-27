@@ -62,6 +62,33 @@ def test_each_family_has_all_sanitized_release_states() -> None:
             assert fixture["_redaction_version"] == "3.1.0-beta.1"
             assert isinstance(fixture["_provenance"], str)
             assert FAMILY_MARKERS[stem] in fixture
+            result = _dispatch_fixture_contract(stem, state, fixture)
+            assert result in {"success", "empty", "schema-drift"}
+
+
+def _dispatch_fixture_contract(stem: str, state: str, fixture: dict) -> str:
+    """Run the bounded family contract for each release fixture state."""
+    marker = FAMILY_MARKERS[stem]
+    payload = fixture[marker]
+    if state == "sparse":
+        assert payload in ({}, [], None)
+        return "empty"
+    if state == "schema_drift":
+        assert fixture.get("unknown_structural_field") == "redacted"
+        return "schema-drift"
+    assert payload not in ({}, [], None)
+    if stem == "garmin_fit_structural_summary":
+        assert isinstance(payload.get("message_counts"), dict)
+        assert isinstance(payload.get("message_fields"), dict)
+    elif stem == "garmin_activity_archive":
+        assert isinstance(payload, dict) and ("activityType" in payload or "activityTypeKey" in payload)
+    elif stem == "garmin_health_events":
+        assert isinstance(payload, list) and payload and isinstance(payload[0], dict)
+    elif stem == "garmin_summary_training":
+        assert isinstance(payload, dict) and "calendarDate" in payload
+    else:
+        assert isinstance(payload, (dict, list))
+    return "success"
 
 
 def test_release_metadata_targets_beta_and_core_gate() -> None:

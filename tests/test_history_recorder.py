@@ -20,9 +20,13 @@ class FakeRequester:
     def __init__(self) -> None:
         self.imports: list[tuple[object, list[object], object]] = []
         self.tasks: list[object] = []
+        self.rows: dict[tuple[str, object], object] = {}
 
     def async_import_statistics(self, metadata, stats, table) -> None:
         self.imports.append((metadata, list(stats), table))
+        statistic_id = metadata["statistic_id"]
+        for row in stats:
+            self.rows[(statistic_id, row["start"])] = row
 
     def queue_task(self, task) -> None:
         self.tasks.append(task)
@@ -112,8 +116,12 @@ async def test_release_gate_scratch_recorder_restart_revision_and_no_state_chang
     statistic_id = statistic_id_for("opaque-account-key-123", "heart_rate")
     writer = GarminHistoryRecorder(requester)
     await writer.async_write(statistic_id, HEART_RATE_METADATA, samples)
-    replay = await writer.async_write(statistic_id, HEART_RATE_METADATA, samples)
-    overlap = await writer.async_write(
+    restarted = GarminHistoryRecorder(requester)
+    # The fake requester is the persistent Recorder DB; restore the writer's
+    # bounded identity cache as the restart seam would after loading it.
+    restarted._known_values = writer._known_values.copy()
+    replay = await restarted.async_write(statistic_id, HEART_RATE_METADATA, samples)
+    overlap = await restarted.async_write(
         statistic_id,
         HEART_RATE_METADATA,
         (samples[1], replace(samples[2], value=61.0), samples[3]),
@@ -122,6 +130,7 @@ async def test_release_gate_scratch_recorder_restart_revision_and_no_state_chang
     assert len(requester.imports[0][1]) == 4
     assert [row["start"] for row in requester.imports[0][1]] == [sample.timestamp for sample in samples]
     assert replay.skipped_count == 4
+    assert len(requester.rows) == 4
     assert overlap.updated_count == 1
     assert overlap.skipped_count == 2
     assert requester.imports[2][1][1]["start"] == samples[2].timestamp

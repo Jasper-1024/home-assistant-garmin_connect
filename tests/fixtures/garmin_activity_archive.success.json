@@ -1,1 +1,1 @@
-{"_provenance":"Sanitized activity success state; no route, coordinates, measurements, or credentials.","_redaction_version":"3.1.0-beta.1","state":"success","lastActivity":{"activityType":"running","startTime":"2026-07-24T23:30:00Z","durationInSeconds":3600}}
+{"_provenance":"Sanitized activity success state; no route, coordinates, measurements, or credentials.","_redaction_version":"3.1.0-beta.1","state":"success","lastActivity":{"activityType":"running","startTime":"2026-07-24T23:30:00Z","durationInSeconds":null}}
