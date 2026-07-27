@@ -85,6 +85,8 @@ def test_normalize_stress_excludes_negative_quality_codes_but_keeps_zero_and_nul
         value_keys=("stressLevel",),
         exclude_negative=True,
     )
+    assert len(samples) == 1
+    assert samples[0].value == 0
 
 
 def test_normalize_health_events_preserves_explicit_fields_only() -> None:
@@ -95,10 +97,6 @@ def test_normalize_health_events_preserves_explicit_fields_only() -> None:
     assert events[0].start is not None and events[0].end is not None
     assert events[1].event_type == "abnormalHeartRate"
     assert events[1].occurrence is not None
-
-    assert len(samples) == 1
-    assert samples[0].value == 0
-
 
 def test_normalize_pair_series_rejects_incompatible_known_series() -> None:
     """A changed known field fails only this family/date."""
