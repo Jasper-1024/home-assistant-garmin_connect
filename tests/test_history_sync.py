@@ -775,10 +775,19 @@ async def test_valid_fit_survives_restart_revalidation(tmp_path: Path, monkeypat
     partition = _NamedStore({"account_key": "opaque-account-key-1234567890", "schema_version": 1, "sleep_schema_version": 1, "year": "2026", "sessions": {}, "events": {}, "activities": {activity.logical_id: activity_record}, "fits": {activity.logical_id: {"logical_id": activity.logical_id, "path": fit_path.name, "summary": summary}}})
     stores = {"garmin_connect.e.history_catalog": catalog, "garmin_connect.e.sleep_2026": partition}
     archive = _partition_archive(MagicMock(), MagicMock(), stores)
-    archive._hass.config.path.return_value = str(tmp_path)
-    monkeypatch.setattr(history_module, "inspect_fit", lambda path, mode: {**summary, "file": {"integrity_ok": True, "decode_ok": True}})
+    archive._hass.config.path.side_effect = lambda *parts: str(tmp_path.joinpath(*parts[2:]))
+    inspected_paths: list[Path] = []
+
+    def inspect_valid_fit(path: Path, mode: int) -> dict[str, object]:
+        inspected_paths.append(path)
+        assert path == fit_path
+        assert mode == 0o600
+        return {**summary, "file": {"integrity_ok": True, "decode_ok": True}}
+
+    monkeypatch.setattr(history_module, "inspect_fit", inspect_valid_fit)
     await archive.async_start()
     await archive._async_load_sleep_partitions({"2026"})
+    assert inspected_paths == [fit_path]
     assert activity.logical_id in archive._fit_archives["2026"]
     assert partition.data["fits"][activity.logical_id]["logical_id"] == activity.logical_id
 
