@@ -709,7 +709,7 @@ class GarminHistoryArchive:
                     end = datetime.fromisoformat(record["end"]) if record.get("end") else None
                     occurrence = datetime.fromisoformat(record["occurrence"]) if record.get("occurrence") else start
                     point = occurrence or start
-                    if start is not None and end is not None and start_date <= point.date() <= end_date:
+                    if start is not None and end is not None and start_date <= start.date() <= end_date:
                         summary = str(record.get("category") or record.get("event_type") or "Health event")[:64]
                         events[(start, end, summary)] = HistoryCalendarEvent(start, end, summary)
             return tuple(sorted(events.values(), key=lambda event: event.start))
