@@ -14,6 +14,7 @@ from custom_components.garmin_connect.history_source import (
     HistorySchemaError,
     health_event_from_record,
     health_event_record,
+    normalize_activities,
     normalize_body_battery,
     normalize_floors,
     normalize_health_events,
