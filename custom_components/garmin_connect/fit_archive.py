@@ -8,7 +8,7 @@ import os
 import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, cast
 
 
 class FitArchiveError(ValueError):
@@ -23,7 +23,8 @@ def inspect_fit(path: Path, required_mode: int = 0o600) -> dict[str, Any]:
         raise FitArchiveError("FIT inspector unavailable")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.inspect_fit(path, required_mode)
+    inspector = cast(Callable[[Path, int], dict[str, Any]], module.inspect_fit)
+    return inspector(path, required_mode)
 
 
 def fit_file_name(logical_id: str) -> str:
