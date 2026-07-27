@@ -216,7 +216,7 @@ def session_from_record(record: dict[str, Any]) -> SleepSession:
             adjustments=_structured_list(record["adjustments"]),
             feedback=_structured_list(record["feedback"]),
             restless_events=_structured_list(record["restless_events"]),
-            stages=_stage_list(record["stages"]),
+            stages=_stage_list(record.get("stages")),
         )
     except (KeyError, TypeError, ValueError) as err:
         raise SleepSchemaError("sleep Store record is invalid") from err

@@ -94,6 +94,18 @@ def test_sleep_record_restore_rejects_corrupt_identity_and_fields() -> None:
             session_from_record(corrupt)
 
 
+def test_sleep_record_restore_accepts_legacy_record_without_stages() -> None:
+    session = parse_sleep_sessions(
+        {"startTime": "2026-07-24T00:00:00Z", "endTime": "2026-07-24T08:00:00Z"},
+        date(2026, 7, 24),
+    )[0]
+    legacy_record = session_record(session)
+    del legacy_record["stages"]
+    restored = session_from_record(legacy_record)
+    assert restored.stages == ()
+    assert restored.logical_id == session.logical_id
+
+
 def test_sleep_parser_handles_leap_day_and_overlap_identity() -> None:
     first = parse_sleep_sessions(
         {"startTime": "2028-02-29T22:00:00Z", "endTime": "2028-03-01T06:00:00Z"},
