@@ -1,1 +1,1 @@
-{"_provenance":"Sanitized respiration and SpO2 success state; no raw measurements.","_redaction_version":"3.1.0-beta.1","state":"success"}
+{"_provenance":"Sanitized respiration and SpO2 success state; no raw measurements.","_redaction_version":"3.1.0-beta.1","state":"success","respiration":{"respirationValueDescriptorsDTOList":[{"key":"timestamp","index":0}]},"spo2":{"continuousReadingDTOList":[]}}

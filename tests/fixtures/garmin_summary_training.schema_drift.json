@@ -1,1 +1,1 @@
-{"_provenance":"Sanitized summary/training schema-drift state; unknown structural field only.","_redaction_version":"3.1.0-beta.1","state":"schema_drift","unknown_structural_field":"redacted"}
+{"_provenance":"Sanitized summary/training schema-drift state; unknown structural field only.","_redaction_version":"3.1.0-beta.1","state":"schema_drift","daily_summary":{"calendar_date":"2026-07-24"},"training_status":{"calendarDate":"2026-07-24"},"unknown_structural_field":"redacted"}

@@ -1,1 +1,1 @@
-{"_provenance":"Sanitized health-event schema-drift state; unknown structural field only.","_redaction_version":"3.1.0-beta.1","state":"schema_drift","unknown_structural_field":"redacted"}
+{"_provenance":"Sanitized health-event schema-drift state; unknown structural field only.","_redaction_version":"3.1.0-beta.1","state":"schema_drift","events":[{"sourceName":"GARMIN","eventType":"abnormalHeartRate","eventTime":"2026-07-24T23:00:00Z"}],"unknown_structural_field":"redacted"}

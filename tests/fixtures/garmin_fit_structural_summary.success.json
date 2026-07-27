@@ -1,1 +1,1 @@
-{"_provenance":"Sanitized FIT structural success state; message inventory only, no raw values.","_redaction_version":"3.1.0-beta.1","state":"success"}
+{"_provenance":"Sanitized FIT structural success state; message inventory only, no raw values.","_redaction_version":"3.1.0-beta.1","state":"success","summary":{"message_counts":{"record":4},"message_fields":{"record":["timestamp"]}}}

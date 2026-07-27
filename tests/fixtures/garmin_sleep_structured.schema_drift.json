@@ -1,1 +1,1 @@
-{"_provenance":"Sanitized structured-sleep schema-drift state; unknown structural field only.","_redaction_version":"3.1.0-beta.1","state":"schema_drift","unknown_structural_field":"redacted"}
+{"_provenance":"Sanitized structured-sleep schema-drift state; unknown structural field only.","_redaction_version":"3.1.0-beta.1","state":"schema_drift","sleepData":{"calendar_date":"2026-02-28","sleepScores":{"overall":{"value":82}},"sleepLevels":[]},"unknown_structural_field":"redacted"}

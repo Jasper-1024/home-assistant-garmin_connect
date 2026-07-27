@@ -97,6 +97,8 @@ def test_new_series_have_distinct_stable_statistic_ids() -> None:
 @pytest.mark.asyncio
 async def test_release_gate_scratch_recorder_restart_revision_and_no_state_changed() -> None:
     """Release contract: raw points converge without state_changed replay."""
+    from homeassistant.components.recorder.tasks import SynchronizeTask
+
     requester = FakeRequester()
     samples = tuple(
         NormalizedSample(
@@ -108,14 +110,22 @@ async def test_release_gate_scratch_recorder_restart_revision_and_no_state_chang
         for minute in range(4)
     )
     statistic_id = statistic_id_for("opaque-account-key-123", "heart_rate")
-    await GarminHistoryRecorder(requester).async_write(statistic_id, HEART_RATE_METADATA, samples)
-    await GarminHistoryRecorder(requester).async_write(
-        statistic_id, HEART_RATE_METADATA, (replace(samples[2], value=61.0),)
+    writer = GarminHistoryRecorder(requester)
+    await writer.async_write(statistic_id, HEART_RATE_METADATA, samples)
+    replay = await writer.async_write(statistic_id, HEART_RATE_METADATA, samples)
+    overlap = await writer.async_write(
+        statistic_id,
+        HEART_RATE_METADATA,
+        (samples[1], replace(samples[2], value=61.0), samples[3]),
     )
 
     assert len(requester.imports[0][1]) == 4
     assert [row["start"] for row in requester.imports[0][1]] == [sample.timestamp for sample in samples]
-    assert requester.imports[1][1][0]["start"] == samples[2].timestamp
-    assert requester.imports[1][1][0]["mean"] == 61.0
-    assert len(requester.tasks) == 2
+    assert replay.skipped_count == 4
+    assert overlap.updated_count == 1
+    assert overlap.skipped_count == 2
+    assert requester.imports[2][1][1]["start"] == samples[2].timestamp
+    assert requester.imports[2][1][1]["mean"] == 61.0
+    assert all(isinstance(task, SynchronizeTask) for task in requester.tasks)
+    assert len(requester.tasks) == 3
     assert all("state_changed" not in row for _, rows, _ in requester.imports for row in rows)

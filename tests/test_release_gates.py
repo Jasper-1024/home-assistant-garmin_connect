@@ -3,19 +3,20 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import date
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from custom_components.garmin_connect.diagnostics import async_get_config_entry_diagnostics
 from custom_components.garmin_connect.history import (
+    GarminHistoryArchive,
     HistoryArchiveState,
-    HistoryCalendarEvent,
     HistoryStatus,
     HistorySyncReport,
 )
+from custom_components.garmin_connect.services import async_setup_services
 
 ROOT = Path(__file__).parents[1]
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -30,6 +31,16 @@ FROZEN_FIXTURES = (
     "garmin_summary_training.json",
 )
 STATES = ("success", "sparse", "schema_drift")
+FAMILY_MARKERS = {
+    "garmin_activity_archive": "lastActivity",
+    "garmin_fit_structural_summary": "summary",
+    "garmin_health_events": "events",
+    "garmin_respiration_spo2": "respiration",
+    "garmin_segmented_charts": "steps",
+    "garmin_sleep_streams": "sleepHeartRate",
+    "garmin_sleep_structured": "sleepData",
+    "garmin_summary_training": "daily_summary",
+}
 
 
 def test_frozen_fixtures_have_provenance_and_redaction_version() -> None:
@@ -50,6 +61,7 @@ def test_each_family_has_all_sanitized_release_states() -> None:
             fixture = json.loads((FIXTURES / f"{stem}.{state}.json").read_text())
             assert fixture["_redaction_version"] == "3.1.0-beta.1"
             assert isinstance(fixture["_provenance"], str)
+            assert FAMILY_MARKERS[stem] in fixture
 
 
 def test_release_metadata_targets_beta_and_core_gate() -> None:
@@ -72,7 +84,7 @@ def test_fixture_text_has_no_obvious_credentials_or_route_payloads() -> None:
 
 
 def _assert_private_snapshot(value: object) -> None:
-    forbidden = {"token", "refresh_token", "client_id", "account_key", "email", "address", "gps", "latitude", "longitude", "measurement", "measurements", "array", "values"}
+    forbidden = {"token", "refresh_token", "client_id", "account_key", "opaque-account", "email", "address", "gps", "latitude", "longitude", "measurement", "measurements", "array", "values"}
     if isinstance(value, dict):
         assert not forbidden.intersection(value)
         for item in value.values():
@@ -86,7 +98,13 @@ def _assert_private_snapshot(value: object) -> None:
 
 @pytest.mark.asyncio
 async def test_release_privacy_snapshots_cover_diagnostics_status_action_and_calendars() -> None:
-    status = HistoryStatus(HistoryArchiveState.IDLE, current_date="2026-07-24").as_attributes()
+    archive = object.__new__(GarminHistoryArchive)
+    archive._status = HistoryStatus(HistoryArchiveState.IDLE, current_date="2026-07-24")
+    archive._sleep_sessions = {"2026": {"sleep": {"start": "2026-07-24T22:00:00+00:00", "end": "2026-07-25T06:00:00+00:00", "kind": "main"}}}
+    archive._health_events = {"2026": {"health": {"start": "2026-07-24T10:00:00+00:00", "end": "2026-07-24T10:15:00+00:00", "category": "activity", "event_type": "event"}}}
+    archive._activities = {"2026": {"activity": {"start": "2026-07-24T12:00:00+00:00", "end": "2026-07-24T13:00:00+00:00", "name": "Activity"}}}
+    archive._async_load_sleep_partitions = AsyncMock()
+    status = archive.status.as_attributes()
     report = HistorySyncReport(outcome="written")
     action_response = {
         "outcome": report.outcome,
@@ -97,13 +115,29 @@ async def test_release_privacy_snapshots_cover_diagnostics_status_action_and_cal
         "skipped_count": report.skipped_count,
         "error_type": report.error_type,
     }
-    start = datetime(2026, 7, 24, tzinfo=UTC)
-    calendars = {
-        name: (HistoryCalendarEvent(start, start, name),)
+    calendar_events = {
+        name: await archive.async_get_calendar_events(name, date(2026, 7, 24), date(2026, 7, 25))
         for name in ("sleep", "health", "activity")
+    }
+    calendars = {
+        name: tuple(
+            {"start": event.start.isoformat(), "end": event.end.isoformat(), "summary": event.summary}
+            for event in events
+        )
+        for name, events in calendar_events.items()
     }
     entry = MagicMock(data={"history_account_key": "opaque-account-key"}, runtime_data=MagicMock())
     entry.runtime_data.core = MagicMock(data={}, last_update_success=True, update_interval=None)
-    with patch("custom_components.garmin_connect.diagnostics.fields", return_value=[]):
+    entry.runtime_data.history_archive = archive
+    hass = MagicMock()
+    hass.config_entries.async_entries.return_value = [entry]
+    await async_setup_services(hass)
+    handler = next(call[0][2] for call in hass.services.async_register.call_args_list if call[0][1] == "sync_history")
+    call = MagicMock(data={"date": date(2026, 7, 24)})
+    archive.async_sync_range = AsyncMock(return_value=report)
+    action_response = await handler(call)
+    history_field = MagicMock()
+    history_field.name = "history_archive"
+    with patch("custom_components.garmin_connect.diagnostics.fields", return_value=[history_field]):
         diagnostics = await async_get_config_entry_diagnostics(MagicMock(), entry)
     _assert_private_snapshot({"diagnostics": diagnostics, "status": status, "action": action_response, "calendars": calendars})
