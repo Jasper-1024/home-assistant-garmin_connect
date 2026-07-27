@@ -6,7 +6,7 @@ import asyncio
 import inspect
 import logging
 import secrets
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
 from enum import StrEnum
@@ -757,12 +757,32 @@ class GarminHistoryArchive:
                 self._health_events = events_by_year
                 self._activities = activities_by_year
                 if fit_deferred:
+                    # The annual partitions are durable, but the date is not:
+                    # publish their indexes so a restart can restore the
+                    # already archived FIT and continue the deferred batch.
+                    await store.async_save(
+                        self._catalog_record(
+                            completed_dates=self._completed_dates,
+                            presence=presence,
+                            sessions_by_year=sleep_sessions,
+                            events_by_year=events_by_year,
+                            activities_by_year=activities_by_year,
+                        )
+                    )
                     self._runtime_sync_failure = True
                     self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, error_type="fit_limit_pending", **self._backfill_status_fields())
                     return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome="failed", error_type="fit_limit_pending")
                 # Publish the catalog checkpoint only after every affected annual
                 # partition is durable. A failed partition save must be replayed.
-                await store.async_save({"schema_version": HISTORY_STORE_VERSION, "sleep_schema_version": _SLEEP_SCHEMA_VERSION, "account_key": self._account_key(), "completed_dates": sorted(completed_dates), "hrv_summaries": self._hrv_summaries, "presence": presence, "sleep_index": {year: sorted(records) for year, records in sleep_sessions.items()}, "event_index": {year: sorted(records) for year, records in events_by_year.items()}, "activity_index": {year: sorted(records) for year, records in activities_by_year.items()}})
+                await store.async_save(
+                    self._catalog_record(
+                        completed_dates=completed_dates,
+                        presence=presence,
+                        sessions_by_year=sleep_sessions,
+                        events_by_year=events_by_year,
+                        activities_by_year=activities_by_year,
+                    )
+                )
                 self._completed_dates = completed_dates
                 self._presence = presence
             except asyncio.CancelledError:
@@ -775,6 +795,28 @@ class GarminHistoryArchive:
         self._runtime_sync_failure = False
         self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=end_date.isoformat(), processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
         return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome="written")
+
+    def _catalog_record(
+        self,
+        *,
+        completed_dates: Collection[str],
+        presence: Mapping[str, Any],
+        sessions_by_year: Mapping[str, Mapping[str, dict[str, Any]]],
+        events_by_year: Mapping[str, Mapping[str, dict[str, Any]]],
+        activities_by_year: Mapping[str, Mapping[str, dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Build a bounded catalog record after partitions are durable."""
+        return {
+            "schema_version": HISTORY_STORE_VERSION,
+            "sleep_schema_version": _SLEEP_SCHEMA_VERSION,
+            "account_key": self._account_key(),
+            "completed_dates": sorted(completed_dates),
+            "hrv_summaries": self._hrv_summaries,
+            "presence": presence,
+            "sleep_index": {year: sorted(records) for year, records in sessions_by_year.items()},
+            "event_index": {year: sorted(records) for year, records in events_by_year.items()},
+            "activity_index": {year: sorted(records) for year, records in activities_by_year.items()},
+        }
 
     async def _async_save_sleep_partitions(
         self, sessions_by_year: Mapping[str, Mapping[str, dict[str, Any]]],
