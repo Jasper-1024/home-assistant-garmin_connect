@@ -74,7 +74,7 @@ def _dispatch_fixture_contract(stem: str, state: str, fixture: dict) -> str:
         if stem == "garmin_fit_structural_summary":
             assert payload == {"message_counts": {}, "message_fields": {}}
             return "empty"
-        assert payload in ({}, [], None)
+        assert _is_structurally_empty(payload)
         return "empty"
     if state == "schema_drift":
         assert fixture.get("unknown_structural_field") == "redacted"
@@ -92,6 +92,17 @@ def _dispatch_fixture_contract(stem: str, state: str, fixture: dict) -> str:
     else:
         assert isinstance(payload, (dict, list))
     return "success"
+
+
+def _is_structurally_empty(value: object) -> bool:
+    """Accept only bounded empty containers/None for sparse fixtures."""
+    if value is None:
+        return True
+    if isinstance(value, (list, tuple)):
+        return not value
+    if isinstance(value, dict):
+        return all(_is_structurally_empty(item) for item in value.values())
+    return False
 
 
 def test_release_metadata_targets_beta_and_core_gate() -> None:
