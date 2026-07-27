@@ -7,7 +7,6 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-
 _PRESENCE_RULES: dict[str, tuple[str, ...]] = {
     "heart_rate": ("heart_rate",),
     "temperature": ("temperature",),
