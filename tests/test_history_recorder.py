@@ -7,6 +7,8 @@ import pytest
 
 from custom_components.garmin_connect.history_recorder import (
     HEART_RATE_METADATA,
+    RESPIRATION_RAW_METADATA,
+    SPO2_SINGLE_METADATA,
     STRESS_METADATA,
     GarminHistoryRecorder,
     statistic_id_for,
@@ -79,3 +81,14 @@ async def test_revisions_are_sent_idempotently() -> None:
 
     result = await writer.async_write(statistic_id, STRESS_METADATA, (replace(sample, value=62.0),))
     assert (result.inserted_count, result.updated_count, result.skipped_count) == (0, 1, 0)
+
+
+def test_new_series_have_distinct_stable_statistic_ids() -> None:
+    """Respiration and SpO2 variants cannot collide in Recorder."""
+    account_key = "opaque-account-key-123"
+    ids = {
+        statistic_id_for(account_key, RESPIRATION_RAW_METADATA.key),
+        statistic_id_for(account_key, SPO2_SINGLE_METADATA.key),
+    }
+    assert len(ids) == 2
+    assert all("opaque-account-key" not in value for value in ids)

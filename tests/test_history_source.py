@@ -218,3 +218,7 @@ def test_respiration_and_spo2_fixture_variants_preserve_revisions_and_sparse_ser
     assert single.readings[0].value == 98
     assert continuous.readings[0].value == 96
     assert hourly.readings[0].value == 95
+    assert respiration.presence == "present"
+    assert average.presence == "present"
+    assert normalize_respiration({"respirationValuesArray": None}, date(2026, 7, 24)).presence == "returned-empty"
+    assert normalize_respiration({}, date(2026, 7, 24)).presence == "unsupported"
