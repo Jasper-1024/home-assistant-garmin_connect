@@ -164,10 +164,8 @@ _STRUCTURED_FAMILIES = (
 )
 _FROZEN_ARCHIVE_FAMILIES = tuple(
     family for family, _metadata in _NUMERIC_FAMILY_METADATA
-) + _STRUCTURED_FAMILIES
-# Sleep stream writes are a structured reconciliation family, but remain an
-# internal ledger concern rather than a new public archive catalog export.
-_RECONCILIATION_FAMILIES = _FROZEN_ARCHIVE_FAMILIES + ("sleep_stream",)
+) + _STRUCTURED_FAMILIES + ("sleep_stream",)
+_RECONCILIATION_FAMILIES = _FROZEN_ARCHIVE_FAMILIES
 _RECONCILIATION_EXPLICIT_EMPTY_STATES = frozenset(
     {"empty", "all-null", "null", "returned-empty", "absent"}
 )
@@ -470,6 +468,43 @@ def _aggregate_sleep_presence(
             else "present" if "present" in distinct else "mixed"
         )
     return aggregate
+
+
+def _sleep_stream_observation(
+    sleep_details: tuple[SleepSession, ...],
+) -> _FamilyObservation:
+    """Build one reconciliation observation for the raw sleep-stream family."""
+    streams = tuple(
+        (session.logical_id, stream)
+        for session in sleep_details
+        for stream in session.streams
+    )
+    if not sleep_details:
+        presence = "empty"
+    elif not streams:
+        presence = "missing"
+    else:
+        stream_states = {stream.presence for _session_id, stream in streams}
+        if "present" in stream_states:
+            presence = "present"
+        elif "all-null" in stream_states:
+            presence = "all-null"
+        elif "null" in stream_states:
+            presence = "null"
+        else:
+            presence = "empty"
+    has_records = any(
+        point.value is not None
+        and point.value not in _SLEEP_NEGATIVE_SENTINELS.get(stream.metric, frozenset())
+        for _session_id, stream in streams
+        for point in stream.points
+    )
+    return _FamilyObservation(
+        streams,
+        presence,
+        _fingerprint_details(streams),
+        has_records,
+    )
 
 
 class HistoryArchiveState(StrEnum):
@@ -1720,31 +1755,22 @@ class GarminHistoryArchive:
                             outcome="failed",
                         )
                         continue
-                    except GarminConnectError:
+                    except (
+                        GarminConnectError,
+                        AttributeError,
+                        ImportError,
+                        OSError,
+                        TypeError,
+                        ValueError,
+                        RuntimeError,
+                    ) as error:
                         failed_families.add(metric)
-                        failed_family_error = "garmin_client_error"
                         presence.setdefault(target_key, {})[metric] = "failed"
+                        failed_family_error = _safe_family_error_type(error)
                         family_observations.record_failure(metric, failed_family_error)
                         _LOGGER.warning(
                             "Garmin numeric family failed for %s (%s)", target_key, metric
                         )
-                        await self._async_checkpoint_observation(
-                            target,
-                            target_key,
-                            family_observations,
-                            checkpoint,
-                            outcome="failed",
-                        )
-                        continue
-                    except (AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError) as error:
-                        failed_families.add(metric)
-                        presence.setdefault(target_key, {})[metric] = "failed"
-                        failed_family_error = "sync_failed"
-                        family_observations.record_failure(metric, failed_family_error)
-                        _LOGGER.warning(
-                            "Garmin numeric family failed for %s (%s)", target_key, metric
-                        )
-                        del error
                         await self._async_checkpoint_observation(
                             target,
                             target_key,
@@ -1785,13 +1811,38 @@ class GarminHistoryArchive:
                     ),
                 )
                 sleep_details = sleep_observation.details
-                if sleep_observation.presence == "failed":
-                    failed_families.add("sleep_sessions")
-                    failed_family_error = sleep_observation.error_type or "sync_failed"
-                if not isinstance(sleep_details, tuple) or any(not isinstance(item, SleepSession) for item in sleep_details):
+                if sleep_observation.presence in (
+                    _RECONCILIATION_UNAVAILABLE_STATES - {"unknown"}
+                ):
+                    sleep_details = ()
+                    if sleep_observation.presence == "failed":
+                        failed_families.add("sleep_sessions")
+                        failed_family_error = sleep_observation.error_type or "sync_failed"
+                        family_observations.record_failure(
+                            "sleep_stream", failed_family_error
+                        )
+                    else:
+                        family_observations.record(
+                            "sleep_stream",
+                            _FamilyObservation(
+                                (),
+                                sleep_observation.presence,
+                                _fingerprint_details(
+                                    {
+                                        "family": "sleep_stream",
+                                        "presence": sleep_observation.presence,
+                                    }
+                                ),
+                                False,
+                            ),
+                        )
+                elif not isinstance(sleep_details, tuple) or any(
+                    not isinstance(item, SleepSession) for item in sleep_details
+                ):
                     failed_families.add("sleep_sessions")
                     failed_family_error = "sync_failed"
                     family_observations.record_failure("sleep_sessions", failed_family_error)
+                    family_observations.record_failure("sleep_stream", failed_family_error)
                     sleep_details = ()
                     await self._async_checkpoint_observation(
                         target,
@@ -1799,6 +1850,10 @@ class GarminHistoryArchive:
                         family_observations,
                         checkpoint,
                         outcome="failed",
+                    )
+                else:
+                    family_observations.record(
+                        "sleep_stream", _sleep_stream_observation(sleep_details)
                     )
                 invalid_sleep_streams: set[tuple[str, str]] = set()
                 for session in sleep_details:

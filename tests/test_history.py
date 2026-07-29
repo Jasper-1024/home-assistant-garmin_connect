@@ -382,11 +382,117 @@ async def test_empty_archive_date_settles_as_missing_at_window_boundary() -> Non
     await _wait_for_remote_requests(source, 19)
     await _run_reconciliation_cycle(archive, timer, source)
     assert source.requested.count(target) == 19
+    assert store.data["reconciliation_family_presence"][target.isoformat()][
+        "sleep_stream"
+    ] == "empty"
 
     now[0] = datetime(2026, 8, 8, tzinfo=UTC)
     await _run_reconciliation_cycle(archive, timer, source)
 
     assert source.requested.count(target) == 19
+    await archive.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_missing_sleep_stream_keeps_reconciliation_date_open() -> None:
+    """A sleep session without its raw stream family cannot settle a date."""
+    target = date(2026, 8, 4)
+    sleep_session = SleepSession(
+        "sleep-id",
+        "main_sleep",
+        datetime(2026, 8, 4, 0, tzinfo=UTC),
+        datetime(2026, 8, 4, 8, tzinfo=UTC),
+        target,
+        "sleep-revision",
+        {},
+        (),
+        (),
+        (),
+    )
+
+    class MissingSleepStreamSource(ReconciliationSource):
+        async def async_fetch_details(self, target_date: date, metric: str) -> object:
+            if metric == "sleep_sessions" and target_date == target:
+                return (sleep_session,)
+            return await super().async_fetch_details(target_date, metric)
+
+    source = MissingSleepStreamSource({})
+    now = [datetime(2026, 8, 5, tzinfo=UTC)]
+    timer = DeterministicTimer()
+    archive = _enabled_reconciliation_archive(store := _reconciliation_store(target), source, now, timer)
+
+    await archive.async_start()
+    await _wait_for_remote_requests(source, 19)
+    await _run_reconciliation_cycle(archive, timer, source)
+    await _run_reconciliation_cycle(archive, timer, source)
+
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
+    requests_before_window_end = source.requested.count(target)
+    now[0] = datetime(2026, 8, 12, tzinfo=UTC)
+    await _run_reconciliation_cycle(archive, timer, source)
+
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
+    now[0] = datetime(2026, 8, 10, tzinfo=UTC)
+    await _run_reconciliation_cycle(archive, timer, source)
+
+    assert source.requested.count(target) > requests_before_window_end
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
+    await archive.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_successful_sleep_stream_can_settle_after_unchanged_confirmation() -> None:
+    """A complete raw sleep-stream observation participates in settlement."""
+    target = date(2026, 8, 4)
+    sleep_session = SleepSession(
+        "sleep-id",
+        "main_sleep",
+        datetime(2026, 8, 4, 0, tzinfo=UTC),
+        datetime(2026, 8, 4, 8, tzinfo=UTC),
+        target,
+        "sleep-revision",
+        {},
+        (),
+        (),
+        (),
+        streams=(
+            SleepStream(
+                "heart_rate",
+                (
+                    SleepStreamPoint(
+                        datetime(2026, 8, 4, 1, tzinfo=UTC),
+                        "2026-08-04T01:00:00Z",
+                        60.0,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    class SuccessfulSleepStreamSource(ReconciliationSource):
+        async def async_fetch_details(self, target_date: date, metric: str) -> object:
+            if metric == "sleep_sessions" and target_date == target:
+                return (sleep_session,)
+            return await super().async_fetch_details(target_date, metric)
+
+    source = SuccessfulSleepStreamSource({})
+    now = [datetime(2026, 8, 5, tzinfo=UTC)]
+    timer = DeterministicTimer()
+    archive = _enabled_reconciliation_archive(
+        _reconciliation_store(target), source, now, timer
+    )
+
+    await archive.async_start()
+    await _wait_for_remote_requests(source, 19)
+    await _run_reconciliation_cycle(archive, timer, source)
+    first_confirmation_requests = source.requested.count(target)
+
+    await _run_reconciliation_cycle(archive, timer, source)
+    settled_requests = source.requested.count(target)
+    assert settled_requests > first_confirmation_requests
+
+    await _run_reconciliation_cycle(archive, timer, source)
+    assert source.requested.count(target) == settled_requests
     await archive.async_stop()
 
 
