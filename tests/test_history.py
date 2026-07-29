@@ -315,6 +315,36 @@ async def test_reconciliation_requires_one_later_unchanged_confirmation() -> Non
 
 
 @pytest.mark.asyncio
+async def test_settled_date_stays_terminal_after_confirmation_restart_and_next_scheduler() -> None:
+    """An unchanged confirmation settles a date permanently for automatic work."""
+    target = date(2026, 8, 4)
+    store = _reconciliation_store(target)
+    source = ReconciliationSource({target: (72.0,)})
+    now = [datetime(2026, 8, 5, tzinfo=UTC)]
+    timer = DeterministicTimer()
+    archive = _enabled_reconciliation_archive(store, source, now, timer)
+
+    await archive.async_start()
+    await _wait_for_remote_requests(source, 19)
+    await _run_reconciliation_cycle(archive, timer, source)
+    await _run_reconciliation_cycle(archive, timer, source)
+
+    settled_requests = source.requested.count(target)
+    await _run_reconciliation_cycle(archive, timer, source)
+    assert source.requested.count(target) == settled_requests
+    await archive.async_stop()
+
+    now[0] = datetime(2026, 8, 6, tzinfo=UTC)
+    restarted_timer = DeterministicTimer()
+    restarted = _enabled_reconciliation_archive(store, source, now, restarted_timer)
+    await restarted.async_start()
+    await _wait_for_remote_requests(source, len(source.requested) + 19)
+    await _run_reconciliation_cycle(restarted, restarted_timer, source)
+    assert source.requested.count(target) == settled_requests
+    await restarted.async_stop()
+
+
+@pytest.mark.asyncio
 async def test_reconciliation_retries_empty_then_saves_delayed_and_changed_data() -> None:
     target = date(2026, 8, 4)
     store = _reconciliation_store(target)
@@ -597,6 +627,34 @@ async def test_failed_then_empty_observation_remains_open_after_window_end() -> 
     source.fail_target = False
     await _run_reconciliation_cycle(archive, timer, source)
     assert source.requested.count(target) > failed_requests
+
+    now[0] = datetime(2026, 8, 12, tzinfo=UTC)
+    await _run_reconciliation_cycle(archive, timer, source)
+    requests_before_reopen_probe = source.requested.count(target)
+
+    now[0] = datetime(2026, 8, 10, tzinfo=UTC)
+    await _run_reconciliation_cycle(archive, timer, source)
+    assert source.requested.count(target) > requests_before_reopen_probe
+    await archive.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_partial_then_empty_observation_remains_open_after_window_end() -> None:
+    """A later complete-empty response cannot erase prior partial evidence."""
+    target = date(2026, 8, 4)
+    store = _reconciliation_store(target)
+    source = ReconciliationSource({})
+    source.presence[target] = "partial"
+    now = [datetime(2026, 8, 5, tzinfo=UTC)]
+    timer = DeterministicTimer()
+    archive = _enabled_reconciliation_archive(store, source, now, timer)
+
+    await archive.async_start()
+    await _wait_for_remote_requests(source, 19)
+    await _run_reconciliation_cycle(archive, timer, source)
+
+    source.presence.pop(target)
+    await _run_reconciliation_cycle(archive, timer, source)
 
     now[0] = datetime(2026, 8, 12, tzinfo=UTC)
     await _run_reconciliation_cycle(archive, timer, source)

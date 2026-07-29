@@ -120,7 +120,7 @@ _PROSPECTIVE_CYCLE_INTERVAL = timedelta(minutes=15)
 _RECONCILIATION_WINDOW = timedelta(days=7)
 _PROSPECTIVE_CYCLE_FIT_LIMIT = 0
 _DATE_SUMMARY_BUCKET_TIME_ZONE = timezone(timedelta(hours=8))
-_PRESENCE_STATES = frozenset({"null", "empty", "all-null", "missing", "unsupported", "returned-empty", "present", "absent", "failed", "mixed", "unknown"})
+_PRESENCE_STATES = frozenset({"null", "empty", "all-null", "missing", "unsupported", "returned-empty", "present", "absent", "failed", "mixed", "unknown", "partial", "incomplete"})
 # The frozen numeric catalog currently produces 33 base presence keys: 13
 # families, 12 segmented total contexts, and 8 snapshot fields. Seven aggregate
 # sleep-stream states retain date-level availability without session-key growth.
@@ -169,8 +169,16 @@ _RECONCILIATION_EXPLICIT_EMPTY_STATES = frozenset(
     {"empty", "all-null", "null", "returned-empty", "absent"}
 )
 _RECONCILIATION_UNAVAILABLE_STATES = frozenset(
-    {"missing", "failed", "unsupported", "unknown"}
+    {"missing", "failed", "unsupported", "unknown", "partial", "incomplete"}
 )
+_RECONCILIATION_EVIDENCE_RANK = {
+    "failed": 4,
+    "incomplete": 3,
+    "missing": 2,
+    "partial": 2,
+    "unsupported": 2,
+    "unknown": 2,
+}
 _RECONCILIATION_OUTCOMES = frozenset(
     {"records", "empty", "incomplete", "failed", "continuity_gap"}
 )
@@ -314,8 +322,11 @@ class _FamilyObservationAccumulator:
 
     def record(self, family: str, observation: _FamilyObservation) -> None:
         previous = self.observations.get(family)
-        if previous is not None and previous.presence == "failed":
-            return
+        if previous is not None:
+            previous_rank = _RECONCILIATION_EVIDENCE_RANK.get(previous.presence, 0)
+            current_rank = _RECONCILIATION_EVIDENCE_RANK.get(observation.presence, 0)
+            if previous_rank > current_rank:
+                return
         self.observations[family] = observation
 
     def record_failure(self, family: str, error_type: str) -> _FamilyObservation:
@@ -395,6 +406,15 @@ async def _async_observe_family(
 def _safe_family_error_type(error: BaseException) -> str:
     """Map a family exception to a privacy-safe public error class."""
     return "garmin_client_error" if isinstance(error, GarminConnectError) else "sync_failed"
+
+
+def _merge_reconciliation_presence(previous: str | None, current: str) -> str:
+    """Retain more severe unavailable evidence across observations."""
+    previous_rank = _RECONCILIATION_EVIDENCE_RANK.get(previous or "", 0)
+    current_rank = _RECONCILIATION_EVIDENCE_RANK.get(current, 0)
+    if previous_rank > current_rank:
+        return cast(str, previous)
+    return current
 
 
 def _date_reconciliation_observation(
@@ -1048,11 +1068,18 @@ class GarminHistoryArchive:
         return tuple(sorted(eligible))
 
     async def _async_update_reconciliation_state(
-        self, target: date, report: HistorySyncReport, *, is_current_date: bool = False
+        self,
+        target: date,
+        report: HistorySyncReport,
+        *,
+        is_current_date: bool = False,
+        confirmation_fingerprint: str | None = None,
     ) -> None:
         """Persist one automatic observation without exposing its ledger."""
         key = target.isoformat()
         previous = self._reconciliation.get(key)
+        if previous is not None and previous.state == "settled":
+            return
         observation = self._last_reconciliation_observation.get(key)
         prior_fingerprint = previous.fingerprint if previous else None
         prior_has_records = previous.has_records if previous else False
@@ -1091,9 +1118,10 @@ class GarminHistoryArchive:
             ):
                 state = "open"
             elif (
-                previous is not None
+                confirmation_fingerprint is not None
+                and previous is not None
                 and previous.state == "open"
-                and previous.fingerprint == observation.fingerprint
+                and confirmation_fingerprint == observation.fingerprint
             ):
                 state = "settled"
             else:
@@ -1115,10 +1143,10 @@ class GarminHistoryArchive:
         previous = self._reconciliation_family_presence.get(target_key, {})
         current = accumulator.presence
         merged = dict(previous)
-        merged.update(current)
-        for family, state in previous.items():
-            if state == "failed":
-                merged[family] = state
+        for family, state in current.items():
+            merged[family] = _merge_reconciliation_presence(
+                previous.get(family), state
+            )
         self._reconciliation_family_presence[target_key] = merged
         self._last_reconciliation_observation[target_key] = _date_reconciliation_observation(
             accumulator, family_presence=merged
@@ -1252,6 +1280,15 @@ class GarminHistoryArchive:
                 for reconciliation_date in self._eligible_reconciliation_dates(
                     target_date
                 ):
+                    reconciliation_key = reconciliation_date.isoformat()
+                    previous_reconciliation = self._reconciliation.get(
+                        reconciliation_key
+                    )
+                    confirmation_fingerprint = (
+                        previous_reconciliation.fingerprint
+                        if previous_reconciliation is not None
+                        else None
+                    )
                     reconciliation_report = await self._async_sync_range(
                         reconciliation_date,
                         reconciliation_date,
@@ -1260,7 +1297,9 @@ class GarminHistoryArchive:
                         force_date=reconciliation_date,
                     )
                     await self._async_update_reconciliation_state(
-                        reconciliation_date, reconciliation_report
+                        reconciliation_date,
+                        reconciliation_report,
+                        confirmation_fingerprint=confirmation_fingerprint,
                     )
                     reports.append(reconciliation_report)
             if (
