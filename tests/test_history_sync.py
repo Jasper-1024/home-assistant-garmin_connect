@@ -31,6 +31,7 @@ from custom_components.garmin_connect.history_recorder import (
 from custom_components.garmin_connect.history_source import (
     DAILY_SUMMARY_FIELDS,
     TRAINING_STATUS_FIELDS,
+    GarminHistorySource,
     HRVData,
     HRVSummary,
     NormalizedSample,
@@ -76,6 +77,11 @@ class _NamedStore(_Store):
         if self.fail_save:
             raise OSError("partition unavailable")
         await super().async_save(data)
+
+
+class _ImmediateGate:
+    async def async_request(self, priority, request):
+        return await request()
 
 
 def _sync_archive(source, recorder, store, *, options=None):
@@ -330,6 +336,49 @@ async def test_list_shaped_numeric_payloads_write_samples_and_presence() -> None
         "intensity_moderate": 1.0,
         "intensity_vigorous": 3.0,
     }
+
+
+@pytest.mark.asyncio
+async def test_top_level_heart_rate_and_stress_lists_persist_samples_and_presence() -> None:
+    target = date(2026, 1, 1)
+    client = MagicMock()
+    client._base_url = "https://garmin.example"
+    client.get_user_profile = AsyncMock(return_value=SimpleNamespace(display_name="user"))
+    client._get_user_summary_raw = AsyncMock(return_value={})
+    client.get_training_status = AsyncMock(return_value={})
+    client._get_sleep_data_raw = AsyncMock(return_value={})
+    client._get_hrv_data_raw = AsyncMock(return_value={"hrvReadings": []})
+    client.get_activities = AsyncMock(return_value=[])
+
+    async def request(_method, url, **_kwargs):
+        if "dailyHeartRate" in url:
+            return [["2026-01-01T01:00:00Z", 61]]
+        if "dailyStress" in url:
+            return [{"timestamp": "2026-01-01T01:05:00Z", "stressLevel": 14}]
+        if "dailyEvents" in url or "/events/" in url:
+            return []
+        return {}
+
+    client._request = AsyncMock(side_effect=request)
+    source = GarminHistorySource(client, _ImmediateGate())
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(1, inserted_count=1))
+    store = _Store()
+    archive = _sync_archive(source, recorder, store)
+    await archive.async_start()
+
+    report = await archive.async_sync_range(target, target)
+
+    assert report.outcome == "written", report.error_type
+    assert store.data["presence"][target.isoformat()]["heart_rate"] == "present"
+    assert store.data["presence"][target.isoformat()]["stress"] == "present"
+    written = {
+        call.args[1].key: call.args[2][0].value
+        for call in recorder.async_write.await_args_list
+        if call.args[2]
+    }
+    assert written["heart_rate"] == 61.0
+    assert written["stress"] == 14.0
 
 
 @pytest.mark.asyncio

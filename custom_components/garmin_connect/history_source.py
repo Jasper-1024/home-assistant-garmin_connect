@@ -432,7 +432,14 @@ def normalize_pair_series(
     return tuple(latest[key] for key in sorted(latest))
 
 
-def _object_series(payload: Any, target_date: date, value_keys: tuple[str, ...], list_keys: tuple[str, ...]) -> tuple[NormalizedSample, ...]:
+def _object_series(
+    payload: Any,
+    target_date: date,
+    value_keys: tuple[str, ...],
+    list_keys: tuple[str, ...],
+    *,
+    exclude_negative: bool = False,
+) -> tuple[NormalizedSample, ...]:
     if payload is None or payload == []:
         return ()
     if isinstance(payload, list):
@@ -461,6 +468,8 @@ def _object_series(payload: Any, target_date: date, value_keys: tuple[str, ...],
         parsed = _timestamp(raw_time)
         if parsed is None:
             raise HistorySchemaError("segmented timestamp has an invalid value")
+        if exclude_negative and raw_value < 0:
+            continue
         result[parsed] = NormalizedSample(parsed, target_date, raw_time, float(raw_value))
     return tuple(result[key] for key in sorted(result))
 
@@ -468,15 +477,22 @@ def _object_series(payload: Any, target_date: date, value_keys: tuple[str, ...],
 def _nested_value(payload: Any, aliases: tuple[str, ...], depth: int = 0) -> tuple[Any, str] | None:
     if depth > 3 or not isinstance(payload, dict):
         return None
+    null_value: tuple[Any, str] | None = None
     for alias in aliases:
         if alias in payload:
-            return payload[alias], alias
+            value = payload[alias], alias
+            if value[0] is not None:
+                return value
+            if null_value is None:
+                null_value = value
     for container in ("data", "report", "summary", "result", "trainingStatus", "dailySummary"):
         if container in payload:
             found = _nested_value(payload[container], aliases, depth + 1)
-            if found is not None:
+            if found is not None and found[0] is not None:
                 return found
-    return None
+            if null_value is None and found is not None:
+                null_value = found
+    return null_value
 
 
 def _classify_source_array(payload: Any, aliases: tuple[str, ...]) -> tuple[str, Any, str | None]:
@@ -510,20 +526,64 @@ def _classify_source_array(payload: Any, aliases: tuple[str, ...]) -> tuple[str,
     return "present", values, array_key
 
 
-def _normalize_source_series(payload: Any, target_date: date, array_aliases: tuple[str, ...], value_keys: tuple[str, ...], descriptor_aliases: tuple[str, ...]) -> SourceSeries:
+def _is_object_series(values: list[Any]) -> bool:
+    """Recognize object points while ignoring null placeholders."""
+    non_null = [value for value in values if value is not None]
+    return bool(non_null) and all(isinstance(value, dict) for value in non_null)
+
+
+def _normalize_source_series(
+    payload: Any,
+    target_date: date,
+    array_aliases: tuple[str, ...],
+    value_keys: tuple[str, ...],
+    descriptor_aliases: tuple[str, ...],
+    *,
+    exclude_negative: bool = False,
+) -> SourceSeries:
     presence, values, array_key = _classify_source_array(payload, array_aliases)
     if presence != "present":
         return SourceSeries((), presence)
     if array_key is None:
-        return SourceSeries(_object_series(payload, target_date, value_keys, ("data",)), "present")
+        if _is_object_series(values):
+            readings = _object_series(
+                payload,
+                target_date,
+                value_keys,
+                ("data",),
+                exclude_negative=exclude_negative,
+            )
+        else:
+            readings = normalize_pair_series(
+                {"data": values},
+                values_key="data",
+                descriptor_keys=descriptor_aliases,
+                value_keys=value_keys,
+                exclude_negative=exclude_negative,
+                request_date=target_date,
+            )
+        return SourceSeries(readings, "present")
     descriptor_found = _nested_value(payload, descriptor_aliases)
     series_payload = {array_key: values}
     if descriptor_found is not None:
         series_payload[descriptor_found[1]] = descriptor_found[0]
-    if values and all(isinstance(item, dict) for item in values):
-        readings = _object_series(series_payload, target_date, value_keys, (array_key,))
+    if _is_object_series(values):
+        readings = _object_series(
+            series_payload,
+            target_date,
+            value_keys,
+            (array_key,),
+            exclude_negative=exclude_negative,
+        )
     else:
-        readings = normalize_pair_series(series_payload, values_key=array_key, descriptor_keys=descriptor_aliases, value_keys=value_keys, request_date=target_date)
+        readings = normalize_pair_series(
+            series_payload,
+            values_key=array_key,
+            descriptor_keys=descriptor_aliases,
+            value_keys=value_keys,
+            exclude_negative=exclude_negative,
+            request_date=target_date,
+        )
     return SourceSeries(readings, "present")
 
 
@@ -860,29 +920,23 @@ class GarminHistorySource:
             return tuple(activity for activity in normalize_activities(payload, target_date) if activity.calendar_date == target_date)
         if metric in {"health_events_daily", "health_events_body_battery"}:
             return normalize_health_events(payload, target_date)
-        if not isinstance(payload, dict):
+        if not isinstance(payload, (dict, list)):
             return ()
         if metric == "heart_rate":
-            return SourceSeries(
-                normalize_pair_series(
-                    payload,
-                    values_key="heartRateValues",
-                    descriptor_keys=("heartRateValueDescriptors",),
-                    value_keys=("heartRate",),
-                    request_date=target_date,
-                ),
-                _array_presence(payload, ("heartRateValues",)),
-            )
-        return SourceSeries(
-            normalize_pair_series(
+            return _normalize_source_series(
                 payload,
-                values_key="stressValuesArray",
-                descriptor_keys=("stressValueDescriptorsDTOList", "stressValueDescriptorsDtoList"),
-                value_keys=("stressLevel",),
-                exclude_negative=True,
-                request_date=target_date,
-            ),
-            _array_presence(payload, ("stressValuesArray",)),
+                target_date,
+                ("heartRateValues",),
+                ("heartRate", "heartRateValue", "value"),
+                ("heartRateValueDescriptors",),
+            )
+        return _normalize_source_series(
+            payload,
+            target_date,
+            ("stressValuesArray",),
+            ("stressLevel", "stress", "value"),
+            ("stressValueDescriptorsDTOList", "stressValueDescriptorsDtoList"),
+            exclude_negative=True,
         )
 
 

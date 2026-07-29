@@ -180,6 +180,74 @@ def test_normalize_pair_series_rejects_incompatible_known_series() -> None:
         )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("metric", "payload", "expected"),
+    [
+        ("heart_rate", [["2026-07-24T01:00:00Z", 61]], [61.0]),
+        ("stress", [{"timestamp": "2026-07-24T01:00:00Z", "stressLevel": 14}], [14.0]),
+    ],
+)
+async def test_top_level_heart_rate_and_stress_lists_are_normalized(
+    metric: str, payload: list, expected: list[float]
+) -> None:
+    client = MagicMock()
+    client._base_url = "https://garmin.example"
+    client.get_user_profile = AsyncMock(return_value=MagicMock(display_name="user"))
+    client._request = AsyncMock(return_value=payload)
+    source = GarminHistorySource(client, _ImmediateGate())
+
+    result = await source.async_fetch_details(date(2026, 7, 24), metric)
+
+    assert isinstance(result, SourceSeries)
+    assert [sample.value for sample in result.readings] == expected
+    assert result.presence == "present"
+
+
+def test_snapshot_aliases_prefer_non_null_values() -> None:
+    target = date(2026, 7, 24)
+
+    snapshot = normalize_snapshot(
+        {"vo2Max": None, "vo2MaxValue": 47.2}, target, TRAINING_STATUS_FIELDS
+    )
+    assert snapshot.fields["vo2_max"] == ("present", 47.2)
+    assert normalize_snapshot(
+        {"vo2Max": None, "vo2MaxValue": None}, target, TRAINING_STATUS_FIELDS
+    ).fields["vo2_max"] == ("null", None)
+    assert normalize_snapshot({}, target, TRAINING_STATUS_FIELDS).fields["vo2_max"] == (
+        "absent",
+        None,
+    )
+
+
+def test_mixed_null_object_series_preserve_respiration_and_spo2_samples() -> None:
+    target = date(2026, 7, 24)
+    respiration = normalize_respiration(
+        {
+            "respirationValuesArray": [
+                None,
+                {"timestamp": "2026-07-24T01:00:00Z", "respirationValue": 12.5},
+            ]
+        },
+        target,
+    )
+    assert [sample.value for sample in respiration.readings] == [12.5]
+    assert respiration.presence == "present"
+
+    for variant, array_key, value_key, value in (
+        ("single", "spO2SingleValues", "spO2", 98),
+        ("continuous", "continuousReadingDTOList", "reading", 96),
+        ("hourly", "spO2HourlyAverages", "average", 95),
+    ):
+        spo2 = normalize_spo2(
+            {array_key: [None, {"readingTime": "2026-07-24T01:05:00Z", value_key: value}]},
+            target,
+            variant,
+        )
+        assert [sample.value for sample in spo2.readings] == [float(value)]
+        assert spo2.presence == "present"
+
+
 def test_body_battery_selects_daily_report_and_revises_irregular_times() -> None:
     payload = [
         {"calendarDate": "2026-07-25", "bodyBatteryValuesArray": []},
