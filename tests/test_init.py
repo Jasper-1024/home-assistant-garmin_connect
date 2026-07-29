@@ -3,6 +3,7 @@
 import asyncio
 from contextlib import ExitStack
 from datetime import UTC, date, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -64,6 +65,85 @@ def _stack_coordinators(stack: ExitStack, coord: MagicMock) -> None:
     """Push patches for all 9 coordinator constructors onto an ExitStack."""
     for target in _COORD_TARGETS:
         stack.enter_context(patch(target, return_value=coord))
+
+
+class _LifecycleTimer:
+    """Deterministic timer used through the archive's normal timer seam."""
+
+    def __init__(self) -> None:
+        self.slots: list[list[object]] = []
+
+    def call_later(self, delay: timedelta, callback) -> object:
+        slot = [delay, callback, True]
+        self.slots.append(slot)
+
+        def cancel() -> None:
+            slot[2] = False
+
+        return cancel
+
+    @property
+    def active(self) -> list[list[object]]:
+        return [slot for slot in self.slots if slot[2]]
+
+    def fire_next(self) -> None:
+        for slot in self.slots:
+            if slot[2]:
+                slot[2] = False
+                slot[1]()
+                return
+        raise AssertionError("no timer wakeup is scheduled")
+
+
+class _RuntimeHistoryClient:
+    """Empty Garmin endpoint double that exercises GarminHistorySource."""
+
+    _base_url = "https://garmin.example"
+
+    def __init__(self) -> None:
+        self.requests = 0
+        self.events: list[str] = []
+        self.first_sync_done = asyncio.Event()
+        self.block_cycle = False
+        self.cycle_started = asyncio.Event()
+        self.cycle_cancelled = asyncio.Event()
+        self.release_cycle = asyncio.Event()
+
+    async def _archive_request(self) -> dict:
+        self.requests += 1
+        self.events.append(f"archive-{self.requests}")
+        if self.requests == 19:
+            self.first_sync_done.set()
+        if self.block_cycle and not self.cycle_started.is_set():
+            self.cycle_started.set()
+            try:
+                await self.release_cycle.wait()
+            except asyncio.CancelledError:
+                self.cycle_cancelled.set()
+                raise
+        return {}
+
+    async def get_user_profile(self) -> SimpleNamespace:
+        return SimpleNamespace(display_name="athlete")
+
+    async def _request(self, *_args, **_kwargs) -> dict:
+        return await self._archive_request()
+
+    async def _get_hrv_data_raw(self, _target: date) -> dict:
+        return await self._archive_request()
+
+    async def _get_sleep_data_raw(self, _target: date) -> dict:
+        return await self._archive_request()
+
+    async def _get_user_summary_raw(self, _target: date) -> dict:
+        return await self._archive_request()
+
+    async def get_activities(self, _offset: int, _limit: int) -> list:
+        await self._archive_request()
+        return []
+
+    async def get_training_status(self, _target: date) -> dict:
+        return await self._archive_request()
 
 
 # ── Setup tests ───────────────────────────────────────────────────────────────
@@ -384,82 +464,48 @@ async def test_option_disablement_reload_cancels_recurring_archive_work(tmp_path
         entry_id="entry-1",
     )
     coordinator = _coord_mock()
-    archives: list[tuple[GarminHistoryArchive, object, object]] = []
-
-    class Timer:
-        def __init__(self) -> None:
-            self.slots: list[list[object]] = []
-
-        def call_later(self, delay: timedelta, callback) -> object:
-            slot = [delay, callback, True]
-            self.slots.append(slot)
-
-            def cancel() -> None:
-                slot[2] = False
-
-            return cancel
-
-        @property
-        def active(self) -> list[list[object]]:
-            return [slot for slot in self.slots if slot[2]]
-
-    class Source:
-        async_fetch_details = None
-
-        def __init__(self) -> None:
-            self.calls = 0
-            self.first_sync_done = asyncio.Event()
-            self.cycle_started = asyncio.Event()
-            self.cycle_cancelled = asyncio.Event()
-
-        async def async_fetch(self, _target, _metric):
-            self.calls += 1
-            if self.calls == 15:
-                self.first_sync_done.set()
-                return ()
-            if self.calls == 16:
-                self.cycle_started.set()
-                try:
-                    await asyncio.Event().wait()
-                except asyncio.CancelledError:
-                    self.cycle_cancelled.set()
-                    raise
-            return ()
-
-    class LifecycleArchive(GarminHistoryArchive):
-        def __init__(self, hass_arg, entry_arg) -> None:
-            timer = Timer()
-            source = Source()
-            store = MagicMock()
-            store.async_load = AsyncMock(return_value=None)
-            store.async_save = AsyncMock()
-            recorder = MagicMock()
-            recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
-            super().__init__(
-                hass_arg,
-                entry_arg,
-                recorder_checker=MagicMock(
-                    async_check=AsyncMock(
-                        return_value=RecorderCompatibilityResult.compatible_result()
-                    )
-                ),
-                store_factory=lambda *_args, **_kwargs: store,
-                source_factory=lambda *_args, **_kwargs: source,
-                recorder_factory=lambda: recorder,
-                timer_factory=timer.call_later,
-            )
-            archives.append((self, timer, source))
+    client = _RuntimeHistoryClient()
+    coordinator.client = client
+    timer = _LifecycleTimer()
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
 
     try:
         with ExitStack() as stack:
             stack.enter_context(patch("custom_components.garmin_connect.GarminAuth"))
-            stack.enter_context(patch("custom_components.garmin_connect.GarminClient"))
+            stack.enter_context(
+                patch(
+                    "custom_components.garmin_connect.GarminClient",
+                    return_value=client,
+                )
+            )
             _stack_coordinators(stack, coordinator)
             stack.enter_context(
                 patch(
-                    "custom_components.garmin_connect.GarminHistoryArchive",
-                    new=LifecycleArchive,
+                    "custom_components.garmin_connect.history.dt_util.utcnow",
+                    return_value=datetime(2026, 8, 4, 12, tzinfo=UTC),
                 )
+            )
+            stack.enter_context(
+                patch(
+                    "custom_components.garmin_connect.history._default_history_timer_factory",
+                    new=timer.call_later,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "custom_components.garmin_connect.history.HomeAssistantRecorderCompatibility.async_check",
+                    new=AsyncMock(return_value=RecorderCompatibilityResult.compatible_result()),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "custom_components.garmin_connect.history.GarminHistoryRecorder",
+                    return_value=recorder,
+                )
+            )
+            stack.enter_context(
+                patch("homeassistant.helpers.recorder.get_instance", return_value=recorder)
             )
             stack.enter_context(
                 patch("custom_components.garmin_connect.async_setup_services", new=AsyncMock())
@@ -468,30 +514,141 @@ async def test_option_disablement_reload_cancels_recurring_archive_work(tmp_path
             hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
 
             await hass.config_entries.async_add(entry)
-            _, first_timer, first_source = archives[0]
-            await asyncio.wait_for(first_source.first_sync_done.wait(), timeout=0.1)
+            first_archive = entry.runtime_data.history_archive
+            await asyncio.wait_for(client.first_sync_done.wait(), timeout=0.1)
+            await hass.async_block_till_done()
             for _ in range(100):
-                if first_timer.active:
+                if timer.active:
                     break
                 await asyncio.sleep(0)
-            assert first_timer.active
+            assert timer.active, (first_archive.status, client.requests, client.events)
 
-            first_slot = first_timer.active[0]
-            first_slot[2] = False
-            first_slot[1]()
-            await asyncio.wait_for(first_source.cycle_started.wait(), timeout=0.1)
+            client.block_cycle = True
+            timer.fire_next()
+            await asyncio.wait_for(client.cycle_started.wait(), timeout=0.1)
 
-            hass.config_entries.async_update_entry(
-                entry, options={CONF_ARCHIVE_ENABLED: False}
-            )
+            requests_before_disable = client.requests
+            hass.config_entries.async_update_entry(entry, options={CONF_ARCHIVE_ENABLED: False})
             await hass.async_block_till_done()
 
-            assert first_source.cycle_cancelled.is_set()
-            assert first_timer.active == []
-            assert len(archives) >= 2
-            assert entry.runtime_data.history_archive is archives[-1][0]
+            assert client.cycle_cancelled.is_set()
+            assert client.requests == requests_before_disable
+            assert timer.active == []
+            assert entry.runtime_data.history_archive is not first_archive
             assert entry.runtime_data.history_archive.archive_enabled is False
-            assert all(timer.active == [] for _, timer, _ in archives[1:])
+    finally:
+        hass.config_entries._store._async_cleanup_delay_listener()
+        await hass.async_stop(force=True)
+
+
+async def test_runtime_archive_prioritizes_foreground_work_through_shared_gate(tmp_path) -> None:
+    """A real archive cycle yields to a foreground request on runtime_data's gate."""
+    hass = HomeAssistant(str(tmp_path))
+    hass.config_entries = ConfigEntries(hass, {})
+    loader.async_setup(hass)
+    entry = ConfigEntry(
+        version=2,
+        minor_version=1,
+        domain=DOMAIN,
+        title="Garmin account",
+        data={
+            **ENTRY_DATA,
+            "history_account_key": "opaque-account-key-1234567890",
+            CONF_ARCHIVE_ACTIVATION_DATE: "2026-08-04",
+            CONF_ARCHIVE_PREVIOUSLY_ENABLED: True,
+        },
+        options={CONF_ARCHIVE_ENABLED: True},
+        source=SOURCE_USER,
+        unique_id="garmin-account",
+        discovery_keys={},
+        subentries_data=None,
+        entry_id="entry-1",
+    )
+    coordinator = _coord_mock()
+    client = _RuntimeHistoryClient()
+    coordinator.client = client
+    timer = _LifecycleTimer()
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+
+    try:
+        with ExitStack() as stack:
+            stack.enter_context(patch("custom_components.garmin_connect.GarminAuth"))
+            stack.enter_context(
+                patch(
+                    "custom_components.garmin_connect.GarminClient",
+                    return_value=client,
+                )
+            )
+            _stack_coordinators(stack, coordinator)
+            stack.enter_context(
+                patch(
+                    "custom_components.garmin_connect.history.dt_util.utcnow",
+                    return_value=datetime(2026, 8, 4, 12, tzinfo=UTC),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "custom_components.garmin_connect.history._default_history_timer_factory",
+                    new=timer.call_later,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "custom_components.garmin_connect.history.HomeAssistantRecorderCompatibility.async_check",
+                    new=AsyncMock(return_value=RecorderCompatibilityResult.compatible_result()),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "custom_components.garmin_connect.history.GarminHistoryRecorder",
+                    return_value=recorder,
+                )
+            )
+            stack.enter_context(
+                patch("homeassistant.helpers.recorder.get_instance", return_value=recorder)
+            )
+            stack.enter_context(
+                patch("custom_components.garmin_connect.async_setup_services", new=AsyncMock())
+            )
+            hass.config_entries.async_forward_entry_setups = AsyncMock()
+            hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
+
+            await hass.config_entries.async_add(entry)
+            await asyncio.wait_for(client.first_sync_done.wait(), timeout=0.1)
+            await hass.async_block_till_done()
+            for _ in range(100):
+                if timer.active:
+                    break
+                await asyncio.sleep(0)
+
+            client.block_cycle = True
+            timer.fire_next()
+            await asyncio.wait_for(client.cycle_started.wait(), timeout=0.1)
+
+            async def current_value_request() -> str:
+                client.events.append("current")
+                return "current-value"
+
+            current_task = asyncio.create_task(
+                entry.runtime_data.request_gate.async_request(
+                    GarminRequestPriority.FOREGROUND,
+                    current_value_request,
+                )
+            )
+            await asyncio.sleep(0)
+            assert not current_task.done()
+
+            client.release_cycle.set()
+            assert await asyncio.wait_for(current_task, timeout=0.1) == "current-value"
+
+            current_index = client.events.index("current")
+            next_archive_index = next(
+                index
+                for index, event in enumerate(client.events)
+                if index > current_index and event.startswith("archive-")
+            )
+            assert current_index < next_archive_index
     finally:
         hass.config_entries._store._async_cleanup_delay_listener()
         await hass.async_stop(force=True)

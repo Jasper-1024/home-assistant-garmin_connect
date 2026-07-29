@@ -649,6 +649,7 @@ async def test_restart_restores_one_cadence_without_replaying_missed_ticks() -> 
     source.async_fetch_details = None
     recorder = MagicMock()
     recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    now = [datetime(2026, 8, 4, 12, tzinfo=UTC)]
 
     first_timer = DeterministicTimer()
     first = GarminHistoryArchive(
@@ -658,6 +659,7 @@ async def test_restart_restores_one_cadence_without_replaying_missed_ticks() -> 
         store_factory=_store_factory(store),
         source_factory=lambda *args: source,
         recorder_factory=lambda: recorder,
+        clock=lambda: now[0],
         timer_factory=first_timer.call_later,
     )
     await first.async_start()
@@ -667,6 +669,7 @@ async def test_restart_restores_one_cadence_without_replaying_missed_ticks() -> 
     assert len(first_timer.active) == 1
     await first.async_stop()
 
+    now[0] = datetime(2026, 8, 6, 12, tzinfo=UTC)
     second_timer = DeterministicTimer()
     restarted = GarminHistoryArchive(
         hass,
@@ -675,6 +678,7 @@ async def test_restart_restores_one_cadence_without_replaying_missed_ticks() -> 
         store_factory=_store_factory(store),
         source_factory=lambda *args: source,
         recorder_factory=lambda: recorder,
+        clock=lambda: now[0],
         timer_factory=second_timer.call_later,
     )
     await restarted.async_start()
@@ -684,6 +688,9 @@ async def test_restart_restores_one_cadence_without_replaying_missed_ticks() -> 
 
     assert len(second_timer.active) == 1
     assert [slot[0] for slot in second_timer.active] == [timedelta(minutes=15)]
+    assert source.async_fetch.await_count == 30
+    assert {call.args[0] for call in source.async_fetch.await_args_list[:15]} == {date(2026, 8, 4)}
+    assert {call.args[0] for call in source.async_fetch.await_args_list[15:]} == {date(2026, 8, 6)}
     await restarted.async_stop()
 
 
@@ -740,11 +747,18 @@ async def test_cycle_ticks_coalesce_while_one_cycle_is_running() -> None:
 
     timer.fire_next()
     await asyncio.sleep(0)
+    timer.fire_next()
+    await asyncio.sleep(0)
+    timer.fire_next()
+    await asyncio.sleep(0)
     assert calls == 16
 
     release_cycle.set()
     await asyncio.wait_for(follow_up_done.wait(), timeout=0.1)
     assert calls == 45
+    await asyncio.sleep(0)
+    assert calls == 45
+    assert len(timer.active) == 1
     await archive.async_stop()
 
 
