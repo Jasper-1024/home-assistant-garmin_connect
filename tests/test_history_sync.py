@@ -116,7 +116,7 @@ def _sync_archive(source, recorder, store, *, options=None):
     return archive
 
 
-def _partition_archive(source, recorder, stores, *, options=None, data=None):
+def _partition_archive(source, recorder, stores, *, options=None, data=None, clock=None):
     entry = MagicMock(
         data=data or {"history_account_key": "opaque-account-key-1234567890"},
         entry_id="e",
@@ -129,6 +129,7 @@ def _partition_archive(source, recorder, stores, *, options=None, data=None):
         store_factory=lambda _hass, _version, path, **kwargs: stores.setdefault(path, _NamedStore()),
         source_factory=lambda *args: source,
         recorder_factory=lambda: recorder,
+        clock=clock,
     )
 
 
@@ -2236,24 +2237,31 @@ async def test_background_fit_limit_defers_then_converges_across_restart(tmp_pat
     stores = {"garmin_connect.e.history_catalog": _NamedStore()}
     recorder = MagicMock()
     recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
-    archive = _partition_archive(Source(), recorder, stores)
+    now = [datetime(2026, 8, 1, 13, tzinfo=UTC)]
+    archive = _partition_archive(Source(), recorder, stores, clock=lambda: now[0])
     archive._entry.runtime_data.core.client = client
     archive._hass.config.path.return_value = str(tmp_path)
     await archive.async_start()
     first = await archive.async_sync_range(date(2026, 1, 1), date(2026, 1, 1), fit_limit=1, include_training_status=False)
     assert first.outcome == "written"
     assert first.fit_count == 1
-    assert "2026-01-01" in stores["garmin_connect.e.history_catalog"].data["completed_dates"]
-    assert len(stores["garmin_connect.e.sleep_2026"].data["fits"]) == 1
-    assert stores["garmin_connect.e.history_catalog"].data["fit_queue"] == [
-        {
-            "logical_id": activities[1].logical_id,
-            "activity_id": activities[1].activity_id,
-            "year": "2026",
-            "calendar_date": "2026-01-01",
-        }
-    ]
+    assert len(tuple((tmp_path / "opaque-account-key-1234567890").glob("*.fit"))) == 1
     assert client.download_activity.await_count == 1
+
+    restarted = _partition_archive(
+        Source(), recorder, stores, clock=lambda: now[0]
+    )
+    restarted._entry.runtime_data.core.client = client
+    restarted._hass.config.path.return_value = str(tmp_path)
+    await restarted.async_start()
+    now[0] += timedelta(hours=1)
+    second = await restarted.async_sync_range(
+        date(2026, 1, 1), date(2026, 1, 1), fit_limit=1, include_training_status=False
+    )
+
+    assert second.fit_count == 1
+    assert client.download_activity.await_count == 2
+    assert len(tuple((tmp_path / "opaque-account-key-1234567890").glob("*.fit"))) == 2
 
 
 @pytest.mark.asyncio

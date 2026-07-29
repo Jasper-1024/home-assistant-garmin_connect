@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from custom_components.garmin_connect import fit_archive as fit_archive_module
 from custom_components.garmin_connect.fit_archive import (
     FitArchiveError,
     async_archive_fit,
@@ -85,6 +86,34 @@ async def test_fit_archive_hardens_account_directory_permissions(tmp_path: Path)
 
     assert stat.S_IMODE(directory.stat().st_mode) == 0o700
     assert stat.S_IMODE((directory / fit_file_name("a" * 24)).stat().st_mode) == 0o600
+
+
+@pytest.mark.asyncio
+async def test_fit_archive_degrades_when_directory_fsync_is_unsupported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = AsyncMock()
+    client.download_activity.return_value = b"validated fit bytes"
+
+    original_open = os.open
+
+    def unsupported_directory_open(path: Path, flags: int, *args: object) -> int:
+        if Path(path) == tmp_path:
+            raise OSError("directory handles are unsupported")
+        return original_open(path, flags, *args)
+
+    monkeypatch.setattr(fit_archive_module.os, "open", unsupported_directory_open)
+
+    record = await async_archive_fit(
+        client=client,
+        activity_id="12345",
+        logical_id="a" * 24,
+        directory=tmp_path,
+        inspect=_valid_inspector,
+    )
+
+    assert record["path"] == fit_file_name("a" * 24)
+    assert (tmp_path / record["path"]).read_bytes() == b"validated fit bytes"
 
 
 @pytest.mark.asyncio

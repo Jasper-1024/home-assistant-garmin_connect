@@ -162,7 +162,7 @@ async def test_activity_discovery_deduplicates_durable_fit_work_without_download
 
 
 @pytest.mark.asyncio
-async def test_legacy_shared_fit_is_migrated_only_for_indexed_account_record(
+async def test_legacy_shared_fit_is_copied_only_for_indexed_account_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     activity = _activity()
@@ -234,12 +234,91 @@ async def test_legacy_shared_fit_is_migrated_only_for_indexed_account_record(
     migrated_path = fit_root / account_key / legacy_path.name
     assert migrated_path.is_file()
     assert migrated_path.stat().st_mode & 0o777 == 0o600
-    assert not legacy_path.exists()
+    assert legacy_path.read_bytes() == b"legacy FIT"
     assert unowned_path.is_file()
     events = await archive.async_get_calendar_events(
         "activity", activity.calendar_date, activity.calendar_date
     )
     assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_shared_fit_is_copied_for_duplicate_accounts_without_stealing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    activity = _activity()
+    fit_root = tmp_path / "fit"
+    fit_root.mkdir(mode=0o700)
+    legacy_path = fit_root / fit_file_name(activity.logical_id)
+    legacy_path.write_bytes(b"shared legacy FIT")
+    legacy_path.chmod(0o600)
+    summary = _fit_summary()
+
+    def stores_for(account_key: str) -> dict[str, _Store]:
+        catalog = _Store(
+            {
+                "schema_version": 1,
+                "account_key": account_key,
+                "completed_dates": [],
+                "sleep_index": {"2026": [activity.logical_id]},
+                "event_index": {},
+                "activity_index": {"2026": [activity.logical_id]},
+                "fit_queue": [],
+                "fit_queue_quarantine": [],
+                "fit_queue_error": None,
+                "fit_last_eligible_download": None,
+            }
+        )
+        partition = _Store(
+            {
+                "schema_version": 1,
+                "sleep_schema_version": 1,
+                "account_key": account_key,
+                "year": "2026",
+                "sessions": {},
+                "events": {},
+                "activities": {activity.logical_id: _activity_record(activity)},
+                "fits": {
+                    activity.logical_id: {
+                        "logical_id": activity.logical_id,
+                        "path": legacy_path.name,
+                        "summary": summary,
+                    }
+                },
+            }
+        )
+        return {
+            "garmin_connect.entry-1.history_catalog": catalog,
+            "garmin_connect.entry-1.sleep_2026": partition,
+        }
+
+    monkeypatch.setattr(
+        history_module,
+        "inspect_fit",
+        lambda _path, _mode: {
+            **summary,
+            "file": {"integrity_ok": True, "decode_ok": True},
+        },
+    )
+    account_a = "account-a-opaque-key-1234567890"
+    account_b = "account-b-opaque-key-1234567890"
+    stores_a = stores_for(account_a)
+    stores_b = stores_for(account_b)
+    archive_a = _archive(
+        MagicMock(), MagicMock(), stores_a[next(iter(stores_a))],
+        account_key=account_a, stores=stores_a,
+    )
+    archive_b = _archive(
+        MagicMock(), MagicMock(), stores_b[next(iter(stores_b))],
+        account_key=account_b, stores=stores_b,
+    )
+    for archive in (archive_a, archive_b):
+        archive._hass.config.path.return_value = str(fit_root)
+        await archive.async_start()
+
+    assert (fit_root / account_a / legacy_path.name).read_bytes() == b"shared legacy FIT"
+    assert (fit_root / account_b / legacy_path.name).read_bytes() == b"shared legacy FIT"
+    assert legacy_path.read_bytes() == b"shared legacy FIT"
 
 
 @pytest.mark.asyncio
@@ -518,6 +597,108 @@ async def test_fit_queue_paces_downloads_and_recovers_pending_work_after_restart
     assert archive_fit.await_count == 2
     assert restarted_report.fit_count == 1
     assert len(tuple((tmp_path / "fit" / "opaque-account-key-1234567890").glob("*.fit"))) == 2
+
+
+@pytest.mark.asyncio
+async def test_fit_backlog_over_256_survives_restart_and_is_fully_consumed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    activity_count = 260
+    first_activities = normalize_activities(
+        [
+            {
+                "activityId": 2000 + index,
+                "activityType": "running",
+                "startTime": "2026-08-01T10:00:00Z",
+                "durationInSeconds": 60,
+            }
+            for index in range(256)
+        ],
+        date(2026, 8, 1),
+    )
+    later_activities = normalize_activities(
+        [
+            {
+                "activityId": 3000 + index,
+                "activityType": "running",
+                "startTime": "2026-08-02T10:00:00Z",
+                "durationInSeconds": 60,
+            }
+            for index in range(4)
+        ],
+        date(2026, 8, 2),
+    )
+    activities_by_date = {
+        date(2026, 8, 1): first_activities,
+        date(2026, 8, 2): later_activities,
+    }
+
+    class Source:
+        async def async_fetch(self, _target, _metric):
+            return ()
+
+        async def async_fetch_details(self, _target, metric):
+            return activities_by_date.get(_target, ()) if metric == "timed_activities" else ()
+
+    summary = _fit_summary()
+    client = MagicMock()
+    client.download_activity = AsyncMock(return_value=b"fit")
+    archive_fit = AsyncMock()
+
+    async def archive_one(**kwargs):
+        directory = Path(kwargs["directory"])
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / fit_file_name(kwargs["logical_id"])
+        path.write_bytes(b"fit")
+        path.chmod(0o600)
+        return {
+            "logical_id": kwargs["logical_id"],
+            "path": path.name,
+            "summary": summary,
+        }
+
+    archive_fit.side_effect = archive_one
+    monkeypatch.setattr(history_module, "async_archive_fit", archive_fit)
+    monkeypatch.setattr(
+        history_module,
+        "inspect_fit",
+        lambda _path, _mode: {
+            **summary,
+            "file": {"integrity_ok": True, "decode_ok": True},
+        },
+    )
+    now = [datetime(2026, 8, 1, 13, tzinfo=UTC)]
+    store = _Store()
+    stores = {}
+    archive = _archive(Source(), client, store, clock=lambda: now[0], stores=stores)
+    archive._hass.config.path.return_value = str(tmp_path / "fit")
+    await archive.async_start()
+
+    first_report = await archive.async_sync_range(
+        date(2026, 8, 1), date(2026, 8, 1), fit_limit=1
+    )
+    assert first_report.fit_count == 1
+    second_report = await archive.async_sync_range(
+        date(2026, 8, 2), date(2026, 8, 2), fit_limit=0
+    )
+    assert second_report.fit_count == 0
+    assert len(tuple((tmp_path / "fit" / "opaque-account-key-1234567890").glob("*.fit"))) == 1
+
+    restarted = _archive(
+        Source(), client, store, clock=lambda: now[0], stores=stores
+    )
+    restarted._hass.config.path.return_value = str(tmp_path / "fit")
+    await restarted.async_start()
+
+    for _ in range(activity_count - 1):
+        now[0] += timedelta(hours=1)
+        report = await restarted.async_sync_range(
+            date(2026, 8, 1), date(2026, 8, 1), fit_limit=1
+        )
+        assert report.fit_count == 1
+
+    assert archive_fit.await_count == activity_count
+    assert len(tuple((tmp_path / "fit" / "opaque-account-key-1234567890").glob("*.fit"))) == activity_count
 
 
 @pytest.mark.asyncio

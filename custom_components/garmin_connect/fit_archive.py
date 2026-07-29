@@ -23,6 +23,29 @@ class FitArchiveError(ValueError):
     """FIT download, validation, or persistence failed."""
 
 
+def fsync_directory(directory: Path) -> None:
+    """Best-effort persist a directory entry on platforms that support it."""
+    try:
+        directory_fd = os.open(
+            directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+    except OSError:
+        # Windows and some filesystems do not allow opening directories for
+        # fsync. The file itself was already flushed; retain that durability
+        # guarantee while safely degrading the directory-entry step.
+        return
+    try:
+        try:
+            os.fsync(directory_fd)
+        except OSError:
+            return
+    finally:
+        try:
+            os.close(directory_fd)
+        except OSError:
+            pass
+
+
 def ensure_private_fit_directory(directory: Path, *, create: bool) -> Path | None:
     """Return an account FIT directory after enforcing its private boundary."""
     try:
@@ -170,11 +193,7 @@ async def async_archive_fit(
             safe_summary = _summary_without_file(summary)
             os.replace(temporary_path, final_path)
             validate_private_fit_file(final_path)
-            directory_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            fsync_directory(directory)
             return {"logical_id": logical_id, "path": final_path.name, "summary": safe_summary}
         finally:
             temporary_path.unlink(missing_ok=True)

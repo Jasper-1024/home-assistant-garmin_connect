@@ -42,6 +42,7 @@ from .fit_archive import (
     ensure_private_fit_directory,
     fit_file_name,
     fit_record,
+    fsync_directory,
     inspect_fit,
     validate_private_fit_file,
     validated_fit_summary,
@@ -128,7 +129,7 @@ _RECONCILIATION_WINDOW = timedelta(days=7)
 _FIT_PACING_INTERVAL = timedelta(hours=1)
 _PROSPECTIVE_CYCLE_FIT_LIMIT = 1
 _FIT_LOGICAL_ID_LENGTH = 24
-_FIT_QUEUE_MAX_ITEMS = 256
+_FIT_QUEUE_QUARANTINE_MAX_ITEMS = 256
 _FIT_QUEUE_FIELDS = frozenset(
     {"logical_id", "activity_id", "year", "calendar_date"}
 )
@@ -1041,7 +1042,7 @@ class GarminHistoryArchive:
         return self._fit_base_directory() / self._account_key()
 
     def _fit_path_for_record(self, path_name: str) -> Path | None:
-        """Return an account-owned FIT, migrating an indexed legacy file once.
+        """Return an account-owned FIT, copying an indexed legacy file once.
 
         The old layout put files directly in the shared FIT root.  A file is
         eligible for migration only when the caller has already validated a
@@ -1076,16 +1077,24 @@ class GarminHistoryArchive:
             validate_private_fit_file(account_path)
             return account_path
 
-        os.replace(legacy_path, account_path)
+        # The legacy root is shared and does not encode account ownership.
+        # Copying leaves it available to another account that references the
+        # same logical ID; moving it would let startup order steal the file.
+        temporary_path = account_directory / f".{path_name}.migration"
+        try:
+            with legacy_path.open("rb") as source, temporary_path.open(
+                "xb", buffering=0
+            ) as target:
+                while chunk := source.read(1024 * 1024):
+                    target.write(chunk)
+                target.flush()
+                os.fsync(target.fileno())
+            os.chmod(temporary_path, 0o600)
+            os.replace(temporary_path, account_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
         validate_private_fit_file(account_path)
-        for directory in (legacy_directory, account_directory):
-            directory_fd = os.open(
-                directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-            )
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+        fsync_directory(account_directory)
         return account_path
 
     @property
@@ -2617,7 +2626,7 @@ class GarminHistoryArchive:
         updated = dict(catalog)
         updated["fit_queue"] = self._fit_queue_records(queue)
         updated["fit_queue_quarantine"] = list(self._fit_queue_quarantine)[
-            :_FIT_QUEUE_MAX_ITEMS
+            :_FIT_QUEUE_QUARANTINE_MAX_ITEMS
         ]
         updated["fit_queue_error"] = self._fit_queue_error
         updated["fit_last_eligible_download"] = self._fit_last_eligible_record()
@@ -2851,7 +2860,7 @@ class GarminHistoryArchive:
             "activity_index": {year: sorted(records) for year, records in activities_by_year.items()},
             "fit_queue": self._fit_queue_records(fit_queue),
             "fit_queue_quarantine": list(self._fit_queue_quarantine)[
-                :_FIT_QUEUE_MAX_ITEMS
+                :_FIT_QUEUE_QUARANTINE_MAX_ITEMS
             ],
             "fit_queue_error": self._fit_queue_error,
             "fit_last_eligible_download": (
@@ -3842,7 +3851,7 @@ class GarminHistoryArchive:
             dict(item) if isinstance(item, Mapping) else {"raw": repr(item)[:256]}
             for item in raw_fit_quarantine
             if isinstance(item, Mapping) or item is not None
-        ][: _FIT_QUEUE_MAX_ITEMS]
+        ][:_FIT_QUEUE_QUARANTINE_MAX_ITEMS]
         raw_fit_error = catalog.get("fit_queue_error")
         if isinstance(raw_fit_error, str) and len(raw_fit_error) <= 64:
             self._fit_queue_error = raw_fit_error
@@ -3852,12 +3861,6 @@ class GarminHistoryArchive:
             self._fit_queue_quarantine.append({"raw": repr(raw_fit_queue)[:256]})
             self._fit_queue_error = "fit_queue_schema"
             raw_fit_queue = []
-        if len(raw_fit_queue) > _FIT_QUEUE_MAX_ITEMS:
-            self._fit_queue_quarantine.extend(
-                {"raw": repr(item)[:256]} for item in raw_fit_queue[_FIT_QUEUE_MAX_ITEMS:]
-            )
-            raw_fit_queue = raw_fit_queue[:_FIT_QUEUE_MAX_ITEMS]
-            self._fit_queue_error = "fit_queue_schema"
         seen_activity_ids: set[str] = set()
         for item in raw_fit_queue:
             try:
@@ -3951,7 +3954,7 @@ class GarminHistoryArchive:
             updated = dict(catalog)
             updated["fit_queue"] = self._fit_queue_records()
             updated["fit_queue_quarantine"] = list(self._fit_queue_quarantine)[
-                :_FIT_QUEUE_MAX_ITEMS
+                :_FIT_QUEUE_QUARANTINE_MAX_ITEMS
             ]
             updated["fit_queue_error"] = self._fit_queue_error
             updated["fit_last_eligible_download"] = self._fit_last_eligible_record()
