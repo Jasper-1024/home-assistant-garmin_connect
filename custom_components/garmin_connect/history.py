@@ -120,7 +120,7 @@ _PROSPECTIVE_CYCLE_INTERVAL = timedelta(minutes=15)
 _RECONCILIATION_WINDOW = timedelta(days=7)
 _PROSPECTIVE_CYCLE_FIT_LIMIT = 0
 _DATE_SUMMARY_BUCKET_TIME_ZONE = timezone(timedelta(hours=8))
-_PRESENCE_STATES = frozenset({"null", "empty", "all-null", "missing", "unsupported", "returned-empty", "present", "absent", "failed", "mixed"})
+_PRESENCE_STATES = frozenset({"null", "empty", "all-null", "missing", "unsupported", "returned-empty", "present", "absent", "failed", "mixed", "unknown"})
 # The frozen numeric catalog currently produces 33 base presence keys: 13
 # families, 12 segmented total contexts, and 8 snapshot fields. Seven aggregate
 # sleep-stream states retain date-level availability without session-key growth.
@@ -139,29 +139,39 @@ _SLEEP_STREAM_METADATA = {
 # Garmin documents -1 as the no-data sentinel for sleep stress; it is not a
 # numeric measurement and therefore is not sent to Recorder.
 _SLEEP_NEGATIVE_SENTINELS = {"stress": frozenset({-1.0})}
-_RECONCILIATION_FAMILIES = (
-    "heart_rate",
-    "stress",
-    "body_battery",
-    "nightly_hrv",
-    "steps",
-    "floors",
-    "intensity_moderate",
-    "intensity_vigorous",
-    "respiration_raw",
-    "respiration_average",
-    "spo2_single",
-    "spo2_continuous",
-    "spo2_hourly",
-    "daily_summary",
-    "training_status",
+_NUMERIC_FAMILY_METADATA = (
+    ("heart_rate", HEART_RATE_METADATA),
+    ("stress", STRESS_METADATA),
+    ("body_battery", BODY_BATTERY_METADATA),
+    ("nightly_hrv", NIGHTLY_HRV_METADATA),
+    ("steps", STEPS_METADATA),
+    ("floors", FLOORS_METADATA),
+    ("intensity_moderate", MODERATE_INTENSITY_METADATA),
+    ("intensity_vigorous", VIGOROUS_INTENSITY_METADATA),
+    ("respiration_raw", RESPIRATION_RAW_METADATA),
+    ("respiration_average", RESPIRATION_AVERAGE_METADATA),
+    ("spo2_single", SPO2_SINGLE_METADATA),
+    ("spo2_continuous", SPO2_CONTINUOUS_METADATA),
+    ("spo2_hourly", SPO2_HOURLY_METADATA),
+    ("daily_summary", None),
+    ("training_status", None),
+)
+_STRUCTURED_FAMILIES = (
     "sleep_sessions",
     "health_events_daily",
     "health_events_body_battery",
     "timed_activities",
 )
+# Public catalog seam for release tests and adapters. Reconciliation is an
+# internal consumer of the same frozen family set, not its owner.
+FROZEN_ARCHIVE_FAMILIES = tuple(
+    family for family, _metadata in _NUMERIC_FAMILY_METADATA
+) + _STRUCTURED_FAMILIES
+_RECONCILIATION_EXPLICIT_EMPTY_STATES = frozenset(
+    {"empty", "all-null", "null", "returned-empty", "absent"}
+)
 _RECONCILIATION_UNAVAILABLE_STATES = frozenset(
-    {"missing", "failed", "unsupported"}
+    {"missing", "failed", "unsupported", "unknown"}
 )
 _RECONCILIATION_OUTCOMES = frozenset(
     {"records", "empty", "incomplete", "failed", "continuity_gap"}
@@ -173,7 +183,6 @@ _NORMALIZED_DETAIL_TYPES = (
     ("snapshot", SnapshotData),
     ("tuple", tuple),
 )
-
 
 def _fingerprint_value(value: Any) -> Any:
     """Convert normalized source details into deterministic private JSON data."""
@@ -245,7 +254,7 @@ def _details_presence(details: Any, *, available: bool = True) -> str:
         return "empty" if available else "missing"
     if detail_type == "tuple":
         return "present" if details else "empty" if available else "missing"
-    return "empty" if available else "missing"
+    return "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +265,7 @@ class _FamilyObservation:
     presence: str
     fingerprint: str
     has_records: bool
+    error_type: str | None = None
 
     @classmethod
     def from_details(
@@ -269,6 +279,57 @@ class _FamilyObservation:
             has_records,
         )
 
+    @classmethod
+    def failed(cls, family: str, error_type: str) -> _FamilyObservation:
+        """Build bounded evidence for a family that could not be observed."""
+        return cls(
+            (),
+            "failed",
+            _fingerprint_details({"family": family, "error_type": error_type}),
+            False,
+            error_type,
+        )
+
+
+@dataclass(slots=True)
+class _FamilyObservationAccumulator:
+    """Collect one durable observation per frozen family."""
+
+    observations: dict[str, _FamilyObservation]
+
+    @classmethod
+    def create(cls) -> _FamilyObservationAccumulator:
+        return cls({})
+
+    def record(self, family: str, observation: _FamilyObservation) -> None:
+        self.observations[family] = observation
+
+    def record_failure(self, family: str, error_type: str) -> _FamilyObservation:
+        observation = _FamilyObservation.failed(family, error_type)
+        self.record(family, observation)
+        return observation
+
+    @property
+    def has_records(self) -> bool:
+        return any(observation.has_records for observation in self.observations.values())
+
+    @property
+    def fingerprints(self) -> dict[str, str]:
+        return {
+            family: observation.fingerprint
+            for family, observation in self.observations.items()
+        }
+
+    @property
+    def presence(self) -> dict[str, str]:
+        return {
+            family: observation.presence
+            for family, observation in self.observations.items()
+        }
+
+    def as_date_observation(self) -> _ReconciliationObservation:
+        return _date_reconciliation_observation(self)
+
 
 @dataclass(frozen=True, slots=True)
 class _ReconciliationObservation:
@@ -277,6 +338,7 @@ class _ReconciliationObservation:
     fingerprint: str
     has_records: bool
     complete: bool
+    explicit_empty: bool
 
 
 @dataclass(slots=True)
@@ -302,44 +364,48 @@ async def _async_observe_family(
     fetch: Callable[..., Any] | None,
     target: date,
     family: str,
-    family_fingerprints: dict[str, str],
-    family_presence: dict[str, str],
+    accumulator: _FamilyObservationAccumulator,
 ) -> _FamilyObservation:
     """Read one structured family and record its bounded observation."""
     available = fetch is not None
-    details = await fetch(target, family) if fetch is not None else ()
-    observation = _FamilyObservation.from_details(details, available=available)
-    _record_family_observation(
-        family, observation, family_fingerprints, family_presence
-    )
+    try:
+        details = await fetch(target, family) if fetch is not None else ()
+        observation = _FamilyObservation.from_details(details, available=available)
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        error_type = _safe_family_error_type(error)
+        observation = accumulator.record_failure(family, error_type)
+        _LOGGER.warning("Garmin structured family failed for %s (%s)", target, family)
+        return observation
+    accumulator.record(family, observation)
     return observation
 
 
-def _record_family_observation(
-    family: str,
-    observation: _FamilyObservation,
-    family_fingerprints: dict[str, str],
-    family_presence: dict[str, str],
-) -> bool:
-    """Add one family observation and return whether it contains records."""
-    family_fingerprints[family] = observation.fingerprint
-    family_presence[family] = observation.presence
-    return observation.has_records
+def _safe_family_error_type(error: BaseException) -> str:
+    """Map a family exception to a privacy-safe public error class."""
+    return "garmin_client_error" if isinstance(error, GarminConnectError) else "sync_failed"
 
 
 def _date_reconciliation_observation(
-    family_fingerprints: Mapping[str, str],
-    has_records: bool,
-    family_presence: Mapping[str, str],
+    accumulator: _FamilyObservationAccumulator,
 ) -> _ReconciliationObservation:
     """Build the date observation used for complete and partial attempts."""
+    family_presence = accumulator.presence
+    complete = all(
+        family in family_presence
+        and family_presence[family] not in _RECONCILIATION_UNAVAILABLE_STATES
+        for family in FROZEN_ARCHIVE_FAMILIES
+    )
     return _ReconciliationObservation(
-        _fingerprint_details(family_fingerprints),
-        has_records,
-        all(
-            family in family_presence
-            and family_presence[family] not in _RECONCILIATION_UNAVAILABLE_STATES
-            for family in _RECONCILIATION_FAMILIES
+        _fingerprint_details(accumulator.fingerprints),
+        accumulator.has_records,
+        complete,
+        complete
+        and not accumulator.has_records
+        and all(
+            family_presence[family] in _RECONCILIATION_EXPLICIT_EMPTY_STATES
+            for family in FROZEN_ARCHIVE_FAMILIES
         ),
     )
 
@@ -928,7 +994,7 @@ class GarminHistoryArchive:
             raw_outcome = value.get("outcome")
             if raw_outcome is None:
                 raw_outcome = "continuity_gap" if state == "gap" and not has_records else (
-                    "records" if has_records else "empty"
+                    "records" if has_records else "incomplete"
                 )
             if raw_outcome not in _RECONCILIATION_OUTCOMES:
                 raise ValueError("Store reconciliation state is invalid")
@@ -970,19 +1036,28 @@ class GarminHistoryArchive:
         if observation is None:
             self._reconciliation[key] = _ReconciliationEntry(
                 "open", prior_fingerprint, prior_has_records,
-                "failed" if report.outcome != "written" else "empty",
+                "failed" if report.outcome != "written" else "incomplete",
             )
         else:
             has_records = observation.has_records or prior_has_records
             if report.outcome != "written":
                 outcome = "failed"
-            elif not observation.complete:
+            elif (
+                not observation.complete
+                or (not observation.explicit_empty and not observation.has_records)
+            ):
                 outcome = "incomplete"
-            elif not observation.has_records:
+            elif observation.explicit_empty:
                 outcome = "empty"
             else:
                 outcome = "records"
-            if report.outcome != "written" or is_current_date or not observation.complete or not observation.has_records:
+            if (
+                report.outcome != "written"
+                or is_current_date
+                or not observation.complete
+                or observation.explicit_empty
+                or not observation.has_records
+            ):
                 state = "open"
             elif (
                 previous is not None
@@ -1003,17 +1078,11 @@ class GarminHistoryArchive:
     def _remember_date_reconciliation_observation(
         self,
         target_key: str,
-        family_fingerprints: Mapping[str, str],
-        has_records: bool,
-        family_presence: Mapping[str, str],
+        accumulator: _FamilyObservationAccumulator,
     ) -> None:
         """Store one date observation and its exact family presence snapshot."""
-        self._reconciliation_family_presence[target_key] = dict(family_presence)
-        self._last_reconciliation_observation[target_key] = _date_reconciliation_observation(
-            family_fingerprints,
-            has_records,
-            family_presence,
-        )
+        self._reconciliation_family_presence[target_key] = accumulator.presence
+        self._last_reconciliation_observation[target_key] = accumulator.as_date_observation()
 
     async def _async_expire_empty_reconciliation_dates(self, current: date) -> None:
         """Settle empty Open Archive Dates that reached the window boundary."""
@@ -1025,7 +1094,16 @@ class GarminHistoryArchive:
             if (
                 target >= self._activation_date
                 and record.state == "open"
+                and record.outcome == "empty"
                 and not record.has_records
+                and isinstance(record.fingerprint, str)
+                and set(self._reconciliation_family_presence.get(key, {}))
+                == set(FROZEN_ARCHIVE_FAMILIES)
+                and all(
+                    self._reconciliation_family_presence[key][family]
+                    in _RECONCILIATION_EXPLICIT_EMPTY_STATES
+                    for family in FROZEN_ARCHIVE_FAMILIES
+                )
                 and current - target >= _RECONCILIATION_WINDOW
             ):
                 record.state = "settled"
@@ -1461,31 +1539,13 @@ class GarminHistoryArchive:
             self._status = HistoryStatus(HistoryArchiveState.SYNCING, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
             try:
                 presence[target_key] = {}
-                metrics: tuple[tuple[str, Any], ...] = (
-                    ("heart_rate", HEART_RATE_METADATA),
-                    ("stress", STRESS_METADATA),
-                    ("body_battery", BODY_BATTERY_METADATA),
-                    ("nightly_hrv", NIGHTLY_HRV_METADATA),
-                    ("steps", STEPS_METADATA),
-                    ("floors", FLOORS_METADATA),
-                    ("intensity_moderate", MODERATE_INTENSITY_METADATA),
-                    ("intensity_vigorous", VIGOROUS_INTENSITY_METADATA),
-                    ("respiration_raw", RESPIRATION_RAW_METADATA),
-                    ("respiration_average", RESPIRATION_AVERAGE_METADATA),
-                    ("spo2_single", SPO2_SINGLE_METADATA),
-                    ("spo2_continuous", SPO2_CONTINUOUS_METADATA),
-                    ("spo2_hourly", SPO2_HOURLY_METADATA),
-                    ("daily_summary", None),
-                    ("training_status", None),
-                )
+                metrics: tuple[tuple[str, Any], ...] = _NUMERIC_FAMILY_METADATA
                 if not include_training_status:
                     metrics = tuple(item for item in metrics if item[0] != "training_status")
                 failed_families: set[str] = set()
                 failed_family_error = "sync_failed"
                 numeric_write_failed = False
-                family_fingerprints: dict[str, str] = {}
-                current_family_presence: dict[str, str] = {}
-                observation_has_records = False
+                family_observations = _FamilyObservationAccumulator.create()
                 events_by_year = {year: dict(records) for year, records in self._health_events.items()}
                 activities_by_year = {year: dict(records) for year, records in self._activities.items()}
                 for metric, metadata in metrics:
@@ -1499,18 +1559,9 @@ class GarminHistoryArchive:
                         failed_families.add(metric)
                         failed_family_error = error.error_type
                         presence.setdefault(target_key, {})[metric] = "failed"
-                        current_family_presence[metric] = "failed"
                         if error.observation is not None:
-                            observation_has_records = (
-                                _record_family_observation(
-                                    metric,
-                                    error.observation,
-                                    family_fingerprints,
-                                    current_family_presence,
-                                )
-                                or observation_has_records
-                            )
-                            current_family_presence[metric] = "failed"
+                            family_observations.record(metric, error.observation)
+                        family_observations.record_failure(metric, error.error_type)
                         _LOGGER.warning(
                             "Garmin numeric family failed for %s (%s)", target_key, metric
                         )
@@ -1522,7 +1573,7 @@ class GarminHistoryArchive:
                         failed_families.add(metric)
                         failed_family_error = "garmin_client_error"
                         presence.setdefault(target_key, {})[metric] = "failed"
-                        current_family_presence[metric] = "failed"
+                        family_observations.record_failure(metric, failed_family_error)
                         _LOGGER.warning(
                             "Garmin numeric family failed for %s (%s)", target_key, metric
                         )
@@ -1530,8 +1581,8 @@ class GarminHistoryArchive:
                     except (AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError) as error:
                         failed_families.add(metric)
                         presence.setdefault(target_key, {})[metric] = "failed"
-                        current_family_presence[metric] = "failed"
                         failed_family_error = "sync_failed"
+                        family_observations.record_failure(metric, failed_family_error)
                         _LOGGER.warning(
                             "Garmin numeric family failed for %s (%s)", target_key, metric
                         )
@@ -1540,16 +1591,7 @@ class GarminHistoryArchive:
                     inserted += metric_result.inserted_count
                     updated += metric_result.updated_count
                     skipped += metric_result.skipped_count
-                    observation_has_records = (
-                        _record_family_observation(
-                            metric,
-                            metric_result.observation,
-                            family_fingerprints,
-                            current_family_presence,
-                        )
-                        or observation_has_records
-                    )
-                    current_family_presence[metric] = metric_result.observation.presence
+                    family_observations.record(metric, metric_result.observation)
                 try:
                     structured_descriptor = inspect.getattr_static(source, "async_fetch_details")
                 except AttributeError:
@@ -1561,15 +1603,17 @@ class GarminHistoryArchive:
                     else None,
                     target,
                     "sleep_sessions",
-                    family_fingerprints,
-                    current_family_presence,
+                    family_observations,
                 )
                 sleep_details = sleep_observation.details
-                observation_has_records = (
-                    sleep_observation.has_records or observation_has_records
-                )
+                if sleep_observation.presence == "failed":
+                    failed_families.add("sleep_sessions")
+                    failed_family_error = sleep_observation.error_type or "sync_failed"
                 if not isinstance(sleep_details, tuple) or any(not isinstance(item, SleepSession) for item in sleep_details):
-                    raise SleepSchemaError("sleep session result has invalid shape")
+                    failed_families.add("sleep_sessions")
+                    failed_family_error = "sync_failed"
+                    family_observations.record_failure("sleep_sessions", failed_family_error)
+                    sleep_details = ()
                 invalid_sleep_streams: set[tuple[str, str]] = set()
                 for session in sleep_details:
                     for stream in session.streams:
@@ -1639,9 +1683,12 @@ class GarminHistoryArchive:
                     if key.startswith(_SLEEP_PRESENCE_PREFIX):
                         del date_presence[key]
                 date_presence.update(_aggregate_sleep_presence(observed_sleep_sessions, target))
-                self._remember_date_reconciliation_observation(
-                    target_key, family_fingerprints, observation_has_records, current_family_presence
-                )
+                for event in health_events:
+                    year = str((event.start or event.occurrence or datetime.combine(event.calendar_date, time.min, tzinfo=UTC)).year)
+                    structured_dirty_years.add(year)
+                    events_by_year.setdefault(year, {})[event.logical_id] = health_event_record(event)
+                health_events.clear()
+                self._remember_date_reconciliation_observation(target_key, family_observations)
                 await self._async_persist_observed_structured_records(
                     presence=presence,
                     sessions_by_year=sleep_sessions,
@@ -1656,45 +1703,48 @@ class GarminHistoryArchive:
                         else None,
                         target,
                         event_metric,
-                        family_fingerprints,
-                        current_family_presence,
+                        family_observations,
                     )
                     event_details = event_observation.details
-                    observation_has_records = (
-                        event_observation.has_records or observation_has_records
-                    )
+                    if event_observation.presence == "failed":
+                        failed_families.add(event_metric)
+                        failed_family_error = event_observation.error_type or "sync_failed"
+                        continue
                     if not isinstance(event_details, tuple) or any(not isinstance(item, NormalizedHealthEvent) for item in event_details):
-                        raise ValueError("health event result has invalid shape")
-                    health_events.extend(event_details)
-                for event in health_events:
-                    year = str((event.start or event.occurrence or datetime.combine(event.calendar_date, time.min, tzinfo=UTC)).year)
-                    structured_dirty_years.add(year)
-                    events_by_year.setdefault(year, {})[event.logical_id] = health_event_record(event)
-                self._remember_date_reconciliation_observation(
-                    target_key, family_fingerprints, observation_has_records, current_family_presence
-                )
-                await self._async_persist_observed_structured_records(
-                    presence=presence,
-                    sessions_by_year=sleep_sessions,
-                    events_by_year=events_by_year,
-                    activities_by_year=activities_by_year,
-                    dirty_years=structured_dirty_years,
-                )
+                        failed_families.add(event_metric)
+                        failed_family_error = "health_event_schema"
+                        family_observations.record_failure(event_metric, failed_family_error)
+                        continue
+                    for event in event_details:
+                        year = str((event.start or event.occurrence or datetime.combine(event.calendar_date, time.min, tzinfo=UTC)).year)
+                        structured_dirty_years.add(year)
+                        events_by_year.setdefault(year, {})[event.logical_id] = health_event_record(event)
+                    self._remember_date_reconciliation_observation(target_key, family_observations)
+                    await self._async_persist_observed_structured_records(
+                        presence=presence,
+                        sessions_by_year=sleep_sessions,
+                        events_by_year=events_by_year,
+                        activities_by_year=activities_by_year,
+                        dirty_years=structured_dirty_years,
+                    )
                 activity_observation = await _async_observe_family(
                     structured_fetch
                     if callable(structured_descriptor) and callable(structured_fetch)
                     else None,
                     target,
                     "timed_activities",
-                    family_fingerprints,
-                    current_family_presence,
+                    family_observations,
                 )
                 activity_details = activity_observation.details
-                observation_has_records = (
-                    activity_observation.has_records or observation_has_records
-                )
+                if activity_observation.presence == "failed":
+                    failed_families.add("timed_activities")
+                    failed_family_error = activity_observation.error_type or "sync_failed"
+                    activity_details = ()
                 if not isinstance(activity_details, tuple) or any(not isinstance(item, NormalizedActivity) for item in activity_details):
-                    raise ValueError("activity result has invalid shape")
+                    failed_families.add("timed_activities")
+                    failed_family_error = "activity_schema"
+                    family_observations.record_failure("timed_activities", failed_family_error)
+                    activity_details = ()
                 fit_count = 0
                 fit_deferred = False
                 for activity in activity_details:
@@ -1713,6 +1763,18 @@ class GarminHistoryArchive:
                         "end": activity.end.isoformat() if activity.end else None, "duration_seconds": activity.duration_seconds,
                         "training_effect": activity.training_effect, "load": activity.load, "recovery": activity.recovery,
                     }
+                self._remember_date_reconciliation_observation(target_key, family_observations)
+                await self._async_persist_observed_structured_records(
+                    presence=presence,
+                    sessions_by_year=sleep_sessions,
+                    events_by_year=events_by_year,
+                    activities_by_year=activities_by_year,
+                    dirty_years=structured_dirty_years,
+                )
+                for activity in activity_details:
+                    if activity.calendar_date != target:
+                        continue
+                    year = str(activity.calendar_date.year)
                     download_activity = getattr(client, "download_activity", None)
                     if callable(download_activity):
                         if activity.logical_id in self._fit_archives.get(year, {}):
@@ -1730,9 +1792,7 @@ class GarminHistoryArchive:
                         )
                         self._fit_archives.setdefault(year, {})[activity.logical_id] = fit_result
                         fit_count += 1
-                self._remember_date_reconciliation_observation(
-                    target_key, family_fingerprints, observation_has_records, current_family_presence
-                )
+                self._remember_date_reconciliation_observation(target_key, family_observations)
                 if failed_families:
                     await self._async_save_numeric_source_manifest()
                     if not numeric_write_failed:
@@ -1886,16 +1946,12 @@ class GarminHistoryArchive:
                 self._numeric_source_date_dirty_years.difference_update(numeric_checkpoint_years)
                 self._completed_dates = completed_dates
                 self._presence = presence
-                self._remember_date_reconciliation_observation(
-                    target_key, family_fingerprints, observation_has_records, current_family_presence
-                )
+                self._remember_date_reconciliation_observation(target_key, family_observations)
             except asyncio.CancelledError:
                 self._status = HistoryStatus(self._resting_state(), current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
                 raise
             except _NumericFamilyError as error:
-                self._remember_date_reconciliation_observation(
-                    target_key, family_fingerprints, observation_has_records, current_family_presence
-                )
+                self._remember_date_reconciliation_observation(target_key, family_observations)
                 self._runtime_sync_failure = True
                 self._status = HistoryStatus(
                     HistoryArchiveState.FAILED,
@@ -1924,9 +1980,7 @@ class GarminHistoryArchive:
                         type(error).__name__,
                         target_key,
                     )
-                self._remember_date_reconciliation_observation(
-                    target_key, family_fingerprints, observation_has_records, current_family_presence
-                )
+                self._remember_date_reconciliation_observation(target_key, family_observations)
                 self._runtime_sync_failure = True
                 error_type = "garmin_client_error" if isinstance(error, GarminConnectError) else "sync_failed"
                 self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type=error_type, **self._backfill_status_fields())
@@ -2896,7 +2950,7 @@ class GarminHistoryArchive:
             for family, state in families.items():
                 if (
                     not isinstance(family, str)
-                    or family not in _RECONCILIATION_FAMILIES
+                    or family not in FROZEN_ARCHIVE_FAMILIES
                     or state not in _PRESENCE_STATES
                 ):
                     raise ValueError("Store reconciliation family presence is invalid")

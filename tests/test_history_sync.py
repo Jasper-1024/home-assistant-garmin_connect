@@ -1578,6 +1578,61 @@ async def test_health_events_archive_before_checkpoint_and_calendar_restart():
 
 
 @pytest.mark.asyncio
+async def test_structured_health_family_is_queryable_when_following_family_fails() -> None:
+    """Each structured family is durable before the next family is fetched."""
+    target = date(2026, 7, 24)
+    event = normalize_health_events(
+        {
+            "events": [
+                {
+                    "source": "GARMIN",
+                    "type": "walking",
+                    "category": "activity",
+                    "startTime": "2026-07-24T10:00:00Z",
+                    "endTime": "2026-07-24T10:15:00Z",
+                }
+            ]
+        },
+        target,
+    )[0]
+
+    class Source:
+        async def async_fetch_details(self, request_date, metric):
+            if metric == "health_events_daily":
+                return (event,)
+            if metric == "health_events_body_battery":
+                raise GarminConnectError("body battery endpoint failed")
+            return ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    stores = {"garmin_connect.e.history_catalog": _NamedStore()}
+    archive = _partition_archive(Source(), recorder, stores)
+    await archive.async_start()
+
+    report = await archive.async_sync_range(target, target)
+
+    assert report.outcome == "failed"
+    events = await GarminHealthEventsCalendar(archive, "e").async_get_events(
+        MagicMock(),
+        datetime(2026, 7, 24, tzinfo=UTC),
+        datetime(2026, 7, 25, tzinfo=UTC),
+    )
+    assert [item.summary for item in events] == ["activity"]
+
+    restarted = _partition_archive(Source(), recorder, stores)
+    await restarted.async_start()
+    assert [
+        item.summary
+        for item in await GarminHealthEventsCalendar(restarted, "e").async_get_events(
+            MagicMock(),
+            datetime(2026, 7, 24, tzinfo=UTC),
+            datetime(2026, 7, 25, tzinfo=UTC),
+        )
+    ] == ["activity"]
+
+
+@pytest.mark.asyncio
 async def test_occurrence_only_health_event_is_a_positive_calendar_interval() -> None:
     occurrence = datetime(2026, 7, 24, 10, 0, tzinfo=UTC)
     event = normalize_health_events(
