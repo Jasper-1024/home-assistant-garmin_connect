@@ -278,13 +278,21 @@ def _manual_repair_archive(
     )
     recorder = MagicMock()
     recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+
+    annual_stores: dict[str, FakeStore] = {}
+
+    def store_factory(_hass: object, _version: int, path: str, **kwargs: object) -> FakeStore:
+        if path.endswith(".history_catalog"):
+            return store
+        return annual_stores.setdefault(path, FakeStore())
+
     return GarminHistoryArchive(
         _hass(),
         entry,
         recorder_checker=FakeRecorderChecker(
             RecorderCompatibilityResult.compatible_result()
         ),
-        store_factory=_store_factory(store),
+        store_factory=store_factory,
         source_factory=lambda *_args: source,
         recorder_factory=lambda: recorder,
     )
@@ -3994,6 +4002,100 @@ async def test_manual_repair_accepts_one_and_31_days_but_rejects_32_before_reque
     assert set(source.requested) == {
         start + timedelta(days=offset) for offset in range(31)
     }
+
+
+@pytest.mark.asyncio
+async def test_manual_repair_keeps_per_date_results_when_a_later_date_fails() -> None:
+    """A failed range operation cannot overwrite or invent date outcomes."""
+    first = date(2026, 7, 24)
+    second = first + timedelta(days=1)
+    third = second + timedelta(days=1)
+    store = _reconciliation_store(first)
+    store.data["reconciliation"].update(
+        {
+            second.isoformat(): {
+                "state": "open",
+                "fingerprint": None,
+                "has_records": False,
+                "outcome": "empty",
+            },
+            third.isoformat(): {
+                "state": "settled",
+                "fingerprint": "a" * 64,
+                "has_records": True,
+                "outcome": "records",
+            },
+        }
+    )
+
+    class FailLaterDateSource(ReconciliationSource):
+        def __init__(self) -> None:
+            super().__init__({first: (72.0,), second: (73.0,)})
+            self.fail_second = True
+            self.first_event = normalize_health_events(
+                {
+                    "events": [
+                        {
+                            "source": "garmin",
+                            "type": "daily_event",
+                            "category": "health",
+                            "occurrenceTime": "2026-07-24T01:00:00+00:00",
+                        }
+                    ]
+                },
+                first,
+            )[0]
+
+        async def async_fetch_details(self, target: date, metric: str) -> object:
+            if target == second and self.fail_second:
+                self.requested.append(target)
+                raise RuntimeError("second date unavailable")
+            if target == first and metric == "health_events_daily":
+                self.requested.append(target)
+                return (self.first_event,)
+            return await super().async_fetch_details(target, metric)
+
+    source = FailLaterDateSource()
+    archive = _manual_repair_archive(store, source)
+    await archive.async_start()
+
+    report = await archive.async_sync_range(first, third)
+
+    assert report.outcome == "failed"
+    assert source.requested.count(first) == 19
+    assert source.requested.count(second) == 19
+    assert source.requested.count(third) == 0
+    assert archive.get_history_presence(first, third)[first.isoformat()][
+        "heart_rate"
+    ] == "present"
+    assert archive.get_history_presence(first, third)[second.isoformat()][
+        "heart_rate"
+    ] == "failed"
+    assert third.isoformat() not in archive.get_history_presence(first, third)
+    assert store.data["event_index"] == {"2026": [source.first_event.logical_id]}
+    calendar_events = await archive.async_get_calendar_events("health", first, third)
+    assert [event.summary for event in calendar_events] == ["health"]
+    assert store.data["reconciliation"][first.isoformat()]["outcome"] == "records"
+    assert store.data["reconciliation"][second.isoformat()]["state"] == "open"
+    assert store.data["reconciliation"][second.isoformat()]["outcome"] == "failed"
+    assert store.data["reconciliation"][third.isoformat()] == {
+        "state": "settled",
+        "fingerprint": "a" * 64,
+        "has_records": True,
+        "outcome": "records",
+    }
+
+    source.fail_second = False
+    retry = await archive.async_sync_range(second, second)
+
+    assert retry.outcome == "written"
+    assert source.requested.count(second) == 38
+    assert source.requested.count(third) == 0
+    assert store.data["reconciliation"][second.isoformat()]["state"] == "open"
+    assert store.data["reconciliation"][second.isoformat()]["outcome"] == "records"
+    assert archive.get_history_presence(second, second)[second.isoformat()][
+        "heart_rate"
+    ] == "present"
 
 
 async def test_different_entries_get_different_account_keys() -> None:

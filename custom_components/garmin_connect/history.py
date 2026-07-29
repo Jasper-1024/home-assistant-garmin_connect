@@ -8,7 +8,7 @@ import inspect
 import json
 import logging
 import secrets
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, timezone
 from enum import StrEnum
@@ -652,6 +652,7 @@ class HistorySyncReport:
     fit_count: int = 0
     outcome: str = "not_implemented"
     error_type: str | None = None
+    date_results: tuple[tuple[date, HistorySyncReport], ...] = ()
 
 
 class _InvalidArchiveActivationDateError(ValueError):
@@ -1564,18 +1565,7 @@ class GarminHistoryArchive:
             return HistorySyncReport(outcome="busy", error_type="sync_in_progress")
 
         async with self._sync_lock:
-            forced_dates = tuple(
-                start_date.fromordinal(start_date.toordinal() + offset)
-                for offset in range((end_date - start_date).days + 1)
-            )
-            changed = False
-            for target in forced_dates:
-                entry = self._reconciliation.get(target.isoformat())
-                if entry is not None and entry.state == "settled":
-                    entry.state = "open"
-                    changed = True
-            if changed:
-                await self._async_save_reconciliation_state()
+            forced_dates = tuple(_iter_inclusive_dates(start_date, end_date))
             report = await self._async_sync_range(
                 start_date,
                 end_date,
@@ -1583,13 +1573,10 @@ class GarminHistoryArchive:
                 include_training_status=include_training_status,
                 force_dates=frozenset(forced_dates),
             )
-            processed_dates = report.processed_dates
-            if report.outcome == "failed" and not processed_dates:
-                processed_dates = forced_dates
-            for target in processed_dates:
+            for target, target_report in report.date_results:
                 # One Manual Repair observation must not settle a date without
                 # the later unchanged confirmation used by automatic work.
-                await self._async_update_reconciliation_state(target, report)
+                await self._async_update_reconciliation_state(target, target_report)
             return report
 
     async def _async_fetch_numeric_detail(
@@ -1815,6 +1802,7 @@ class GarminHistoryArchive:
             self._status = HistoryStatus(HistoryArchiveState.FAILED, error_type="store_unavailable", **self._backfill_status_fields())
             return HistorySyncReport(outcome="failed", error_type="store_unavailable")
         processed: list[date] = []
+        date_results: list[tuple[date, HistorySyncReport]] = []
         skipped = 0
         inserted = 0
         updated = 0
@@ -1836,8 +1824,7 @@ class GarminHistoryArchive:
         sleep_sessions = checkpoint.sessions_by_year
         structured_dirty_years = checkpoint.dirty_years
         self._status = HistoryStatus(HistoryArchiveState.SYNCING, **self._backfill_status_fields())
-        for offset in range((end_date - start_date).days + 1):
-            target = start_date.fromordinal(start_date.toordinal() + offset)
+        for target in _iter_inclusive_dates(start_date, end_date):
             target_key = target.isoformat()
             if (
                 target_key in self._completed_dates
@@ -1846,8 +1833,16 @@ class GarminHistoryArchive:
             ):
                 skipped += 1
                 processed.append(target)
+                date_results.append(
+                    (target, HistorySyncReport(outcome="written", skipped_count=1))
+                )
                 self._status = HistoryStatus(HistoryArchiveState.SYNCING, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
                 continue
+            if target in force_dates:
+                entry = self._reconciliation.get(target_key)
+                if entry is not None and entry.state == "settled":
+                    entry.state = "open"
+                    await self._async_save_reconciliation_state()
             self._status = HistoryStatus(HistoryArchiveState.SYNCING, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
             try:
                 presence[target_key] = {}
@@ -2226,9 +2221,18 @@ class GarminHistoryArchive:
                         error_type=failed_family_error,
                         **self._backfill_status_fields(),
                     )
+                    date_results.append(
+                        (
+                            target,
+                            HistorySyncReport(
+                                outcome="failed", error_type=failed_family_error
+                            ),
+                        )
+                    )
                     return HistorySyncReport(
                         tuple(processed), inserted, updated, skipped,
                         outcome="failed", error_type=failed_family_error,
+                        date_results=tuple(date_results),
                     )
                 for year, pending_dates in self._numeric_source_date_pending.items():
                     if target_key not in pending_dates or self._numeric_source_date_is_repaired(
@@ -2269,7 +2273,23 @@ class GarminHistoryArchive:
                     if fail_on_fit_limit:
                         self._runtime_sync_failure = True
                         self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, error_type="fit_limit_pending", **self._backfill_status_fields())
-                        return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome="failed", error_type="fit_limit_pending")
+                        date_results.append(
+                            (
+                                target,
+                                HistorySyncReport(
+                                    outcome="failed", error_type="fit_limit_pending"
+                                ),
+                            )
+                        )
+                        return HistorySyncReport(
+                            tuple(processed),
+                            inserted,
+                            updated,
+                            skipped,
+                            outcome="failed",
+                            error_type="fit_limit_pending",
+                            date_results=tuple(date_results),
+                        )
                     self._presence = presence
                     continue
                 # Publish the catalog checkpoint only after every affected annual
@@ -2350,6 +2370,7 @@ class GarminHistoryArchive:
                 self._completed_dates = completed_dates
                 self._presence = presence
                 self._remember_date_reconciliation_observation(target_key, family_observations)
+                date_results.append((target, HistorySyncReport(outcome="written")))
             except asyncio.CancelledError:
                 self._remember_date_reconciliation_observation(
                     target_key, family_observations
@@ -2384,6 +2405,12 @@ class GarminHistoryArchive:
                     include_partition=not error.write_failure
                 )
                 self._runtime_sync_failure = True
+                date_results.append(
+                    (
+                        target,
+                        HistorySyncReport(outcome="failed", error_type=error.error_type),
+                    )
+                )
                 self._status = HistoryStatus(
                     HistoryArchiveState.FAILED,
                     current_date=target_key,
@@ -2395,6 +2422,7 @@ class GarminHistoryArchive:
                 return HistorySyncReport(
                     tuple(processed), inserted, updated, skipped,
                     outcome="failed", error_type=error.error_type,
+                    date_results=tuple(date_results),
                 )
             except (GarminConnectError, AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError) as error:
                 self._remember_date_reconciliation_observation(target_key, family_observations)
@@ -2422,11 +2450,32 @@ class GarminHistoryArchive:
                     )
                 self._runtime_sync_failure = True
                 error_type = "garmin_client_error" if isinstance(error, GarminConnectError) else "sync_failed"
+                date_results.append(
+                    (
+                        target,
+                        HistorySyncReport(outcome="failed", error_type=error_type),
+                    )
+                )
                 self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type=error_type, **self._backfill_status_fields())
-                return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome="failed", error_type=error_type)
+                return HistorySyncReport(
+                    tuple(processed),
+                    inserted,
+                    updated,
+                    skipped,
+                    outcome="failed",
+                    error_type=error_type,
+                    date_results=tuple(date_results),
+                )
         self._runtime_sync_failure = False
         self._status = HistoryStatus(self._resting_state(), current_date=end_date.isoformat(), processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
-        return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome="written")
+        return HistorySyncReport(
+            tuple(processed),
+            inserted,
+            updated,
+            skipped,
+            outcome="written",
+            date_results=tuple(date_results),
+        )
 
     def _catalog_record(
         self,
@@ -3538,6 +3587,12 @@ def _is_valid_account_key(value: str) -> bool:
     return _ACCOUNT_KEY_MIN_LENGTH <= len(value) <= _ACCOUNT_KEY_MAX_LENGTH and not (
         set(value) - _ACCOUNT_KEY_ALPHABET
     )
+
+
+def _iter_inclusive_dates(start_date: date, end_date: date) -> Iterator[date]:
+    """Yield every calendar date in an inclusive range."""
+    for offset in range((end_date - start_date).days + 1):
+        yield start_date.fromordinal(start_date.toordinal() + offset)
 
 
 def _validate_sync_range(start_date: date, end_date: date) -> str | None:
