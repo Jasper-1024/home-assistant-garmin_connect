@@ -420,7 +420,7 @@ def _timestamp(value: Any, *, allow_date_only: bool = False) -> datetime | None:
         number = float(value) / (1000 if abs(float(value)) >= 100_000_000_000 else 1)
         try:
             return datetime.fromtimestamp(number, tz=UTC)
-        except OverflowError, OSError, ValueError:
+        except (OverflowError, OSError, ValueError):
             return None
     if isinstance(value, str) and value:
         try:

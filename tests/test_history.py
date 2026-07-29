@@ -131,6 +131,285 @@ def _store_factory(store: FakeStore):
     return factory
 
 
+_RECONCILIATION_FAMILIES_FOR_TEST = (
+    "heart_rate", "stress", "body_battery", "nightly_hrv", "steps", "floors",
+    "intensity_moderate", "intensity_vigorous", "respiration_raw",
+    "respiration_average", "spo2_single", "spo2_continuous", "spo2_hourly",
+    "daily_summary", "training_status", "sleep_sessions", "health_events_daily",
+    "health_events_body_battery", "timed_activities",
+)
+
+
+def _reconciliation_store(
+    target: date,
+    *,
+    state: str = "open",
+    has_records: bool = False,
+) -> FakeStore:
+    """Build the smallest durable catalog for automatic-date tests."""
+    families = dict.fromkeys(_RECONCILIATION_FAMILIES_FOR_TEST, "empty")
+    return FakeStore(
+        {
+            "schema_version": 1,
+            "account_key": "opaque-account-key-1234567890",
+            "completed_dates": [],
+            "reconciliation": {
+                target.isoformat(): {
+                    "state": state,
+                    "fingerprint": None,
+                    "has_records": has_records,
+                }
+            },
+            "reconciliation_family_presence": {target.isoformat(): families},
+            "hrv_summaries": {},
+            "numeric_source_date_index": [],
+            "numeric_source_date_dates": {},
+            "numeric_source_date_pending": {},
+            "numeric_source_date_tombstones": {},
+            "numeric_source_date_outbox": {},
+            "numeric_source_date_confirmed": {},
+            "presence": {},
+            "sleep_index": {},
+            "event_index": {},
+            "activity_index": {},
+        }
+    )
+
+
+class ReconciliationSource:
+    """Deterministic source returning one mutable heart-rate family."""
+
+    def __init__(self, values: dict[date, tuple[float, ...]]) -> None:
+        self.values = values
+        self.requested: list[date] = []
+
+    async def async_fetch_details(self, target: date, metric: str) -> object:
+        self.requested.append(target)
+        if metric in {
+            "sleep_sessions",
+            "health_events_daily",
+            "health_events_body_battery",
+            "timed_activities",
+        }:
+            return ()
+        values = self.values.get(target, ()) if metric == "heart_rate" else ()
+        samples = tuple(
+            NormalizedSample(
+                datetime(2026, 8, 1, index, tzinfo=UTC),
+                target,
+                f"{target.isoformat()}T{index:02d}:00:00Z",
+                value,
+            )
+            for index, value in enumerate(values)
+        )
+        return SourceSeries(samples, "present" if samples else "empty")
+
+
+def _enabled_reconciliation_archive(
+    store: FakeStore,
+    source: ReconciliationSource,
+    now: list[datetime],
+    timer: DeterministicTimer,
+    activation_date: str = "2026-08-01",
+) -> GarminHistoryArchive:
+    """Create an enabled archive with deterministic automatic cycles."""
+    hass = _hass()
+    entry = _entry(
+        data={
+            "history_account_key": "opaque-account-key-1234567890",
+            CONF_ARCHIVE_ACTIVATION_DATE: activation_date,
+            CONF_ARCHIVE_PREVIOUSLY_ENABLED: True,
+        }
+    )
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=object()
+    )
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    return GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(
+            RecorderCompatibilityResult.compatible_result()
+        ),
+        store_factory=_store_factory(store),
+        source_factory=lambda *_args: source,
+        recorder_factory=lambda: recorder,
+        clock=lambda: now[0],
+        timer_factory=timer.call_later,
+    )
+
+
+async def _run_reconciliation_cycle(
+    archive: GarminHistoryArchive, timer: DeterministicTimer
+) -> None:
+    """Fire one deterministic cadence and await its single-flight task."""
+    timer.fire_next()
+    task = archive._cycle_task
+    assert task is not None
+    await task
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_requires_one_later_unchanged_confirmation() -> None:
+    target = date(2026, 8, 4)
+    store = _reconciliation_store(target)
+    source = ReconciliationSource({target: (72.0,)})
+    now = [datetime(2026, 8, 5, tzinfo=UTC)]
+    timer = DeterministicTimer()
+    archive = _enabled_reconciliation_archive(store, source, now, timer)
+
+    await archive.async_start()
+    await archive._first_sync_task
+    await _run_reconciliation_cycle(archive, timer)
+
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
+    assert source.requested.count(target) == 19
+
+    await _run_reconciliation_cycle(archive, timer)
+
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "settled"
+    assert source.requested.count(target) == 38
+    await archive.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_retries_empty_then_saves_delayed_and_changed_data() -> None:
+    target = date(2026, 8, 4)
+    store = _reconciliation_store(target)
+    source = ReconciliationSource({target: ()})
+    now = [datetime(2026, 8, 5, tzinfo=UTC)]
+    timer = DeterministicTimer()
+    archive = _enabled_reconciliation_archive(store, source, now, timer)
+
+    await archive.async_start()
+    await archive._first_sync_task
+    await _run_reconciliation_cycle(archive, timer)
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
+    assert source.requested.count(target) == 19
+
+    source.values[target] = (70.0,)
+    await _run_reconciliation_cycle(archive, timer)
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
+
+    source.values[target] = (71.0,)
+    await _run_reconciliation_cycle(archive, timer)
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
+
+    await _run_reconciliation_cycle(archive, timer)
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "settled"
+    assert source.requested.count(target) == 76
+    await archive.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_empty_archive_date_settles_as_gap_at_window_boundary() -> None:
+    target = date(2026, 8, 1)
+    store = _reconciliation_store(target)
+    source = ReconciliationSource({})
+    now = [datetime(2026, 8, 2, tzinfo=UTC)]
+    timer = DeterministicTimer()
+    archive = _enabled_reconciliation_archive(store, source, now, timer)
+
+    await archive.async_start()
+    await archive._first_sync_task
+    await _run_reconciliation_cycle(archive, timer)
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
+    assert source.requested.count(target) == 19
+
+    now[0] = datetime(2026, 8, 8, tzinfo=UTC)
+    await _run_reconciliation_cycle(archive, timer)
+
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "gap"
+    assert source.requested.count(target) == 19
+    await archive.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_settled_date_is_local_first_and_survives_restart() -> None:
+    target = date(2026, 8, 4)
+    store = _reconciliation_store(target, state="settled")
+    source = ReconciliationSource({target: (72.0,)})
+    now = [datetime(2026, 8, 5, tzinfo=UTC)]
+    timer = DeterministicTimer()
+    archive = _enabled_reconciliation_archive(store, source, now, timer)
+
+    await archive.async_start()
+    await archive._first_sync_task
+    await _run_reconciliation_cycle(archive, timer)
+    assert source.requested.count(target) == 0
+    await archive.async_stop()
+
+    store.data["reconciliation"][target.isoformat()]["state"] = "open"
+    source.values[target] = (73.0,)
+    now[0] = datetime(2026, 8, 6, tzinfo=UTC)
+    restarted_timer = DeterministicTimer()
+    restarted = _enabled_reconciliation_archive(store, source, now, restarted_timer)
+    await restarted.async_start()
+    await restarted._first_sync_task
+    await _run_reconciliation_cycle(restarted, restarted_timer)
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
+    await _run_reconciliation_cycle(restarted, restarted_timer)
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "settled"
+    assert source.requested.count(target) == 38
+    await restarted.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_respects_activation_boundary_and_current_rollover() -> None:
+    before_activation = date(2026, 8, 1)
+    store = _reconciliation_store(before_activation)
+    source = ReconciliationSource({before_activation: (70.0,)})
+    now = [datetime(2026, 8, 3, tzinfo=UTC)]
+    timer = DeterministicTimer()
+    archive = _enabled_reconciliation_archive(
+        store, source, now, timer, activation_date="2026-08-02"
+    )
+
+    await archive.async_start()
+    await archive._first_sync_task
+    await _run_reconciliation_cycle(archive, timer)
+    assert source.requested.count(before_activation) == 0
+
+    now[0] = datetime(2026, 8, 4, tzinfo=UTC)
+    await _run_reconciliation_cycle(archive, timer)
+    assert date(2026, 8, 3) in source.requested
+    await archive.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_disablement_stops_reconciliation_and_retains_ledger() -> None:
+    target = date(2026, 8, 4)
+    store = _reconciliation_store(target)
+    hass = _hass()
+    entry = _entry(
+        data={
+            "history_account_key": "opaque-account-key-1234567890",
+            CONF_ARCHIVE_ACTIVATION_DATE: "2026-08-01",
+            CONF_ARCHIVE_PREVIOUSLY_ENABLED: True,
+        }
+    )
+    entry.options = {CONF_ARCHIVE_ENABLED: False}
+    source = MagicMock()
+    source.async_fetch = AsyncMock(return_value=())
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(
+            RecorderCompatibilityResult.compatible_result()
+        ),
+        store_factory=_store_factory(store),
+        source_factory=lambda *_args: source,
+    )
+
+    await archive.async_start()
+
+    assert archive.status.state is HistoryArchiveState.DISABLED
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
+    source.async_fetch.assert_not_awaited()
+
+
 def _archive(
     hass: MagicMock,
     entry: MagicMock,

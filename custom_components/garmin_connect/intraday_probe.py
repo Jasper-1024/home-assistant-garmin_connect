@@ -55,7 +55,7 @@ def _timestamp_ms_to_iso(value: Any) -> str | None:
         timestamp /= 1000
     try:
         return datetime.fromtimestamp(timestamp, tz=UTC).isoformat()
-    except OSError, OverflowError, ValueError:
+    except (OSError, OverflowError, ValueError):
         return None
 
 

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import logging
 import secrets
 from collections.abc import Callable, Collection, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -115,6 +117,7 @@ _HISTORY_MIN_DATE = date(2026, 1, 1)
 _HISTORY_MAX_DAYS = 31
 _FIRST_SYNC_FIT_LIMIT = 1
 _PROSPECTIVE_CYCLE_INTERVAL = timedelta(minutes=15)
+_RECONCILIATION_WINDOW = timedelta(days=7)
 _PROSPECTIVE_CYCLE_FIT_LIMIT = 0
 _DATE_SUMMARY_BUCKET_TIME_ZONE = timezone(timedelta(hours=8))
 _PRESENCE_STATES = frozenset({"null", "empty", "all-null", "missing", "unsupported", "returned-empty", "present", "absent", "failed", "mixed"})
@@ -136,6 +139,77 @@ _SLEEP_STREAM_METADATA = {
 # Garmin documents -1 as the no-data sentinel for sleep stress; it is not a
 # numeric measurement and therefore is not sent to Recorder.
 _SLEEP_NEGATIVE_SENTINELS = {"stress": frozenset({-1.0})}
+_RECONCILIATION_FAMILIES = (
+    "heart_rate",
+    "stress",
+    "body_battery",
+    "nightly_hrv",
+    "steps",
+    "floors",
+    "intensity_moderate",
+    "intensity_vigorous",
+    "respiration_raw",
+    "respiration_average",
+    "spo2_single",
+    "spo2_continuous",
+    "spo2_hourly",
+    "daily_summary",
+    "training_status",
+    "sleep_sessions",
+    "health_events_daily",
+    "health_events_body_battery",
+    "timed_activities",
+)
+_RECONCILIATION_UNAVAILABLE_STATES = frozenset(
+    {"missing", "failed", "unsupported"}
+)
+
+
+def _fingerprint_value(value: Any) -> Any:
+    """Convert normalized source details into deterministic private JSON data."""
+    if is_dataclass(value):
+        return {
+            field.name: _fingerprint_value(getattr(value, field.name))
+            for field in fields(value)
+        }
+    if isinstance(value, Mapping):
+        return {
+            str(key): _fingerprint_value(item)
+            for key, item in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, (tuple, list)):
+        return [_fingerprint_value(item) for item in value]
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
+def _fingerprint_details(value: Any) -> str:
+    """Return a stable, non-public fingerprint for one returned family."""
+    payload = json.dumps(
+        _fingerprint_value(value), sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _details_have_records(details: Any) -> bool:
+    """Return whether normalized details contain a Source Record."""
+    if isinstance(details, HRVData):
+        return bool(details.readings or details.summary is not None)
+    if isinstance(details, SegmentedData):
+        return bool(details.readings or details.totals)
+    if isinstance(details, SourceSeries):
+        return bool(details.readings or details.presence == "present")
+    if isinstance(details, SnapshotData):
+        return bool(
+            details.events
+            or any(state == "present" and value is not None for state, value in details.fields.values())
+        )
+    if isinstance(details, tuple):
+        return bool(details)
+    return False
 
 
 def _aggregate_sleep_presence(
@@ -382,7 +456,7 @@ class HomeAssistantRecorderCompatibility:
             await asyncio.wait_for(future, timeout=_RECORDER_BARRIER_TIMEOUT)
         except asyncio.CancelledError:
             raise
-        except AttributeError, ImportError, TypeError, ValueError:
+        except (AttributeError, ImportError, TypeError, ValueError):
             return RecorderCompatibilityResult.incompatible_result("recorder_signature")
         except TimeoutError:
             return RecorderCompatibilityResult.incompatible_result("recorder_barrier")
@@ -467,6 +541,9 @@ class GarminHistoryArchive:
         self._fit_archives: dict[str, dict[str, dict[str, Any]]] = {}
         self._sleep_partition_stores: dict[str, Any] = {}
         self._presence: dict[str, dict[str, str]] = {}
+        self._reconciliation_family_presence: dict[str, dict[str, str]] = {}
+        self._reconciliation: dict[str, dict[str, Any]] = {}
+        self._last_reconciliation_observation: dict[str, tuple[str, bool, bool]] = {}
         self._archive_enabled = False
         self._activation_date: date | None = None
         self._account_key_value: str | None = None
@@ -646,6 +723,9 @@ class GarminHistoryArchive:
                 fail_on_fit_limit=False,
                 force_date=target_date,
             )
+            await self._async_update_reconciliation_state(
+                target_date, report, current=True
+            )
         if report.outcome != "written":
             if self._status.state is not HistoryArchiveState.FAILED:
                 self._set_failed(report.error_type or "first_sync")
@@ -659,6 +739,134 @@ class GarminHistoryArchive:
     def _current_local_date(self) -> date:
         """Return the current Home Assistant local calendar date."""
         return dt_util.as_local(self._utc_now()).date()
+
+    async def _async_refresh_reconciliation_state(self) -> None:
+        """Reload only the private reconciliation ledger before old-date work."""
+        if self._store is None:
+            return
+        catalog = await self._store.async_load()
+        if not isinstance(catalog, Mapping):
+            return
+        self._reconciliation = self._parse_reconciliation_state(
+            catalog.get("reconciliation", {})
+        )
+
+    @staticmethod
+    def _parse_reconciliation_state(raw: Any) -> dict[str, dict[str, Any]]:
+        """Validate the bounded private Open/Settled ledger."""
+        if raw is None:
+            return {}
+        if not isinstance(raw, Mapping):
+            raise ValueError("Store reconciliation state is invalid")
+        parsed: dict[str, dict[str, Any]] = {}
+        for key, value in raw.items():
+            if not isinstance(key, str) or not isinstance(value, Mapping):
+                raise ValueError("Store reconciliation state is invalid")
+            target = date.fromisoformat(key)
+            if target.isoformat() != key or target < _HISTORY_MIN_DATE:
+                raise ValueError("Store reconciliation state is invalid")
+            state = value.get("state")
+            if state not in {"open", "settled", "gap"}:
+                raise ValueError("Store reconciliation state is invalid")
+            fingerprint = value.get("fingerprint")
+            if fingerprint is not None and (
+                not isinstance(fingerprint, str) or len(fingerprint) != 64
+            ):
+                raise ValueError("Store reconciliation state is invalid")
+            has_records = value.get("has_records", False)
+            if not isinstance(has_records, bool):
+                raise ValueError("Store reconciliation state is invalid")
+            parsed[key] = {
+                "state": state,
+                "fingerprint": fingerprint,
+                "has_records": has_records,
+            }
+        return parsed
+
+    def _eligible_reconciliation_dates(self, current: date) -> tuple[date, ...]:
+        """Return durable Open Archive Dates still inside the nominal window."""
+        if self._activation_date is None:
+            return ()
+        eligible: list[date] = []
+        for key, record in self._reconciliation.items():
+            target = date.fromisoformat(key)
+            age = current - target
+            if (
+                target < self._activation_date
+                or target >= current
+                or age >= _RECONCILIATION_WINDOW
+                or record.get("state") != "open"
+            ):
+                continue
+            eligible.append(target)
+        return tuple(sorted(eligible))
+
+    async def _async_update_reconciliation_state(
+        self, target: date, report: HistorySyncReport, *, current: bool = False
+    ) -> None:
+        """Persist one automatic observation without exposing its ledger."""
+        key = target.isoformat()
+        previous = self._reconciliation.get(key, {})
+        observation = self._last_reconciliation_observation.get(key)
+        if report.outcome != "written" or observation is None:
+            self._reconciliation[key] = {
+                "state": "open",
+                "fingerprint": previous.get("fingerprint"),
+                "has_records": bool(previous.get("has_records", False)),
+            }
+        else:
+            fingerprint, has_records, complete = observation
+            prior_has_records = bool(previous.get("has_records", False))
+            has_records = has_records or prior_has_records
+            if current or not complete or not has_records:
+                state = "open"
+            elif previous.get("state") == "open" and previous.get("fingerprint") == fingerprint:
+                state = "settled"
+            else:
+                state = "open"
+            self._reconciliation[key] = {
+                "state": state,
+                "fingerprint": fingerprint,
+                "has_records": has_records,
+            }
+        await self._async_save_reconciliation_state()
+
+    async def _async_expire_empty_reconciliation_dates(self, current: date) -> None:
+        """Settle empty Open Archive Dates that reached the window boundary."""
+        changed = False
+        for key, record in self._reconciliation.items():
+            target = date.fromisoformat(key)
+            if (
+                record.get("state") == "open"
+                and not record.get("has_records", False)
+                and current - target >= _RECONCILIATION_WINDOW
+            ):
+                record["state"] = "gap"
+                changed = True
+        if changed:
+            await self._async_save_reconciliation_state()
+
+    async def _async_save_reconciliation_state(self) -> None:
+        """Atomically persist the private reconciliation ledger."""
+        if self._store is None:
+            return
+        catalog = await self._store.async_load()
+        if not isinstance(catalog, Mapping):
+            raise ValueError("Store catalog is unavailable")
+        updated = dict(catalog)
+        updated["reconciliation"] = {
+            key: {
+                "state": value.get("state", "open"),
+                "fingerprint": value.get("fingerprint"),
+                "has_records": bool(value.get("has_records", False)),
+            }
+            for key, value in self._reconciliation.items()
+        }
+        updated["reconciliation_family_presence"] = {
+            key: dict(value)
+            for key, value in self._reconciliation_family_presence.items()
+        }
+        await self._store.async_save(updated)
 
     def _schedule_next_cycle(self) -> None:
         """Arm one nominal cadence wakeup after a successful first sync."""
@@ -704,22 +912,45 @@ class GarminHistoryArchive:
         return task
 
     async def _async_run_cycle(self) -> None:
-        """Synchronize only the current local date at background priority."""
+        """Synchronize current and durable Open Archive Dates in the background."""
         try:
             target_date = self._current_local_date()
             async with self._sync_lock:
-                report = await self._async_sync_range(
+                current_report = await self._async_sync_range(
                     target_date,
                     target_date,
                     fit_limit=_PROSPECTIVE_CYCLE_FIT_LIMIT,
                     fail_on_fit_limit=False,
                     force_date=target_date,
                 )
+                await self._async_update_reconciliation_state(
+                    target_date, current_report, current=True
+                )
+                await self._async_refresh_reconciliation_state()
+                await self._async_expire_empty_reconciliation_dates(target_date)
+                reports = [current_report]
+                for reconciliation_date in self._eligible_reconciliation_dates(
+                    target_date
+                ):
+                    reconciliation_report = await self._async_sync_range(
+                        reconciliation_date,
+                        reconciliation_date,
+                        fit_limit=_PROSPECTIVE_CYCLE_FIT_LIMIT,
+                        fail_on_fit_limit=False,
+                        force_date=reconciliation_date,
+                    )
+                    await self._async_update_reconciliation_state(
+                        reconciliation_date, reconciliation_report
+                    )
+                    reports.append(reconciliation_report)
             if (
-                report.outcome != "written"
+                any(report.outcome != "written" for report in reports)
                 and self._status.state is not HistoryArchiveState.FAILED
             ):
-                self._set_failed(report.error_type or "cycle")
+                failed_report = next(
+                    report for report in reports if report.outcome != "written"
+                )
+                self._set_failed(failed_report.error_type or "cycle")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -824,7 +1055,7 @@ class GarminHistoryArchive:
         metadata: Any,
         presence: dict[str, dict[str, str]],
         health_events: list[NormalizedHealthEvent],
-    ) -> tuple[int, int, int]:
+    ) -> tuple[int, int, int, str, bool]:
         """Import one numeric family without deciding the date checkpoint."""
         try:
             details_descriptor = inspect.getattr_static(source, "async_fetch_details")
@@ -903,9 +1134,21 @@ class GarminHistoryArchive:
                 inserted += getattr(snapshot_outcome, "inserted_count", snapshot_outcome.accepted_count)
                 updated += getattr(snapshot_outcome, "updated_count", 0)
                 skipped += getattr(snapshot_outcome, "skipped_count", 0)
-            return inserted, updated, skipped
+            return (
+                inserted,
+                updated,
+                skipped,
+                _fingerprint_details(details),
+                _details_have_records(details),
+            )
         elif metadata is None:
-            return 0, 0, 0
+            return (
+                0,
+                0,
+                0,
+                _fingerprint_details(details),
+                _details_have_records(details),
+            )
         else:
             samples = details
 
@@ -962,7 +1205,13 @@ class GarminHistoryArchive:
         inserted += getattr(outcome, "inserted_count", outcome.accepted_count)
         updated += getattr(outcome, "updated_count", 0)
         skipped += getattr(outcome, "skipped_count", 0)
-        return inserted, updated, skipped
+        return (
+            inserted,
+            updated,
+            skipped,
+            _fingerprint_details(details),
+            _details_have_records(details),
+        )
 
     async def _async_sync_range(
         self,
@@ -1007,6 +1256,10 @@ class GarminHistoryArchive:
         updated = 0
         health_events: list[NormalizedHealthEvent] = []
         presence = {key: dict(value) for key, value in self._presence.items()}
+        reconciliation_family_presence = {
+            key: dict(value)
+            for key, value in self._reconciliation_family_presence.items()
+        }
         sleep_sessions = {year: dict(records) for year, records in self._sleep_sessions.items()}
         structured_dirty_years: set[str] = set()
         self._status = HistoryStatus(HistoryArchiveState.SYNCING, **self._backfill_status_fields())
@@ -1042,9 +1295,17 @@ class GarminHistoryArchive:
                 failed_families: set[str] = set()
                 failed_family_error = "sync_failed"
                 numeric_write_failed = False
+                observation_parts: dict[str, Any] = {}
+                observation_has_records = False
                 for metric, metadata in metrics:
                     try:
-                        metric_inserted, metric_updated, metric_skipped = await self._async_import_numeric_metric(
+                        (
+                            metric_inserted,
+                            metric_updated,
+                            metric_skipped,
+                            metric_fingerprint,
+                            metric_has_records,
+                        ) = await self._async_import_numeric_metric(
                             source, recorder, target, target_key, metric, metadata, presence, health_events
                         )
                     except asyncio.CancelledError:
@@ -1053,6 +1314,7 @@ class GarminHistoryArchive:
                         failed_families.add(metric)
                         failed_family_error = error.error_type
                         presence.setdefault(target_key, {})[metric] = "failed"
+                        reconciliation_family_presence.setdefault(target_key, {})[metric] = "failed"
                         _LOGGER.warning(
                             "Garmin numeric family failed for %s (%s)", target_key, metric
                         )
@@ -1064,6 +1326,7 @@ class GarminHistoryArchive:
                         failed_families.add(metric)
                         failed_family_error = "garmin_client_error"
                         presence.setdefault(target_key, {})[metric] = "failed"
+                        reconciliation_family_presence.setdefault(target_key, {})[metric] = "failed"
                         _LOGGER.warning(
                             "Garmin numeric family failed for %s (%s)", target_key, metric
                         )
@@ -1071,6 +1334,7 @@ class GarminHistoryArchive:
                     except (AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError) as error:
                         failed_families.add(metric)
                         presence.setdefault(target_key, {})[metric] = "failed"
+                        reconciliation_family_presence.setdefault(target_key, {})[metric] = "failed"
                         failed_family_error = "sync_failed"
                         _LOGGER.warning(
                             "Garmin numeric family failed for %s (%s)", target_key, metric
@@ -1080,6 +1344,13 @@ class GarminHistoryArchive:
                     inserted += metric_inserted
                     updated += metric_updated
                     skipped += metric_skipped
+                    observation_parts[metric] = metric_fingerprint
+                    observation_has_records = observation_has_records or metric_has_records
+                    reconciliation_family_presence.setdefault(target_key, {})[metric] = (
+                        presence.get(target_key, {}).get(
+                            metric, "present" if metric_has_records else "empty"
+                        )
+                    )
                 try:
                     structured_descriptor = inspect.getattr_static(source, "async_fetch_details")
                 except AttributeError:
@@ -1090,6 +1361,11 @@ class GarminHistoryArchive:
                     if callable(structured_descriptor) and callable(structured_fetch)
                     else ()
                 )
+                reconciliation_family_presence.setdefault(target_key, {})["sleep_sessions"] = (
+                    "present" if sleep_details else "empty"
+                ) if callable(structured_descriptor) and callable(structured_fetch) else "missing"
+                observation_parts["sleep_sessions"] = _fingerprint_details(sleep_details)
+                observation_has_records = observation_has_records or bool(sleep_details)
                 if not isinstance(sleep_details, tuple) or any(not isinstance(item, SleepSession) for item in sleep_details):
                     raise SleepSchemaError("sleep session result has invalid shape")
                 invalid_sleep_streams: set[tuple[str, str]] = set()
@@ -1160,6 +1436,11 @@ class GarminHistoryArchive:
                 date_presence.update(_aggregate_sleep_presence(sleep_sessions, target))
                 for event_metric in ("health_events_daily", "health_events_body_battery"):
                     event_details = await structured_fetch(target, event_metric) if callable(structured_descriptor) and callable(structured_fetch) else ()
+                    reconciliation_family_presence.setdefault(target_key, {})[event_metric] = (
+                        "present" if event_details else "empty"
+                    ) if callable(structured_descriptor) and callable(structured_fetch) else "missing"
+                    observation_parts[event_metric] = _fingerprint_details(event_details)
+                    observation_has_records = observation_has_records or bool(event_details)
                     if not isinstance(event_details, tuple) or any(not isinstance(item, NormalizedHealthEvent) for item in event_details):
                         raise ValueError("health event result has invalid shape")
                     health_events.extend(event_details)
@@ -1170,6 +1451,11 @@ class GarminHistoryArchive:
                     structured_dirty_years.add(year)
                     events_by_year.setdefault(year, {})[event.logical_id] = health_event_record(event)
                 activity_details = await structured_fetch(target, "timed_activities") if callable(structured_descriptor) and callable(structured_fetch) else ()
+                reconciliation_family_presence.setdefault(target_key, {})["timed_activities"] = (
+                    "present" if activity_details else "empty"
+                ) if callable(structured_descriptor) and callable(structured_fetch) else "missing"
+                observation_parts["timed_activities"] = _fingerprint_details(activity_details)
+                observation_has_records = observation_has_records or bool(activity_details)
                 if not isinstance(activity_details, tuple) or any(not isinstance(item, NormalizedActivity) for item in activity_details):
                     raise ValueError("activity result has invalid shape")
                 fit_count = 0
@@ -1207,6 +1493,7 @@ class GarminHistoryArchive:
                         )
                         self._fit_archives.setdefault(year, {})[activity.logical_id] = fit_result
                         fit_count += 1
+                self._reconciliation_family_presence = reconciliation_family_presence
                 if failed_families:
                     await self._async_save_numeric_source_manifest()
                     if not numeric_write_failed:
@@ -1360,6 +1647,17 @@ class GarminHistoryArchive:
                 self._numeric_source_date_dirty_years.difference_update(numeric_checkpoint_years)
                 self._completed_dates = completed_dates
                 self._presence = presence
+                self._reconciliation_family_presence = reconciliation_family_presence
+                self._last_reconciliation_observation[target_key] = (
+                    _fingerprint_details(observation_parts),
+                    observation_has_records,
+                    all(
+                        family in reconciliation_family_presence.get(target_key, {})
+                        and reconciliation_family_presence[target_key][family]
+                        not in _RECONCILIATION_UNAVAILABLE_STATES
+                        for family in _RECONCILIATION_FAMILIES
+                    ),
+                )
             except asyncio.CancelledError:
                 self._status = HistoryStatus(self._resting_state(), current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
                 raise
@@ -1397,6 +1695,7 @@ class GarminHistoryArchive:
         numeric_source_date_pending: Mapping[str, Collection[str]] | None = None,
         numeric_source_date_outbox: Mapping[str, Mapping[str, Mapping[str, str]]] | None = None,
         numeric_source_date_confirmed: Mapping[str, Mapping[str, Mapping[str, str]]] | None = None,
+        reconciliation: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Build a bounded catalog record after partitions are durable."""
         return {
@@ -1404,6 +1703,18 @@ class GarminHistoryArchive:
             "sleep_schema_version": _SLEEP_SCHEMA_VERSION,
             "account_key": self._account_key(),
             "completed_dates": sorted(completed_dates),
+            "reconciliation": {
+                key: {
+                    "state": value.get("state", "open"),
+                    "fingerprint": value.get("fingerprint"),
+                    "has_records": bool(value.get("has_records", False)),
+                }
+                for key, value in (
+                    self._reconciliation
+                    if reconciliation is None
+                    else reconciliation
+                ).items()
+            },
             "hrv_summaries": self._hrv_summaries,
             "numeric_source_date_index": sorted(self._numeric_source_date_years),
             "numeric_source_date_dates": {
@@ -1451,6 +1762,10 @@ class GarminHistoryArchive:
                 if statistics
             },
             "presence": presence,
+            "reconciliation_family_presence": {
+                key: dict(value)
+                for key, value in self._reconciliation_family_presence.items()
+            },
             "sleep_index": {year: sorted(records) for year, records in sessions_by_year.items()},
             "event_index": {year: sorted(records) for year, records in events_by_year.items()},
             "activity_index": {year: sorted(records) for year, records in activities_by_year.items()},
@@ -2031,6 +2346,7 @@ class GarminHistoryArchive:
                     "schema_version": HISTORY_STORE_VERSION,
                     "account_key": account_key,
                     "completed_dates": [],
+                    "reconciliation": {},
                     "hrv_summaries": {},
                     "numeric_source_date_index": [],
                     "numeric_source_date_dates": {},
@@ -2039,6 +2355,7 @@ class GarminHistoryArchive:
                     "numeric_source_date_outbox": {},
                     "numeric_source_date_confirmed": {},
                     "presence": {},
+                    "reconciliation_family_presence": {},
                     "sleep_index": {},
                     "event_index": {},
                     "activity_index": {},
@@ -2062,6 +2379,9 @@ class GarminHistoryArchive:
                 raise ValueError("Store checkpoint is invalid")
             parsed_dates.add(item)
         self._completed_dates = parsed_dates
+        self._reconciliation = self._parse_reconciliation_state(
+            catalog.get("reconciliation", {})
+        )
         summaries = catalog.get("hrv_summaries", {})
         if isinstance(summaries, Mapping):
             self._hrv_summaries = {key: dict(value) for key, value in summaries.items() if isinstance(key, str) and isinstance(value, Mapping)}
@@ -2283,6 +2603,27 @@ class GarminHistoryArchive:
                 raise ValueError("Store presence catalog is invalid")
             parsed_presence[key] = bounded
         self._presence = parsed_presence
+        raw_reconciliation_presence = catalog.get("reconciliation_family_presence", {})
+        if not isinstance(raw_reconciliation_presence, Mapping):
+            raise ValueError("Store reconciliation family presence is invalid")
+        parsed_reconciliation_presence: dict[str, dict[str, str]] = {}
+        for key, families in raw_reconciliation_presence.items():
+            if not isinstance(key, str) or not isinstance(families, Mapping):
+                raise ValueError("Store reconciliation family presence is invalid")
+            parsed_date = date.fromisoformat(key)
+            if parsed_date.isoformat() != key or parsed_date < _HISTORY_MIN_DATE:
+                raise ValueError("Store reconciliation family presence is invalid")
+            bounded_families: dict[str, str] = {}
+            for family, state in families.items():
+                if (
+                    not isinstance(family, str)
+                    or family not in _RECONCILIATION_FAMILIES
+                    or state not in _PRESENCE_STATES
+                ):
+                    raise ValueError("Store reconciliation family presence is invalid")
+                bounded_families[family] = state
+            parsed_reconciliation_presence[key] = bounded_families
+        self._reconciliation_family_presence = parsed_reconciliation_presence
         raw_sleep = catalog.get("sleep_index", catalog.get("sleep_sessions", {}))
         raw_events = catalog.get("event_index", {})
         raw_activities = catalog.get("activity_index", {})
