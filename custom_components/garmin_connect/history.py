@@ -447,6 +447,13 @@ class _ReconciliationEntry:
         }
 
 
+def _reconciliation_records(
+    entries: Mapping[str, _ReconciliationEntry],
+) -> dict[str, dict[str, Any]]:
+    """Return the stable JSON representation of the reconciliation ledger."""
+    return {key: value.as_record() for key, value in entries.items()}
+
+
 async def _async_observe_family(
     fetch: Callable[..., Any] | None,
     target: date,
@@ -1286,7 +1293,6 @@ class GarminHistoryArchive:
         """Publish one observation and the structured records it made durable."""
         self._remember_date_reconciliation_observation(target_key, accumulator)
         await self._async_persist_observed_structured_records(checkpoint)
-        await self._async_save_reconciliation_state(presence=checkpoint.presence)
         if outcome != "written":
             await self._async_update_reconciliation_state(
                 target,
@@ -1345,7 +1351,10 @@ class GarminHistoryArchive:
             await self._async_save_reconciliation_state()
 
     async def _async_save_reconciliation_state(
-        self, *, presence: Mapping[str, Mapping[str, str]] | None = None
+        self,
+        *,
+        presence: Mapping[str, Mapping[str, str]] | None = None,
+        hrv_summaries: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
         """Atomically persist the private reconciliation ledger."""
         if self._store is None:
@@ -1354,14 +1363,15 @@ class GarminHistoryArchive:
         if not isinstance(catalog, Mapping):
             raise ValueError("Store catalog is unavailable")
         updated = dict(catalog)
-        updated["reconciliation"] = {
-            key: value.as_record()
-            for key, value in self._reconciliation.items()
-        }
+        updated["reconciliation"] = _reconciliation_records(self._reconciliation)
         updated["reconciliation_family_presence"] = {
             key: dict(value)
             for key, value in self._reconciliation_family_presence.items()
         }
+        if hrv_summaries is not None:
+            updated["hrv_summaries"] = {
+                key: dict(value) for key, value in hrv_summaries.items()
+            }
         if presence is not None:
             updated["presence"] = {
                 key: dict(value) for key, value in presence.items()
@@ -2394,14 +2404,9 @@ class GarminHistoryArchive:
             "sleep_schema_version": _SLEEP_SCHEMA_VERSION,
             "account_key": self._account_key(),
             "completed_dates": sorted(completed_dates),
-            "reconciliation": {
-                key: value.as_record()
-                for key, value in (
-                    self._reconciliation
-                    if reconciliation is None
-                    else reconciliation
-                ).items()
-            },
+            "reconciliation": _reconciliation_records(
+                self._reconciliation if reconciliation is None else reconciliation
+            ),
             "hrv_summaries": self._hrv_summaries,
             "numeric_source_date_index": sorted(self._numeric_source_date_years),
             "numeric_source_date_dates": {
@@ -2752,7 +2757,7 @@ class GarminHistoryArchive:
         self, checkpoint: _StructuredCheckpoint
     ) -> None:
         """Persist structured records already observed before the next fetch."""
-        if self._store is None or not checkpoint.dirty_years:
+        if self._store is None:
             return
         self._sleep_sessions = {
             year: dict(records) for year, records in checkpoint.sessions_by_year.items()
@@ -2763,21 +2768,27 @@ class GarminHistoryArchive:
         self._activities = {
             year: dict(records) for year, records in checkpoint.activities_by_year.items()
         }
-        await self._async_save_sleep_partitions(
-            checkpoint.sessions_by_year,
-            checkpoint.events_by_year,
-            checkpoint.activities_by_year,
-            self._fit_archives,
-            years=checkpoint.dirty_years,
-        )
-        await self._store.async_save(
-            self._catalog_record(
-                completed_dates=self._completed_dates,
-                presence=checkpoint.presence,
-                sessions_by_year=checkpoint.sessions_by_year,
-                events_by_year=checkpoint.events_by_year,
-                activities_by_year=checkpoint.activities_by_year,
+        if checkpoint.dirty_years:
+            await self._async_save_sleep_partitions(
+                checkpoint.sessions_by_year,
+                checkpoint.events_by_year,
+                checkpoint.activities_by_year,
+                self._fit_archives,
+                years=checkpoint.dirty_years,
             )
+            await self._store.async_save(
+                self._catalog_record(
+                    completed_dates=self._completed_dates,
+                    presence=checkpoint.presence,
+                    sessions_by_year=checkpoint.sessions_by_year,
+                    events_by_year=checkpoint.events_by_year,
+                    activities_by_year=checkpoint.activities_by_year,
+                )
+            )
+            return
+        await self._async_save_reconciliation_state(
+            presence=checkpoint.presence,
+            hrv_summaries=self._hrv_summaries,
         )
 
     def _account_key(self) -> str:

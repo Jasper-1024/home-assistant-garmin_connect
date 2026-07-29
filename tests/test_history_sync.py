@@ -1,5 +1,6 @@
 """Focused tests for the manual history synchronization slice."""
 
+import asyncio
 import json
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -1340,6 +1341,60 @@ async def test_hrv_summary_persists_only_with_date_checkpoint():
     assert restarted.get_hrv_summaries(date(2026, 1, 1), date(2026, 1, 1))[0][1].weekly_avg == 50.0
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("structured_outcome", ["cancelled", "failed"])
+async def test_numeric_sidecars_survive_first_structured_checkpoint_restart(
+    structured_outcome: str,
+) -> None:
+    target = date(2026, 1, 1)
+    sample = NormalizedSample(
+        datetime(2026, 1, 1, 3, tzinfo=UTC), target, "2026-01-01T03:00:00Z", 52.0
+    )
+
+    class Source:
+        async def async_fetch_details(self, request_date: date, metric: str) -> object:
+            if metric == "nightly_hrv":
+                return HRVData(
+                    (sample,), HRVSummary("balanced", 48.0, 72.0, 50.0, {"low": 40.0})
+                )
+            if metric == "daily_summary":
+                return SnapshotData(
+                    {"abnormal_heart_rate_alerts": ("present", 2.0)},
+                    datetime.combine(request_date, datetime.min.time(), tzinfo=UTC),
+                    request_date.isoformat(),
+                    calendar_date=request_date,
+                )
+            if metric == "sleep_sessions":
+                if structured_outcome == "cancelled":
+                    raise asyncio.CancelledError
+                raise ValueError("injected structured family failure")
+            return ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    store = _Store()
+    archive = _sync_archive(Source(), recorder, store)
+    await archive.async_start()
+
+    if structured_outcome == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await archive.async_sync_range(target, target)
+    else:
+        report = await archive.async_sync_range(target, target)
+        assert report.outcome == "failed"
+
+    restarted = _sync_archive(Source(), recorder, store)
+    await restarted.async_start()
+
+    summaries = restarted.get_hrv_summaries(target, target)
+    assert summaries[0][1].weekly_avg == 50.0
+    assert restarted.get_history_presence(target, target)[target.isoformat()][
+        "daily_summary:abnormal_heart_rate_alerts"
+    ] == "present"
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
+    assert store.data["reconciliation"][target.isoformat()]["outcome"] != "continuity_gap"
+
+
 def _sleep_session() -> SleepSession:
     return SleepSession(
         "sleep-id", "main",
@@ -1368,7 +1423,7 @@ async def test_sleep_partition_failure_does_not_publish_completed_checkpoint():
     report = await archive.async_sync_range(date(2026, 1, 1), date(2026, 1, 1))
 
     assert report.outcome == "failed"
-    assert "completed_dates" not in catalog.data
+    assert catalog.data.get("completed_dates", []) == []
 
 
 @pytest.mark.asyncio
