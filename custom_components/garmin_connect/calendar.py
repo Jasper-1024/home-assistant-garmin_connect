@@ -40,6 +40,8 @@ class GarminStructuredCalendar(CalendarEntity):
         self, hass: HomeAssistant, start_date: datetime, end_date: datetime
     ) -> list[CalendarEvent]:
         """Return candidates that exactly overlap the requested Source Instants."""
+        if start_date >= end_date:
+            return []
         events = await self._archive.async_get_calendar_events(
             self._calendar_name,
             start_date.astimezone(UTC).date(),

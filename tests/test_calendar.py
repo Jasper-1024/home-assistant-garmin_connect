@@ -1,6 +1,6 @@
 """Tests for Garmin Calendar adapter range handling."""
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
 
@@ -86,3 +86,29 @@ async def test_calendar_adapter_excludes_source_calendar_date_candidate_outside_
     archive.async_get_calendar_events.assert_awaited_once_with(
         calendar_name, date(2026, 7, 24), date(2026, 7, 25)
     )
+
+
+@pytest.mark.asyncio
+async def test_calendar_adapter_returns_empty_for_non_positive_range() -> None:
+    """HA's [start, end) contract rejects zero-length and reversed ranges."""
+    archive = MagicMock()
+    archive.async_get_calendar_events = AsyncMock(
+        return_value=(
+            HistoryCalendarEvent(
+                datetime(2026, 7, 24, 10, tzinfo=UTC),
+                datetime(2026, 7, 24, 11, tzinfo=UTC),
+                "spanning event",
+            ),
+        )
+    )
+    calendar = GarminActivityCalendar(archive, "entry-1")
+    start = datetime(2026, 7, 24, 10, tzinfo=UTC)
+
+    assert await calendar.async_get_events(MagicMock(), start, start) == []
+    assert (
+        await calendar.async_get_events(
+            MagicMock(), start, start - timedelta(seconds=1)
+        )
+        == []
+    )
+    archive.async_get_calendar_events.assert_not_awaited()

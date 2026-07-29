@@ -345,10 +345,15 @@ def normalize_health_events(payload: Any, target_date: date) -> tuple[Normalized
         if any(value is not None and (not isinstance(value, str) or len(value) > 64) for value in (source, event_type, category)):
             raise HistorySchemaError("health event identity has invalid type")
         def event_time(event_data: dict[str, Any], names: tuple[str, ...]) -> datetime | None:
-            value = _first_non_null(event_data, names)
-            if value is _MISSING:
-                return None
-            return _timestamp(value)
+            for name in names:
+                value = event_data.get(name)
+                if value is not None:
+                    return (
+                        _timestamp_as_utc(value)
+                        if name.endswith("GMT")
+                        else _timestamp(value)
+                    )
+            return None
         start = event_time(event, ("startTime", "startTimeGMT", "start"))
         end = event_time(event, ("endTime", "endTimeGMT", "end"))
         occurrence = event_time(event, ("occurrenceTime", "occurrenceTimeGMT", "eventTime", "timestamp", "time"))

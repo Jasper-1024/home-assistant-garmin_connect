@@ -1,0 +1,15 @@
+{
+  "_provenance": "Sanitized captured-shaped health-event fixture; Garmin GMT fields intentionally omit an offset.",
+  "_redaction_version": "3.1.0-beta.1",
+  "state": "success",
+  "events": [
+    {
+      "source": "GARMIN",
+      "eventType": "abnormalHeartRate",
+      "eventCategory": "abnormal",
+      "startTimeGMT": "2026-07-24T23:00:00.000",
+      "endTimeGMT": "2026-07-24T23:01:00.000",
+      "occurrenceTimeGMT": "2026-07-24T23:00:30.000"
+    }
+  ]
+}

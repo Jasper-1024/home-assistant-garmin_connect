@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
@@ -366,6 +367,33 @@ async def test_calendar_exposes_instantaneous_health_source_record() -> None:
             datetime(2026, 7, 23, 22, 34, 56, tzinfo=UTC),
             datetime(2026, 7, 23, 22, 34, 57, tzinfo=UTC),
         )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_raw_health_gmt_fixture_preserves_source_instant_and_calendar_query() -> None:
+    """Naive Garmin GMT fields are UTC Source Instants and remain queryable."""
+    fixture = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "garmin_health_events.naive_gmt.json"
+        ).read_text()
+    )
+    target = date(2026, 7, 24)
+    source_event = normalize_health_events(fixture, target)[0]
+
+    source_start = datetime(2026, 7, 24, 23, tzinfo=UTC)
+    source_end = datetime(2026, 7, 24, 23, 1, tzinfo=UTC)
+    assert source_event.start == source_start
+    assert source_event.end == source_end
+    assert source_event.occurrence == datetime(2026, 7, 24, 23, 0, 30, tzinfo=UTC)
+
+    archive, _stores = await _sync_health_calendar_records(fixture["events"])
+    events = await archive.async_get_calendar_events("health", target, target)
+
+    assert [(event.summary, event.start, event.end) for event in events] == [
+        ("abnormal", source_start, source_end)
     ]
 
 
