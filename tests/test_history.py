@@ -52,7 +52,12 @@ from custom_components.garmin_connect.request_gate import (
     GarminRequestGate,
     GarminRequestPriority,
 )
-from custom_components.garmin_connect.sleep_archive import parse_sleep_sessions
+from custom_components.garmin_connect.sleep_archive import (
+    SleepSession,
+    SleepStream,
+    SleepStreamPoint,
+    parse_sleep_sessions,
+)
 
 
 class FakeStore:
@@ -210,17 +215,18 @@ def _enabled_reconciliation_archive(
     source: ReconciliationSource,
     now: list[datetime],
     timer: DeterministicTimer,
-    activation_date: str = "2026-08-01",
+    activation_date: str | None = "2026-08-01",
+    previously_enabled: bool = True,
 ) -> GarminHistoryArchive:
     """Create an enabled archive with deterministic automatic cycles."""
     hass = _hass()
-    entry = _entry(
-        data={
-            "history_account_key": "opaque-account-key-1234567890",
-            CONF_ARCHIVE_ACTIVATION_DATE: activation_date,
-            CONF_ARCHIVE_PREVIOUSLY_ENABLED: True,
-        }
-    )
+    data = {
+        "history_account_key": "opaque-account-key-1234567890",
+        CONF_ARCHIVE_PREVIOUSLY_ENABLED: previously_enabled,
+    }
+    if activation_date is not None:
+        data[CONF_ARCHIVE_ACTIVATION_DATE] = activation_date
+    entry = _entry(data=data)
     entry.options = {CONF_ARCHIVE_ENABLED: True}
     entry.runtime_data = SimpleNamespace(
         core=SimpleNamespace(client=object()), request_gate=object()
@@ -375,6 +381,102 @@ async def test_reconciliation_respects_activation_boundary_and_current_rollover(
     now[0] = datetime(2026, 8, 4, tzinfo=UTC)
     await _run_reconciliation_cycle(archive, timer)
     assert date(2026, 8, 3) in source.requested
+    await archive.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_partial_structured_failure_retains_observed_records_in_open_ledger() -> None:
+    target = date(2026, 8, 4)
+    store = _reconciliation_store(target)
+    source = ReconciliationSource({})
+    sleep_details = (
+        SleepSession(
+            "sleep-id",
+            "main_sleep",
+            datetime(2026, 8, 4, 0, tzinfo=UTC),
+            datetime(2026, 8, 4, 8, tzinfo=UTC),
+            target,
+            "sleep-revision",
+            {},
+            (),
+            (),
+            (),
+            streams=(
+                SleepStream(
+                    "heart_rate",
+                    (
+                        SleepStreamPoint(
+                            datetime(2026, 8, 4, 1, tzinfo=UTC),
+                            "2026-08-04T01:00:00Z",
+                            60.0,
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    class PartialFailureSource(ReconciliationSource):
+        async def async_fetch_details(self, target: date, metric: str) -> object:
+            if metric == "sleep_sessions":
+                return sleep_details
+            return await super().async_fetch_details(target, metric)
+
+    source = PartialFailureSource({})
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(
+        side_effect=[RecorderWriteOutcome(0) for _ in range(47)]
+        + [OSError("injected structured write failure")]
+    )
+    timer = DeterministicTimer()
+    archive = _enabled_reconciliation_archive(
+        store, source, [datetime(2026, 8, 5, tzinfo=UTC)], timer
+    )
+    archive._recorder_factory = lambda: recorder
+
+    await archive.async_start()
+    await archive._first_sync_task
+    await _run_reconciliation_cycle(archive, timer)
+
+    ledger = store.data["reconciliation"][target.isoformat()]
+    assert archive.status.state is HistoryArchiveState.FAILED
+    assert ledger["state"] == "open"
+    assert ledger["has_records"] is True
+    assert isinstance(ledger["fingerprint"], str)
+
+    recorder.async_write.side_effect = [RecorderWriteOutcome(0) for _ in range(32)]
+    await _run_reconciliation_cycle(archive, timer)
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "settled"
+    await archive.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_reenable_does_not_expire_open_date_before_new_activation_boundary() -> None:
+    target = date(2026, 8, 1)
+    store = _reconciliation_store(target)
+    source = ReconciliationSource({})
+    now = [datetime(2026, 8, 9, tzinfo=UTC)]
+    timer = DeterministicTimer()
+    archive = _enabled_reconciliation_archive(
+        store,
+        source,
+        now,
+        timer,
+        activation_date=None,
+        previously_enabled=False,
+    )
+
+    with patch(
+        "custom_components.garmin_connect.history.dt_util.utcnow",
+        return_value=datetime(2026, 8, 8, tzinfo=UTC),
+    ):
+        await archive.async_start()
+    await archive._first_sync_task
+    await _run_reconciliation_cycle(archive, timer)
+
+    assert archive.activation_date == date(2026, 8, 8)
+    assert source.requested.count(target) == 0
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
     await archive.async_stop()
 
 
