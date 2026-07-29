@@ -2408,6 +2408,84 @@ async def test_confirmed_numeric_provenance_survives_storage_failure_and_empty_r
 
 
 @pytest.mark.asyncio
+async def test_recorder_success_manifest_failure_restarts_without_numeric_tombstone() -> None:
+    """A confirmed Recorder row remains queryable after a manifest failure."""
+    target = date(2026, 12, 31)
+    instant = datetime(2026, 12, 31, 23, 30, tzinfo=UTC)
+    hass = _hass()
+    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
+    checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
+    stores: dict[str, FakeStore] = {}
+
+    class ManifestFailureStore(FakeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_confirmed_manifest = True
+
+        async def async_save(self, data: dict) -> None:
+            if self.fail_confirmed_manifest and data.get("numeric_source_date_confirmed"):
+                raise OSError("simulated manifest failure")
+            await super().async_save(data)
+
+    def factory(_hass, _version, path, **kwargs):
+        if path.endswith("history_catalog"):
+            return stores.setdefault(path, ManifestFailureStore())
+        return stores.setdefault(path, FakeStore())
+
+    class SampleSource:
+        async def async_fetch_details(self, _request_date: date, metric: str) -> object:
+            if metric == "heart_rate":
+                return SourceSeries(
+                    (NormalizedSample(instant, target, instant.isoformat(), 60.0),),
+                    "present",
+                )
+            return ()
+
+    class EmptySource:
+        async def async_fetch_details(self, _request_date: date, metric: str) -> object:
+            if metric == "heart_rate":
+                return SourceSeries((), "empty")
+            return ()
+
+    rows: dict[datetime, NormalizedSample] = {}
+    recorder = MagicMock()
+
+    async def write(_statistic_id, _metadata, samples):
+        rows.update({sample.timestamp: sample for sample in samples})
+        return RecorderWriteOutcome(len(samples))
+
+    recorder.async_write = AsyncMock(side_effect=write)
+
+    def make_archive(source: object) -> GarminHistoryArchive:
+        return GarminHistoryArchive(
+            hass,
+            entry,
+            recorder_checker=checker,
+            store_factory=factory,
+            source_factory=lambda _client, _gate: source,
+            recorder_factory=lambda: recorder,
+        )
+
+    first = make_archive(SampleSource())
+    await first.async_start()
+    first_report = await first.async_sync_range(target, target)
+    assert (first_report.outcome, first_report.error_type) == ("failed", "sync_failed")
+    assert first.status.state is HistoryArchiveState.FAILED
+    assert rows[instant].value == 60.0
+
+    restarted = make_archive(EmptySource())
+    await restarted.async_start()
+    assert (await restarted.async_sync_range(target, target)).outcome == "written"
+    assert rows[instant].value == 60.0
+    statistic_id = statistic_id_for("opaque-account-key-123", "heart_rate")
+    partition = stores["garmin_connect.entry-1.numeric_source_dates_2026"]
+    assert partition.data["dates"][statistic_id] == {
+        instant.isoformat(): target.isoformat()
+    }
+    assert partition.data["tombstones"] == []
+
+
+@pytest.mark.asyncio
 async def test_recorder_failure_outbox_does_not_confirm_provenance_on_empty_retry() -> None:
     """An unbarriered Recorder write cannot become durable provenance after restart."""
     target = date(2026, 12, 31)

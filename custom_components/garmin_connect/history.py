@@ -2165,9 +2165,9 @@ class GarminHistoryArchive:
                 )
                 self._remember_date_reconciliation_observation(target_key, family_observations)
                 if failed_families:
-                    await self._async_save_numeric_source_manifest()
-                    if not numeric_write_failed:
-                        await self._async_save_numeric_source_partitions()
+                    await self._async_persist_numeric_recovery_state(
+                        include_partition=not numeric_write_failed
+                    )
                     await self._async_save_sleep_partitions(
                         sleep_sessions,
                         events_by_year,
@@ -2324,6 +2324,11 @@ class GarminHistoryArchive:
                 )
                 try:
                     await asyncio.shield(
+                        self._async_persist_numeric_recovery_state(
+                            include_partition=not numeric_write_failed
+                        )
+                    )
+                    await asyncio.shield(
                         self._async_persist_observed_structured_records(checkpoint)
                     )
                     await asyncio.shield(
@@ -2343,6 +2348,9 @@ class GarminHistoryArchive:
                 raise
             except _NumericFamilyError as error:
                 self._remember_date_reconciliation_observation(target_key, family_observations)
+                await self._async_persist_numeric_recovery_state(
+                    include_partition=not error.write_failure
+                )
                 self._runtime_sync_failure = True
                 self._status = HistoryStatus(
                     HistoryArchiveState.FAILED,
@@ -2358,6 +2366,9 @@ class GarminHistoryArchive:
                 )
             except (GarminConnectError, AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError) as error:
                 self._remember_date_reconciliation_observation(target_key, family_observations)
+                await self._async_persist_numeric_recovery_state(
+                    include_partition=not numeric_write_failed
+                )
                 try:
                     await self._async_persist_observed_structured_records(checkpoint)
                 except (AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError):
@@ -2566,6 +2577,30 @@ class GarminHistoryArchive:
             if statistics
         }
         await self._store.async_save(updated)
+
+    async def _async_persist_numeric_recovery_state(
+        self, *, include_partition: bool = True
+    ) -> None:
+        """Persist saveable numeric state after a checkpoint exception."""
+        if not self._numeric_source_date_dirty_years:
+            return
+        if include_partition:
+            try:
+                await self._async_save_numeric_source_partitions()
+            except asyncio.CancelledError:
+                raise
+            except (AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError):
+                _LOGGER.warning(
+                    "Garmin numeric source-date partition could not be checkpointed during recovery"
+                )
+        try:
+            await self._async_save_numeric_source_manifest()
+        except asyncio.CancelledError:
+            raise
+        except (AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError):
+            _LOGGER.warning(
+                "Garmin numeric source-date manifest could not be checkpointed during recovery"
+            )
 
     async def _async_save_numeric_source_partitions(self) -> None:
         """Persist source-date provenance in lazy annual private Stores."""
