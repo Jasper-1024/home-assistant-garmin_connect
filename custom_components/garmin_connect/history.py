@@ -9,7 +9,7 @@ import json
 import logging
 import secrets
 from collections.abc import Callable, Collection, Mapping
-from dataclasses import dataclass, fields, is_dataclass, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -183,14 +183,6 @@ _RECONCILIATION_EVIDENCE_RANK = {
 _RECONCILIATION_OUTCOMES = frozenset(
     {"records", "empty", "incomplete", "failed", "continuity_gap"}
 )
-_NORMALIZED_DETAIL_TYPES = (
-    ("hrv", HRVData),
-    ("segmented", SegmentedData),
-    ("series", SourceSeries),
-    ("snapshot", SnapshotData),
-    ("tuple", tuple),
-)
-
 def _fingerprint_value(value: Any) -> Any:
     """Convert normalized source details into deterministic private JSON data."""
     if is_dataclass(value):
@@ -220,61 +212,133 @@ def _fingerprint_details(value: Any) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def _details_have_records(details: Any) -> bool:
-    """Return whether normalized details contain a Source Record."""
-    detail_type = _normalized_detail_type(details)
-    if detail_type == "hrv":
-        return bool(details.readings or details.summary is not None)
-    if detail_type == "segmented":
-        return bool(details.readings or details.totals)
-    if detail_type == "series":
-        return bool(details.readings or details.presence == "present")
-    if detail_type == "snapshot":
-        return bool(
-            details.events
-            or any(state == "present" and value is not None for state, value in details.fields.values())
+@dataclass(frozen=True, slots=True)
+class _NormalizedDetailAdapter:
+    """Expose every normalized response through one private detail adapter."""
+
+    details: Any
+    detail_type: str | None
+    records: bool
+    presence_resolver: Callable[[bool], str]
+    samples: Any
+    write_samples: bool = False
+    metric_presence: str | None = None
+    total_presence: Mapping[str, str] = field(default_factory=dict)
+    totals: Mapping[str, float] | None = None
+    summary: HRVSummary | None = None
+    events: tuple[NormalizedHealthEvent, ...] = ()
+    fields: Mapping[str, tuple[str, float | None]] | None = None
+
+    @property
+    def supported(self) -> bool:
+        return self.detail_type is not None
+
+    def has_records(self) -> bool:
+        return self.records
+
+    def presence(self, available: bool) -> str:
+        return self.presence_resolver(available)
+
+
+def _snapshot_presence(details: SnapshotData, available: bool) -> str:
+    states = {state for state, _value in details.fields.values()}
+    if "present" in states or details.events:
+        return "present"
+    if states & _RECONCILIATION_UNAVAILABLE_STATES:
+        return "missing"
+    return "empty" if available else "missing"
+
+
+def _tuple_presence(details: tuple, available: bool) -> str:
+    return "present" if details else "empty" if available else "missing"
+
+
+def _normalized_detail_adapter(details: Any) -> _NormalizedDetailAdapter:
+    if isinstance(details, HRVData):
+        return _NormalizedDetailAdapter(
+            details,
+            "hrv",
+            bool(details.readings or details.summary is not None),
+            lambda _available: details.presence,
+            details.readings,
+            write_samples=True,
+            metric_presence=details.presence,
+            summary=details.summary,
         )
-    if detail_type == "tuple":
-        return bool(details)
-    return False
-
-
-def _normalized_detail_type(details: Any) -> str | None:
-    """Return the one normalized detail family used by import dispatch."""
-    for detail_type, normalized_type in _NORMALIZED_DETAIL_TYPES:
-        if isinstance(details, normalized_type):
-            return detail_type
-    return None
+    if isinstance(details, SegmentedData):
+        return _NormalizedDetailAdapter(
+            details,
+            "segmented",
+            bool(details.readings or details.totals),
+            lambda _available: details.presence,
+            details.readings,
+            write_samples=True,
+            metric_presence=details.presence,
+            total_presence=details.total_presence,
+            totals=details.totals,
+        )
+    if isinstance(details, SourceSeries):
+        return _NormalizedDetailAdapter(
+            details,
+            "series",
+            bool(details.readings or details.presence == "present"),
+            lambda _available: details.presence,
+            details.readings,
+            write_samples=True,
+            metric_presence=details.presence,
+        )
+    if isinstance(details, SnapshotData):
+        return _NormalizedDetailAdapter(
+            details,
+            "snapshot",
+            bool(
+                details.events
+                or any(
+                    state == "present" and value is not None
+                    for state, value in details.fields.values()
+                )
+            ),
+            lambda available: _snapshot_presence(details, available),
+            (),
+            events=details.events,
+            fields=details.fields,
+        )
+    if isinstance(details, tuple):
+        return _NormalizedDetailAdapter(
+            details,
+            "tuple",
+            bool(details),
+            lambda available: _tuple_presence(details, available),
+            details,
+        )
+    return _NormalizedDetailAdapter(details, None, False, lambda _available: "unknown", details)
 
 
 @dataclass(frozen=True, slots=True)
 class _NormalizedDetailRecord:
-    """Pair normalized details with the single dispatch tag for the response."""
+    """Pair normalized details with their single dispatch adapter."""
 
     details: Any
-    detail_type: str | None
+    adapter: _NormalizedDetailAdapter
+
+    @property
+    def detail_type(self) -> str | None:
+        return self.adapter.detail_type
 
 
 def _normalized_detail_record(details: Any) -> _NormalizedDetailRecord:
     """Build the normalized detail record consumed by numeric import dispatch."""
-    return _NormalizedDetailRecord(details, _normalized_detail_type(details))
+    return _NormalizedDetailRecord(details, _normalized_detail_adapter(details))
+
+
+def _details_have_records(details: Any) -> bool:
+    """Return whether normalized details contain a Source Record."""
+    return _normalized_detail_adapter(details).has_records()
 
 
 def _details_presence(details: Any, *, available: bool = True) -> str:
     """Return presence from this normalized response, never from prior state."""
-    detail_type = _normalized_detail_type(details)
-    if detail_type in {"hrv", "segmented", "series"}:
-        return cast(str, details.presence)
-    if detail_type == "snapshot":
-        states = {state for state, _value in details.fields.values()}
-        if "present" in states or details.events:
-            return "present"
-        if states & _RECONCILIATION_UNAVAILABLE_STATES:
-            return "missing"
-        return "empty" if available else "missing"
-    if detail_type == "tuple":
-        return "present" if details else "empty" if available else "missing"
-    return "unknown"
+    return _normalized_detail_adapter(details).presence(available)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1510,7 +1574,7 @@ class GarminHistoryArchive:
                 details = bound_details(target, metric)
             elif callable(bound_details):
                 candidate = bound_details(target, metric)
-                if inspect.isawaitable(candidate) or _normalized_detail_type(candidate) is not None:
+                if inspect.isawaitable(candidate) or _normalized_detail_adapter(candidate).supported:
                     details = candidate
         if inspect.isawaitable(details):
             details = await details
@@ -1535,32 +1599,27 @@ class GarminHistoryArchive:
         """Import one numeric family without deciding the date checkpoint."""
         detail_record = await self._async_fetch_numeric_detail(source, target, metric)
         details = detail_record.details
-        detail_type = detail_record.detail_type
+        detail_adapter = detail_record.adapter
         family_observation = _FamilyObservation.from_details(details)
 
         inserted = updated = skipped = 0
-        if detail_type == "hrv":
-            samples = details.readings
-            presence.setdefault(target_key, {})[metric] = details.presence
-            if details.summary is not None:
-                self._hrv_summaries[target_key] = {
-                    "status": details.summary.status,
-                    "last_night_avg": details.summary.last_night_avg,
-                    "last_night_5_min_high": details.summary.last_night_5_min_high,
-                    "weekly_avg": details.summary.weekly_avg,
-                    "baseline": details.summary.baseline,
-                }
-        elif detail_type == "segmented":
-            samples = details.readings
-            presence.setdefault(target_key, {})[metric] = details.presence
-            for total_key, state in details.total_presence.items():
-                presence.setdefault(target_key, {})[f"{metric}:{total_key}"] = state
-        elif detail_type == "series":
-            samples = details.readings
-            presence.setdefault(target_key, {})[metric] = details.presence
-        elif detail_type == "snapshot":
-            health_events.extend(details.events)
-            samples = ()
+        if detail_adapter.metric_presence is not None:
+            presence.setdefault(target_key, {})[metric] = detail_adapter.metric_presence
+        for total_key, state in detail_adapter.total_presence.items():
+            presence.setdefault(target_key, {})[f"{metric}:{total_key}"] = state
+        if detail_adapter.summary is not None:
+            self._hrv_summaries[target_key] = {
+                "status": detail_adapter.summary.status,
+                "last_night_avg": detail_adapter.summary.last_night_avg,
+                "last_night_5_min_high": detail_adapter.summary.last_night_5_min_high,
+                "weekly_avg": detail_adapter.summary.weekly_avg,
+                "baseline": detail_adapter.summary.baseline,
+            }
+        health_events.extend(detail_adapter.events)
+        snapshot_fields = detail_adapter.fields
+        if snapshot_fields is not None:
+            for field, (state, _value) in snapshot_fields.items():
+                presence.setdefault(target_key, {})[f"{metric}:{field}"] = state
             snapshot_metadata = {
                 "abnormal_heart_rate_alerts": DAILY_ABNORMAL_HR_METADATA,
                 "acute_load": TRAINING_ACUTE_LOAD_METADATA,
@@ -1571,8 +1630,7 @@ class GarminHistoryArchive:
                 "fitness_trend": TRAINING_FITNESS_TREND_METADATA,
                 "recovery_time": TRAINING_RECOVERY_TIME_METADATA,
             }
-            for field, (state, value) in details.fields.items():
-                presence.setdefault(target_key, {})[f"{metric}:{field}"] = state
+            for field, (state, value) in snapshot_fields.items():
                 metadata_for_field = snapshot_metadata.get(field)
                 if state != "present" or value is None or metadata_for_field is None:
                     continue
@@ -1605,15 +1663,14 @@ class GarminHistoryArchive:
                 skipped,
                 family_observation,
             )
-        elif metadata is None:
+        elif metadata is None and not detail_adapter.write_samples:
             return _NumericImportResult(
                 0,
                 0,
                 0,
                 family_observation,
             )
-        else:
-            samples = details
+        samples = detail_adapter.samples
 
         statistic_id = statistic_id_for(self._account_key(), metric)
         await self._async_prepare_numeric_source_dates(statistic_id, samples)
@@ -1626,7 +1683,8 @@ class GarminHistoryArchive:
             )
         await self._async_confirm_numeric_source_dates(statistic_id, samples)
 
-        if detail_type == "segmented" and details.totals:
+        total_values = detail_adapter.totals
+        if total_values:
             total_metadata = {
                 ("steps", "totalSteps"): STEPS_DAILY_TOTAL_METADATA,
                 ("floors", "floorsAscended"): FLOORS_ASCENDED_DAILY_METADATA,
@@ -1641,7 +1699,7 @@ class GarminHistoryArchive:
                 ("intensity_vigorous", "moderateIntensityMinutes"): MODERATE_INTENSITY_DAILY_METADATA,
                 ("intensity_vigorous", "totalIntensityMinutes"): INTENSITY_TOTAL_DAILY_METADATA,
             }
-            for total_key, total_value in details.totals.items():
+            for total_key, total_value in total_values.items():
                 total_metric = total_metadata.get((metric, total_key))
                 if total_metric is None:
                     continue
