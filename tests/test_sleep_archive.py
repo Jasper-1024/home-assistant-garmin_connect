@@ -269,15 +269,22 @@ def test_sleep_stream_descriptors_reorder_columns_and_deduplicate_timestamps() -
     with pytest.raises(SleepSchemaError):
         parse_sleep_sessions({**payload, "sleepHeartRate": [[60, "x"]]}, date(2026, 7, 24))
 
-    with pytest.raises(SleepSchemaError):
-        parse_sleep_sessions({**payload, "sleepHeartRate": [[60, "2026-07-25T00:00:00Z"]] * 4097}, date(2026, 7, 24))
+    long_stream = [
+        [index, f"2026-07-25T{index // 3600:02d}:{index // 60 % 60:02d}:{index % 60:02d}Z"]
+        for index in range(4097)
+    ]
+    long_session = parse_sleep_sessions(
+        {**payload, "sleepHeartRate": long_stream}, date(2026, 7, 24)
+    )[0]
+    assert len(long_session.streams[0].points) == 4097
 
 
 def test_sleep_stream_aliases_choose_first_non_null_field() -> None:
     payload = {
         "startTime": "2026-07-24T23:45:00Z", "endTime": "2026-07-25T07:15:00Z",
         "sleepHeartRate": [{
-            "timestamp": "2026-07-25T00:00:00Z",
+            "timestamp": None,
+            "time": "2026-07-25T00:00:00Z",
             "heartRate": None,
             "value": 60,
         }],
@@ -292,6 +299,24 @@ def test_sleep_stream_aliases_choose_first_non_null_field() -> None:
     assert [(point.timestamp.isoformat(), point.value) for point in session.streams[0].points] == [
         ("2026-07-25T00:00:00+00:00", 60.0),
     ]
+
+
+def test_sleep_descriptor_rows_choose_first_non_null_timestamp_and_value_alias() -> None:
+    session = parse_sleep_sessions(
+        {
+            "startTime": "2026-07-24T23:45:00Z",
+            "endTime": "2026-07-25T07:15:00Z",
+            "sleepHeartRateDescriptors": [
+                {"key": "timestamp", "index": 0},
+                {"key": "time", "index": 1},
+                {"key": "heartRate", "index": 2},
+                {"key": "value", "index": 3},
+            ],
+            "sleepHeartRate": [[None, "2026-07-25T00:00:00Z", None, 60]],
+        },
+        date(2026, 7, 24),
+    )[0]
+    assert session.streams[0].points[0].value == 60.0
 
 
 def test_sleep_stream_key_aliases_choose_first_non_null_array() -> None:

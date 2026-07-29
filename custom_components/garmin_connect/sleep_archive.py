@@ -196,8 +196,6 @@ def _sleep_streams(item: dict[str, Any]) -> tuple[SleepStream, ...]:
             continue
         if not isinstance(values, list):
             raise SleepSchemaError("sleep stream has invalid type")
-        if len(values) > 4096:
-            raise SleepSchemaError("sleep stream exceeds bounded point limit")
         descriptors = _stream_descriptors(item, metric)
         points: list[SleepStreamPoint] = []
         by_timestamp: dict[datetime, SleepStreamPoint] = {}
@@ -205,16 +203,21 @@ def _sleep_streams(item: dict[str, Any]) -> tuple[SleepStream, ...]:
             if row is None:
                 continue
             if isinstance(row, dict):
-                raw_time = next((row[name] for name in ("timestamp", "time", "startGMT", "readingTimeGMT") if name in row), _MISSING)
+                raw_time = _first_non_null(
+                    row, ("timestamp", "time", "startGMT", "readingTimeGMT")
+                )
                 raw_value = _first_non_null(row, ("value", metric, "heartRate", "hrvValue", "stressLevel", "spO2", "spo2", "bodyBattery", "respirationValue", "movement", "activityLevel"))
                 if raw_time is _MISSING or raw_value is _MISSING:
                     raise SleepSchemaError("sleep stream point lacks required fields")
             elif isinstance(row, list) and descriptors is not None:
-                timestamp_index = next((descriptors[key] for key in ("timestamp", "time", "startGMT", "readingTimeGMT") if key in descriptors), None)
-                value_index = next((descriptors[key] for key in ("value", metric, "heartRate", "hrvValue", "stressLevel", "spO2", "spo2", "movement", "activityLevel") if key in descriptors), None)
-                if timestamp_index is None or value_index is None or max(timestamp_index, value_index) >= len(row):
-                    raise SleepSchemaError("sleep stream descriptor fields are missing")
-                raw_time, raw_value = row[timestamp_index], row[value_index]
+                raw_time = _first_non_null_sequence(
+                    row, descriptors,
+                    ("timestamp", "time", "startGMT", "readingTimeGMT"),
+                )
+                raw_value = _first_non_null_sequence(
+                    row, descriptors,
+                    ("value", metric, "heartRate", "hrvValue", "stressLevel", "spO2", "spo2", "movement", "activityLevel"),
+                )
             elif isinstance(row, list) and len(row) >= 2:
                 raw_time, raw_value = row[0], row[1]
             else:
@@ -241,6 +244,24 @@ def _first_non_null(mapping: dict[str, Any], names: tuple[str, ...]) -> Any:
         if name not in mapping:
             continue
         value = mapping[name]
+        if value is not None:
+            return value
+        null_found = True
+    return None if null_found else _MISSING
+
+
+def _first_non_null_sequence(
+    values: list[Any], descriptors: dict[str, int], names: tuple[str, ...]
+) -> Any:
+    """Select the first non-null descriptor column without hiding bad rows."""
+    null_found = False
+    for name in names:
+        index = descriptors.get(name)
+        if index is None:
+            continue
+        if index >= len(values):
+            raise SleepSchemaError("sleep stream descriptor fields are missing")
+        value = values[index]
         if value is not None:
             return value
         null_found = True
@@ -318,6 +339,8 @@ def parse_sleep_sessions(payload: Any, target_date: date) -> tuple[SleepSession,
 
 def session_record(session: SleepSession) -> dict[str, Any]:
     """Return the bounded Store representation."""
+    stream_presence = dict.fromkeys(_STREAM_FIELDS, "missing")
+    stream_presence.update({stream.metric: stream.presence for stream in session.streams})
     return {
         "logical_id": session.logical_id, "kind": session.kind,
         "start": session.start.isoformat(), "end": session.end.isoformat(),
@@ -332,7 +355,7 @@ def session_record(session: SleepSession) -> dict[str, Any]:
             ]
             for stream in session.streams
         },
-        "stream_presence": {stream.metric: stream.presence for stream in session.streams},
+        "stream_presence": stream_presence,
     }
 
 
@@ -373,6 +396,12 @@ def session_from_record(record: dict[str, Any]) -> SleepSession:
             raise SleepSchemaError("sleep Store record is invalid")
         raw_presence = record.get("stream_presence", {})
         if not isinstance(raw_presence, dict):
+            raise SleepSchemaError("sleep Store record is invalid")
+        if any(
+            metric not in _STREAM_FIELDS
+            or presence not in {"null", "empty", "all-null", "missing", "present"}
+            for metric, presence in raw_presence.items()
+        ):
             raise SleepSchemaError("sleep Store record is invalid")
         streams: list[SleepStream] = []
         for metric, points in raw_streams.items():

@@ -428,6 +428,7 @@ class GarminHistoryArchive:
         self._numeric_source_date_dirty_years: set[str] = set()
         self._numeric_source_date_year_dates: dict[str, set[str]] = {}
         self._numeric_source_date_pending: dict[str, set[str]] = {}
+        self._numeric_source_date_outbox: dict[str, dict[str, dict[str, str]]] = {}
         self._numeric_source_date_replay_dates: set[str] = set()
         self._sleep_sessions: dict[str, dict[str, dict[str, Any]]] = {}
         self._health_events: dict[str, dict[str, dict[str, Any]]] = {}
@@ -495,11 +496,27 @@ class GarminHistoryArchive:
         """Query bounded source availability without payload or identity data."""
         if start_date > end_date or (end_date - start_date).days + 1 > _HISTORY_MAX_DAYS:
             return {}
-        return {
+        result = {
             key: dict(value)
             for key, value in self._presence.items()
             if start_date <= date.fromisoformat(key) <= end_date
         }
+        for records in self._sleep_sessions.values():
+            for record in records.values():
+                try:
+                    session_date = date.fromisoformat(record["calendar_date"])
+                    logical_id = record["logical_id"]
+                    stream_presence = record.get("stream_presence", {})
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not start_date <= session_date <= end_date or not isinstance(stream_presence, Mapping):
+                    continue
+                target_presence = result.setdefault(session_date.isoformat(), {})
+                for metric, state in stream_presence.items():
+                    metadata = _SLEEP_STREAM_METADATA.get(metric)
+                    if metadata is not None and state in _PRESENCE_STATES:
+                        target_presence[f"{metadata.key}:{logical_id}"] = state
+        return result
 
     async def async_start(self) -> None:
         """Initialize identity, Store catalog, and Recorder compatibility."""
@@ -850,8 +867,10 @@ class GarminHistoryArchive:
                 if state != "present" or value is None or metadata_for_field is None:
                     continue
                 snapshot = NormalizedSample(details.timestamp, target, details.raw_timestamp, value)
+                statistic_id = statistic_id_for(self._account_key(), metadata_for_field.key)
+                await self._async_prepare_numeric_source_dates(statistic_id, (snapshot,))
                 snapshot_outcome = await recorder.async_write(
-                    statistic_id_for(self._account_key(), metadata_for_field.key),
+                    statistic_id,
                     metadata_for_field,
                     (snapshot,),
                 )
@@ -859,9 +878,6 @@ class GarminHistoryArchive:
                     raise _NumericFamilyError(
                         snapshot_outcome.error_type or "sync_failed", write_failure=True
                     )
-                self._remember_numeric_source_dates(
-                    statistic_id_for(self._account_key(), metadata_for_field.key), (snapshot,)
-                )
                 inserted += getattr(snapshot_outcome, "inserted_count", snapshot_outcome.accepted_count)
                 updated += getattr(snapshot_outcome, "updated_count", 0)
                 skipped += getattr(snapshot_outcome, "skipped_count", 0)
@@ -871,9 +887,9 @@ class GarminHistoryArchive:
         else:
             samples = details
 
-        outcome = await recorder.async_write(
-            statistic_id_for(self._account_key(), metric), metadata, samples
-        )
+        statistic_id = statistic_id_for(self._account_key(), metric)
+        await self._async_prepare_numeric_source_dates(statistic_id, samples)
+        outcome = await recorder.async_write(statistic_id, metadata, samples)
         if outcome.outcome != "written":
             raise _NumericFamilyError(outcome.error_type or "sync_failed", write_failure=True)
 
@@ -899,16 +915,15 @@ class GarminHistoryArchive:
                 total_sample = NormalizedSample(
                     datetime.combine(target, time.min, tzinfo=UTC), target, target.isoformat(), total_value
                 )
+                total_statistic_id = statistic_id_for(self._account_key(), total_metric.key)
+                await self._async_prepare_numeric_source_dates(total_statistic_id, (total_sample,))
                 total_outcome = await recorder.async_write(
-                    statistic_id_for(self._account_key(), total_metric.key), total_metric, (total_sample,)
+                    total_statistic_id, total_metric, (total_sample,)
                 )
                 if total_outcome.outcome != "written":
                     raise _NumericFamilyError(
                         total_outcome.error_type or "sync_failed", write_failure=True
                     )
-                self._remember_numeric_source_dates(
-                    statistic_id_for(self._account_key(), total_metric.key), (total_sample,)
-                )
                 inserted += getattr(total_outcome, "inserted_count", total_outcome.accepted_count)
                 updated += getattr(total_outcome, "updated_count", 0)
                 skipped += getattr(total_outcome, "skipped_count", 0)
@@ -916,8 +931,6 @@ class GarminHistoryArchive:
         inserted += getattr(outcome, "inserted_count", outcome.accepted_count)
         updated += getattr(outcome, "updated_count", 0)
         skipped += getattr(outcome, "skipped_count", 0)
-        if metadata is not None:
-            self._remember_numeric_source_dates(statistic_id_for(self._account_key(), metric), samples)
         return inserted, updated, skipped
 
     async def _async_sync_range(
@@ -1040,12 +1053,6 @@ class GarminHistoryArchive:
                 for session in sleep_details:
                     year = str(session.start.year)
                     sleep_sessions.setdefault(year, {})[session.logical_id] = session_record(session)
-                    streams_by_metric = {stream.metric: stream for stream in session.streams}
-                    for stream_metric, stream_metadata in _SLEEP_STREAM_METADATA.items():
-                        stream = streams_by_metric.get(stream_metric)
-                        presence.setdefault(target_key, {})[
-                            f"{stream_metadata.key}:{session.logical_id}"
-                        ] = "missing" if stream is None else stream.presence
                     for stream in session.streams:
                         metadata_for_stream = _SLEEP_STREAM_METADATA.get(stream.metric)
                         if metadata_for_stream is None:
@@ -1055,23 +1062,16 @@ class GarminHistoryArchive:
                             for point in stream.points
                             if point.value is not None and point.value >= 0
                         )
+                        stream_statistic_id = statistic_id_for(
+                            self._account_key(),
+                            f"{metadata_for_stream.key}:{session.logical_id}",
+                        )
+                        await self._async_prepare_numeric_source_dates(stream_statistic_id, samples)
                         stream_outcome = await recorder.async_write(
-                            statistic_id_for(
-                                self._account_key(),
-                                f"{metadata_for_stream.key}:{session.logical_id}",
-                            ),
-                            metadata_for_stream,
-                            samples,
+                            stream_statistic_id, metadata_for_stream, samples
                         )
                         if stream_outcome.outcome != "written":
                             raise RuntimeError(stream_outcome.error_type or "sleep_stream_write_failed")
-                        self._remember_numeric_source_dates(
-                            statistic_id_for(
-                                self._account_key(),
-                                f"{metadata_for_stream.key}:{session.logical_id}",
-                            ),
-                            samples,
-                        )
                         inserted += getattr(stream_outcome, "inserted_count", stream_outcome.accepted_count)
                         updated += getattr(stream_outcome, "updated_count", 0)
                         skipped += getattr(stream_outcome, "skipped_count", 0)
@@ -1146,20 +1146,8 @@ class GarminHistoryArchive:
                 processed.append(target)
                 completed_dates = self._completed_dates | {target_key}
                 numeric_checkpoint_years = set(self._numeric_source_date_dirty_years)
-                pending_years = {
-                    year for year, dates in self._numeric_source_date_pending.items()
-                    if target_key in dates
-                }
                 await self._async_save_numeric_source_manifest()
                 await self._async_save_numeric_source_partitions()
-                for year in numeric_checkpoint_years | pending_years:
-                    dates = self._numeric_source_date_pending.get(year)
-                    if dates is None:
-                        continue
-                    dates.discard(target_key)
-                    if not dates:
-                        self._numeric_source_date_pending.pop(year, None)
-                self._numeric_source_date_replay_dates.discard(target_key)
                 await self._async_save_sleep_partitions(sleep_sessions, events_by_year, activities_by_year, self._fit_archives)
                 self._sleep_sessions = sleep_sessions
                 self._health_events = events_by_year
@@ -1185,6 +1173,26 @@ class GarminHistoryArchive:
                     continue
                 # Publish the catalog checkpoint only after every affected annual
                 # partition is durable. A failed partition save must be replayed.
+                committed_dates_by_year = {
+                    year: {
+                        source_date
+                        for statistics in self._numeric_source_date_outbox.get(year, {}).values()
+                        for source_date in statistics.values()
+                    }
+                    for year in numeric_checkpoint_years
+                }
+                for year, dates in self._numeric_source_date_pending.items():
+                    if target_key in dates:
+                        committed_dates_by_year.setdefault(year, set()).add(target_key)
+                committed_pending = {
+                    year: set(dates) - committed_dates_by_year.get(year, set())
+                    for year, dates in self._numeric_source_date_pending.items()
+                }
+                committed_outbox = {
+                    year: statistics
+                    for year, statistics in self._numeric_source_date_outbox.items()
+                    if year not in numeric_checkpoint_years
+                }
                 await store.async_save(
                     self._catalog_record(
                         completed_dates=completed_dates,
@@ -1192,8 +1200,23 @@ class GarminHistoryArchive:
                         sessions_by_year=sleep_sessions,
                         events_by_year=events_by_year,
                         activities_by_year=activities_by_year,
+                        numeric_source_date_pending=committed_pending,
+                        numeric_source_date_outbox=committed_outbox,
                     )
                 )
+                for year, source_dates in committed_dates_by_year.items():
+                    pending = self._numeric_source_date_pending.get(year)
+                    if pending is not None:
+                        pending.difference_update(source_dates)
+                        if not pending:
+                            self._numeric_source_date_pending.pop(year, None)
+                    self._numeric_source_date_outbox.pop(year, None)
+                self._numeric_source_date_replay_dates.difference_update(
+                    source_date
+                    for source_dates in committed_dates_by_year.values()
+                    for source_date in source_dates
+                )
+                self._numeric_source_date_dirty_years.difference_update(numeric_checkpoint_years)
                 self._completed_dates = completed_dates
                 self._presence = presence
             except asyncio.CancelledError:
@@ -1229,6 +1252,8 @@ class GarminHistoryArchive:
         sessions_by_year: Mapping[str, Mapping[str, dict[str, Any]]],
         events_by_year: Mapping[str, Mapping[str, dict[str, Any]]],
         activities_by_year: Mapping[str, Mapping[str, dict[str, Any]]],
+        numeric_source_date_pending: Mapping[str, Collection[str]] | None = None,
+        numeric_source_date_outbox: Mapping[str, Mapping[str, Mapping[str, str]]] | None = None,
     ) -> dict[str, Any]:
         """Build a bounded catalog record after partitions are durable."""
         return {
@@ -1244,8 +1269,25 @@ class GarminHistoryArchive:
             },
             "numeric_source_date_pending": {
                 year: sorted(dates)
-                for year, dates in self._numeric_source_date_pending.items()
+                for year, dates in (
+                    self._numeric_source_date_pending
+                    if numeric_source_date_pending is None
+                    else numeric_source_date_pending
+                ).items()
                 if dates
+            },
+            "numeric_source_date_outbox": {
+                year: {
+                    statistic_id: dict(instants)
+                    for statistic_id, instants in statistics.items()
+                    if instants
+                }
+                for year, statistics in (
+                    self._numeric_source_date_outbox
+                    if numeric_source_date_outbox is None
+                    else numeric_source_date_outbox
+                ).items()
+                if statistics
             },
             "presence": presence,
             "sleep_index": {year: sorted(records) for year, records in sessions_by_year.items()},
@@ -1273,6 +1315,18 @@ class GarminHistoryArchive:
             source_date = sample.request_date.isoformat()
             self._numeric_source_date_year_dates.setdefault(year, set()).add(source_date)
             self._numeric_source_date_pending.setdefault(year, set()).add(source_date)
+            self._numeric_source_date_outbox.setdefault(year, {}).setdefault(
+                statistic_id, {}
+            )[instant] = source_date
+
+    async def _async_prepare_numeric_source_dates(
+        self, statistic_id: str, samples: Collection[NormalizedSample]
+    ) -> None:
+        """Durably enqueue provenance before a Recorder write is attempted."""
+        if not samples:
+            return
+        self._remember_numeric_source_dates(statistic_id, samples)
+        await self._async_save_numeric_source_manifest()
 
     async def _async_save_numeric_source_manifest(self) -> None:
         """Publish numeric partition intent before writing an annual partition."""
@@ -1291,6 +1345,15 @@ class GarminHistoryArchive:
             year: sorted(dates)
             for year, dates in self._numeric_source_date_pending.items()
             if dates
+        }
+        updated["numeric_source_date_outbox"] = {
+            year: {
+                statistic_id: dict(instants)
+                for statistic_id, instants in statistics.items()
+                if instants
+            }
+            for year, statistics in self._numeric_source_date_outbox.items()
+            if statistics
         }
         await self._store.async_save(updated)
 
@@ -1325,7 +1388,6 @@ class GarminHistoryArchive:
                     "dates": dates,
                 }
             )
-        self._numeric_source_date_dirty_years.clear()
 
     async def _async_load_numeric_source_partitions(self, years: set[str]) -> None:
         """Load only indexed annual source-date provenance partitions."""
@@ -1690,6 +1752,7 @@ class GarminHistoryArchive:
                     "numeric_source_date_index": [],
                     "numeric_source_date_dates": {},
                     "numeric_source_date_pending": {},
+                    "numeric_source_date_outbox": {},
                     "presence": {},
                     "sleep_index": {},
                     "event_index": {},
@@ -1759,6 +1822,50 @@ class GarminHistoryArchive:
             # Legacy catalogs are read once and rewritten into annual Stores
             # on the next successful checkpoint.
             self._numeric_source_date_dirty_years.update(self._numeric_source_date_years)
+        raw_outbox = catalog.get("numeric_source_date_outbox", {})
+        if not isinstance(raw_outbox, Mapping):
+            raise ValueError("Store numeric source-date outbox is invalid")
+        for year, statistics in raw_outbox.items():
+            if (
+                not isinstance(year, str)
+                or len(year) != 4
+                or not year.isdecimal()
+                or not isinstance(statistics, Mapping)
+            ):
+                raise ValueError("Store numeric source-date outbox is invalid")
+            restored_statistics: dict[str, dict[str, str]] = {}
+            for statistic_id, instants in statistics.items():
+                if not isinstance(statistic_id, str) or not statistic_id or not isinstance(instants, Mapping):
+                    raise ValueError("Store numeric source-date outbox is invalid")
+                restored_instants: dict[str, str] = {}
+                for instant, source_date in instants.items():
+                    if not isinstance(instant, str) or not isinstance(source_date, str):
+                        raise ValueError("Store numeric source-date outbox is invalid")
+                    try:
+                        parsed_instant = datetime.fromisoformat(instant)
+                        parsed_date = date.fromisoformat(source_date)
+                    except ValueError as err:
+                        raise ValueError("Store numeric source-date outbox is invalid") from err
+                    if (
+                        parsed_instant.tzinfo is None
+                        or parsed_instant.utcoffset() is None
+                        or parsed_instant.astimezone(UTC).isoformat() != instant
+                        or parsed_instant.astimezone(UTC).year != int(year)
+                        or parsed_date.isoformat() != source_date
+                    ):
+                        raise ValueError("Store numeric source-date outbox is invalid")
+                    restored_instants[instant] = source_date
+                    self._numeric_source_date_year_dates.setdefault(year, set()).add(source_date)
+                    self._numeric_source_date_pending.setdefault(year, set()).add(source_date)
+                    self._numeric_source_date_replay_dates.add(source_date)
+                restored_statistics[statistic_id] = restored_instants
+            self._numeric_source_date_outbox[year] = restored_statistics
+            self._numeric_source_date_years.add(year)
+            self._numeric_source_date_dirty_years.add(year)
+            for statistic_id, instants in restored_statistics.items():
+                self._numeric_source_calendar_dates_by_year.setdefault(year, {}).setdefault(
+                    statistic_id, {}
+                ).update(instants)
         raw_numeric_date_dates = catalog.get("numeric_source_date_dates", {})
         if not isinstance(raw_numeric_date_dates, Mapping):
             raise ValueError("Store numeric source-date dates are invalid")
@@ -1801,13 +1908,17 @@ class GarminHistoryArchive:
             parsed_date = date.fromisoformat(key)
             if parsed_date.isoformat() != key or parsed_date < _HISTORY_MIN_DATE:
                 raise ValueError("Store presence catalog is invalid")
-            if not isinstance(metrics, Mapping) or len(metrics) > _MAX_PRESENCE_METRICS:
+            if not isinstance(metrics, Mapping):
                 raise ValueError("Store presence catalog is invalid")
             bounded: dict[str, str] = {}
             for metric, state in metrics.items():
                 if not isinstance(metric, str) or len(metric) > 64 or state not in _PRESENCE_STATES:
                     raise ValueError("Store presence catalog is invalid")
+                if any(metric.startswith(f"{metadata.key}:") for metadata in _SLEEP_STREAM_METADATA.values()):
+                    continue
                 bounded[metric] = state
+            if len(bounded) > _MAX_PRESENCE_METRICS:
+                raise ValueError("Store presence catalog is invalid")
             parsed_presence[key] = bounded
         self._presence = parsed_presence
         raw_sleep = catalog.get("sleep_index", catalog.get("sleep_sessions", {}))
@@ -1875,6 +1986,15 @@ class GarminHistoryArchive:
                 year: sorted(dates)
                 for year, dates in self._numeric_source_date_pending.items()
                 if dates
+            }
+            updated["numeric_source_date_outbox"] = {
+                year: {
+                    statistic_id: dict(instants)
+                    for statistic_id, instants in statistics.items()
+                    if instants
+                }
+                for year, statistics in self._numeric_source_date_outbox.items()
+                if statistics
             }
             await self._store.async_save(updated)
         except asyncio.CancelledError:

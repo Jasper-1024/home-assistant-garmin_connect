@@ -280,6 +280,71 @@ def test_snapshot_aliases_prefer_non_null_values() -> None:
     )
 
 
+def test_snapshot_timestamp_aliases_prefer_non_null_values() -> None:
+    snapshot = normalize_snapshot(
+        {"timestamp": None, "startTime": "2026-07-24T01:00:00Z"},
+        date(2026, 7, 24),
+        DAILY_SUMMARY_FIELDS,
+    )
+    assert snapshot.timestamp == datetime(2026, 7, 24, 1, tzinfo=UTC)
+
+    with pytest.raises(HistorySchemaError):
+        normalize_snapshot(
+            {"timestamp": "not-a-timestamp", "startTime": "2026-07-24T01:00:00Z"},
+            date(2026, 7, 24),
+            DAILY_SUMMARY_FIELDS,
+        )
+
+
+def test_object_series_timestamp_aliases_prefer_non_null_values() -> None:
+    series = normalize_respiration(
+        {
+            "respirationValuesArray": [
+                {
+                    "timestamp": None,
+                    "time": "2026-07-24T01:00:00Z",
+                    "respirationValue": 12,
+                }
+            ]
+        },
+        date(2026, 7, 24),
+    )
+    assert series.readings[0].timestamp == datetime(2026, 7, 24, 1, tzinfo=UTC)
+
+    with pytest.raises(HistorySchemaError):
+        normalize_respiration(
+            {
+                "respirationValuesArray": [
+                    {
+                        "timestamp": "not-a-timestamp",
+                        "time": "2026-07-24T01:00:00Z",
+                        "respirationValue": 12,
+                    }
+                ]
+            },
+            date(2026, 7, 24),
+        )
+
+
+def test_descriptor_series_timestamp_and_value_aliases_prefer_non_null_values() -> None:
+    series = normalize_respiration(
+        {
+            "respirationValuesArray": [
+                {
+                    "timestamp": None,
+                    "time": "2026-07-24T01:00:00Z",
+                    "respiration": None,
+                    "respirationValue": 12,
+                }
+            ],
+        },
+        date(2026, 7, 24),
+    )
+    assert [(sample.timestamp, sample.value) for sample in series.readings] == [
+        (datetime(2026, 7, 24, 1, tzinfo=UTC), 12.0)
+    ]
+
+
 def test_numeric_activity_records_choose_first_non_null_alias() -> None:
     activity = normalize_activities(
         [{
@@ -356,6 +421,34 @@ def test_hrv_raw_readings_tolerate_missing_summary_and_keep_zero() -> None:
     )
     assert [sample.value for sample in parsed.readings] == [43.0, 0.0]
     assert parsed.summary is None
+
+
+def test_hrv_measurement_aliases_prefer_non_null_values() -> None:
+    parsed = parse_hrv_data(
+        {
+            "hrvReadings": [{
+                "readingTimeGMT": None,
+                "readingTimeGmt": "2026-07-24T01:00:00Z",
+                "hrvValue": None,
+                "value": 42,
+            }]
+        },
+        date(2026, 7, 24),
+    )
+    assert parsed.readings[0].value == 42.0
+    assert parsed.readings[0].timestamp == datetime(2026, 7, 24, 1, tzinfo=UTC)
+
+    with pytest.raises(HistorySchemaError):
+        parse_hrv_data(
+            {
+                "hrvReadings": [{
+                    "readingTimeGMT": "bad",
+                    "readingTimeGmt": "2026-07-24T01:00:00Z",
+                    "hrvValue": 42,
+                }]
+            },
+            date(2026, 7, 24),
+        )
 
 
 def test_hrv_aliases_use_first_non_null_and_reject_first_non_null_malformed_values() -> None:

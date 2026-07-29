@@ -608,14 +608,14 @@ async def test_sleep_numeric_stream_presence_is_sparse_and_valid_points_are_writ
 
     recorder = MagicMock()
     recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(1, inserted_count=1))
-    store = _Store()
-    archive = _sync_archive(Source(), recorder, store)
+    stores = {}
+    archive = _partition_archive(Source(), recorder, stores)
     await archive.async_start()
 
     report = await archive.async_sync_range(target, target)
 
     assert report.outcome == "written"
-    presence = store.data["presence"][target.isoformat()]
+    presence = archive.get_history_presence(target, target)[target.isoformat()]
     assert presence[f"sleep_heart_rate:{session.logical_id}"] == "null"
     assert presence[f"sleep_hrv:{session.logical_id}"] == "empty"
     assert presence[f"sleep_stress:{session.logical_id}"] == "all-null"
@@ -626,9 +626,87 @@ async def test_sleep_numeric_stream_presence_is_sparse_and_valid_points_are_writ
     )
     assert [point.value for point in respiration_write.args[2]] == [14.0]
 
-    restarted = _sync_archive(Source(), recorder, _Store(store.data))
+    restarted = _partition_archive(Source(), recorder, stores)
     await restarted.async_start()
     assert restarted.get_history_presence(target, target)[target.isoformat()] == presence
+
+
+@pytest.mark.asyncio
+async def test_many_sleep_sessions_keep_stream_presence_in_annual_partition() -> None:
+    target = date(2026, 7, 24)
+    sessions_payload = {
+        "startTime": "2026-07-24T23:45:00Z",
+        "endTime": "2026-07-25T07:15:00Z",
+        "sleepHeartRate": None,
+        "hrvData": [],
+        "sleepStress": [["2026-07-25T00:00:00Z", None]],
+        "sleepRespiration": [["2026-07-25T00:01:00Z", 14]],
+        "napEvents": [
+            {
+                "startTime": f"2026-07-24T{hour:02d}:00:00Z",
+                "endTime": f"2026-07-24T{hour:02d}:30:00Z",
+                "sleepHeartRate": None,
+                "hrvData": [],
+                "sleepStress": [[f"2026-07-24T{hour:02d}:01:00Z", None]],
+                "sleepRespiration": [[f"2026-07-24T{hour:02d}:02:00Z", 14]],
+            }
+            for hour in range(10, 20)
+        ],
+    }
+    sessions = parse_sleep_sessions(sessions_payload, target)
+
+    class Source:
+        async def async_fetch_details(self, request_date: date, metric: str) -> object:
+            if metric == "sleep_sessions":
+                return sessions
+            if metric in {"health_events_daily", "health_events_body_battery", "timed_activities"}:
+                return ()
+            if metric == "nightly_hrv":
+                return HRVData((), presence="empty")
+            if metric in {"steps", "floors", "intensity_moderate", "intensity_vigorous"}:
+                total_keys = {
+                    "steps": ("totalSteps",),
+                    "floors": ("floorsAscended", "floorsDescended", "floorsAscendedInMeters", "floorsDescendedInMeters", "totalFloors"),
+                    "intensity_moderate": ("moderateIntensityMinutes", "vigorousIntensityMinutes", "totalIntensityMinutes"),
+                    "intensity_vigorous": ("moderateIntensityMinutes", "vigorousIntensityMinutes", "totalIntensityMinutes"),
+                }[metric]
+                return SegmentedData((), presence="empty", total_presence=dict.fromkeys(total_keys, "absent"))
+            if metric == "daily_summary":
+                return SnapshotData(
+                    {"abnormal_heart_rate_alerts": ("absent", None)},
+                    datetime.combine(request_date, datetime.min.time(), tzinfo=UTC),
+                    request_date.isoformat(),
+                )
+            if metric == "training_status":
+                return SnapshotData(
+                    dict.fromkeys(TRAINING_STATUS_FIELDS, ("absent", None)),
+                    datetime.combine(request_date, datetime.min.time(), tzinfo=UTC),
+                    request_date.isoformat(),
+                )
+            return SourceSeries((), "empty")
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    stores = {}
+    archive = _partition_archive(Source(), recorder, stores)
+    await archive.async_start()
+    assert (await archive.async_sync_range(target, target)).outcome == "written"
+    catalog = stores["garmin_connect.e.history_catalog"]
+    assert len(catalog.data["presence"][target.isoformat()]) == 33
+    assert not any(
+        key.startswith("sleep_") and ":" in key
+        for key in catalog.data["presence"][target.isoformat()]
+    )
+
+    restarted = _partition_archive(Source(), recorder, stores)
+    await restarted.async_start()
+    assert restarted.status.state is HistoryArchiveState.DISABLED
+    restored_presence = restarted.get_history_presence(target, target)[target.isoformat()]
+    assert sum(key.startswith("sleep_heart_rate:") for key in restored_presence) == len(sessions)
+    assert all(
+        restored_presence[f"sleep_heart_rate:{session.logical_id}"] == "null"
+        for session in sessions
+    )
 
 
 @pytest.mark.asyncio

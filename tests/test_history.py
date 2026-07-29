@@ -415,6 +415,12 @@ async def test_numeric_manifest_recovery_replays_after_partition_failure() -> No
     await first.async_start()
     assert (await first.async_sync_range(target, target)).outcome == "failed"
     assert stores["garmin_connect.entry-1.history_catalog"].data["numeric_source_date_pending"]
+    outbox = stores["garmin_connect.entry-1.history_catalog"].data[
+        "numeric_source_date_outbox"
+    ]
+    assert outbox["2026"][next(iter(outbox["2026"]))][
+        "2026-12-31T00:00:00+00:00"
+    ] == target.isoformat()
 
     stores["garmin_connect.entry-1.numeric_source_dates_2026"].fail_saves = False
     restarted = make_archive()
@@ -422,6 +428,10 @@ async def test_numeric_manifest_recovery_replays_after_partition_failure() -> No
     assert restarted.status.state is HistoryArchiveState.DISABLED
     assert target.isoformat() not in restarted._completed_dates
     assert (await restarted.async_sync_range(target, target)).outcome == "written"
+    assert stores["garmin_connect.entry-1.numeric_source_dates_2026"].data["dates"]
+    assert not stores["garmin_connect.entry-1.history_catalog"].data[
+        "numeric_source_date_outbox"
+    ]
 
 
 @pytest.mark.asyncio

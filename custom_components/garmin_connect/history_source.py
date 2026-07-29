@@ -151,9 +151,17 @@ def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedAct
         )
         if non_timed_family or has_event_fields:
             continue
-        start_raw = item.get("startTime", item.get("startTimeGMT", item.get("startTimeLocal")))
+        start_aliases = ("startTime", "startTimeGMT", "startTimeLocal")
+        start_raw = _first_non_null(item, start_aliases)
+        if start_raw is _MISSING:
+            start_raw = None
+        start_key = next(
+            (key for key in start_aliases if item.get(key) is not None), None
+        )
         activity_id = item.get("activityId", item.get("activityUUID"))
-        end_raw = item.get("endTimeGMT", item.get("endTime"))
+        end_raw = _first_non_null(item, ("endTimeGMT", "endTime"))
+        if end_raw is _MISSING:
+            end_raw = None
         duration_raw = _first_non_null(item, ("durationInSeconds", "duration"))
         if duration_raw is _MISSING:
             duration_raw = None
@@ -162,7 +170,7 @@ def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedAct
         start = _timestamp(start_raw)
         if start is None:
             raise HistorySchemaError("activity timestamp is invalid")
-        end = _timestamp(item.get("endTimeGMT", item.get("endTime"))) if item.get("endTimeGMT", item.get("endTime")) is not None else None
+        end = _timestamp(end_raw) if end_raw is not None else None
         def numeric(item_data: dict[str, Any], *names: str) -> float | None:
             value = _first_non_null(item_data, names)
             if value is _MISSING:
@@ -178,7 +186,11 @@ def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedAct
         load = numeric(item, "activityTrainingLoad", "trainingLoad")
         recovery = numeric(item, "recoveryTime")
         logical_id, revision = _activity_hashes(activity_type, str(activity_id), start, end, duration, activity_name, training_effect, load, recovery)
-        local_date = datetime.fromisoformat(start_raw.replace("Z", "+00:00")).date() if isinstance(start_raw, str) and "T" in start_raw and "startTimeLocal" in item and "startTime" not in item and "startTimeGMT" not in item else start.date()
+        local_date = (
+            datetime.fromisoformat(start_raw.replace("Z", "+00:00")).date()
+            if isinstance(start_raw, str) and "T" in start_raw and start_key == "startTimeLocal"
+            else start.date()
+        )
         result[logical_id] = NormalizedActivity(logical_id, str(activity_id), revision, activity_type, activity_name, start, end, duration, training_effect, load, recovery, local_date)
     return tuple(sorted(result.values(), key=lambda item: (item.start, item.logical_id)))
 
@@ -295,7 +307,9 @@ def normalize_health_events(payload: Any, target_date: date) -> tuple[Normalized
         if any(value is not None and (not isinstance(value, str) or len(value) > 64) for value in (source, event_type, category)):
             raise HistorySchemaError("health event identity has invalid type")
         def event_time(event_data: dict[str, Any], names: tuple[str, ...]) -> datetime | None:
-            value = next((event_data[key] for key in names if key in event_data), None)
+            value = _first_non_null(event_data, names)
+            if value is _MISSING:
+                return None
             return _timestamp(value)
         start = event_time(event, ("startTime", "startTimeGMT", "start"))
         end = event_time(event, ("endTime", "endTimeGMT", "end"))
@@ -315,8 +329,15 @@ def normalize_snapshot(
         return SnapshotData(dict.fromkeys(field_aliases, ("null", None)), datetime.combine(target_date, datetime.min.time(), tzinfo=UTC), target_date.isoformat())
     if not isinstance(payload, dict):
         raise HistorySchemaError("snapshot payload is not an object")
-    timestamp_key = next((key for key in ("timestamp", "startTime", "calendarDate") if key in payload), None)
-    timestamp_value = payload[timestamp_key] if timestamp_key is not None else target_date.isoformat()
+    timestamp_value = _first_non_null(payload, ("timestamp", "startTime", "calendarDate"))
+    if timestamp_value is _MISSING:
+        timestamp_key = None
+        timestamp_value = target_date.isoformat()
+    else:
+        timestamp_key = next(
+            key for key in ("timestamp", "startTime", "calendarDate")
+            if key in payload and payload[key] is not None
+        )
     timestamp = _timestamp(
         timestamp_value,
         allow_date_only=timestamp_key in (None, "calendarDate"),
@@ -411,10 +432,11 @@ def normalize_pair_series(
         raise HistorySchemaError(f"{values_key} is not an array")
     descriptor_present = any(key in payload for key in descriptor_keys)
     positions = _descriptors(payload, descriptor_keys)
-    if descriptor_present and raw_points and ("timestamp" not in positions or not any(key in positions for key in value_keys)):
+    if descriptor_present and raw_points and (
+        not any(key in positions for key in ("timestamp", "time"))
+        or not any(key in positions for key in value_keys)
+    ):
         raise HistorySchemaError("descriptor list lacks required fields")
-    timestamp_index = positions.get("timestamp", 0)
-    value_index = next((positions[key] for key in value_keys if key in positions), 1)
     effective_date = request_date
     latest: dict[datetime, NormalizedSample] = {}
     for point in raw_points:
@@ -422,9 +444,12 @@ def normalize_pair_series(
             continue
         if not isinstance(point, (list, tuple)):
             raise HistorySchemaError(f"{values_key} point has an invalid type")
-        if timestamp_index >= len(point) or value_index >= len(point):
-            raise HistorySchemaError(f"{values_key} point is narrower than its descriptors")
-        raw_time, raw_value = point[timestamp_index], point[value_index]
+        raw_time = _first_non_null_sequence(
+            point, positions, ("timestamp", "time"), fallback_index=0
+        )
+        raw_value = _first_non_null_sequence(
+            point, positions, value_keys, fallback_index=1
+        )
         if raw_time is not None and not isinstance(raw_time, str | int | float):
             raise HistorySchemaError("timestamp has an invalid type")
         if raw_value is not None and (isinstance(raw_value, bool) or not isinstance(raw_value, int | float)):
@@ -474,7 +499,10 @@ def _object_series(
             continue
         if not isinstance(point, dict):
             raise HistorySchemaError("segmented point is not an object")
-        raw_time = next((point[key] for key in ("timestamp", "time", "startTime", "start", "readingTime", "readingTimeGMT") if key in point), _MISSING)
+        raw_time = _first_non_null(
+            point,
+            ("timestamp", "time", "startTime", "start", "readingTime", "readingTimeGMT"),
+        )
         raw_value = _first_non_null(point, value_keys)
         if raw_time is _MISSING or raw_value is _MISSING:
             raise HistorySchemaError("segmented point lacks required fields")
@@ -525,6 +553,32 @@ def _first_non_null(mapping: Mapping[str, Any], aliases: tuple[str, ...]) -> Any
             return value
         null_found = True
     return None if null_found else _MISSING
+
+
+def _first_non_null_sequence(
+    values: list[Any] | tuple[Any, ...],
+    positions: Mapping[str, int],
+    aliases: tuple[str, ...],
+    *,
+    fallback_index: int,
+) -> Any:
+    """Select the first non-null descriptor column without hiding bad shapes."""
+    if not positions:
+        if fallback_index >= len(values):
+            raise HistorySchemaError("series point is narrower than its descriptors")
+        return values[fallback_index]
+    found_null = False
+    for alias in aliases:
+        index = positions.get(alias)
+        if index is None:
+            continue
+        if index >= len(values):
+            raise HistorySchemaError("series point is narrower than its descriptors")
+        value = values[index]
+        if value is not None:
+            return value
+        found_null = True
+    return None if found_null else _MISSING
 
 
 def _classify_source_array(payload: Any, aliases: tuple[str, ...]) -> tuple[str, Any, str | None]:
@@ -718,7 +772,10 @@ def _descriptor_segment(payload: Any, target_date: date, values_keys: tuple[str,
     if not isinstance(payload, dict) or not any(key in payload for key in descriptor_keys):
         return None
     present = [key for key in values_keys if key in payload]
-    values_key = next((key for key in present if payload[key] not in (None, [])), present[0] if present else values_keys[0])
+    values_key = next(
+        (key for key in present if payload[key] not in (None, [])),
+        present[0] if present else values_keys[0],
+    )
     return normalize_pair_series(payload, values_key=values_key, descriptor_keys=descriptor_keys, value_keys=value_keys, request_date=target_date)
 
 
@@ -900,7 +957,11 @@ class GarminHistorySource:
                     for item in page_items:
                         if not isinstance(item, dict):
                             continue
-                        raw_start = item.get("startTime", item.get("startTimeGMT", item.get("startTimeLocal")))
+                        raw_start = _first_non_null(
+                            item, ("startTime", "startTimeGMT", "startTimeLocal")
+                        )
+                        if raw_start is _MISSING:
+                            raw_start = None
                         parsed_start = _timestamp(raw_start)
                         if parsed_start is not None:
                             if "startTime" not in item and "startTimeGMT" not in item and isinstance(raw_start, str):
