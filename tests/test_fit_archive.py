@@ -68,6 +68,26 @@ async def test_fit_archive_validates_privately_and_atomically(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_fit_archive_hardens_account_directory_permissions(tmp_path: Path) -> None:
+    directory = tmp_path / "account"
+    directory.mkdir(mode=0o755)
+    directory.chmod(0o755)
+    client = AsyncMock()
+    client.download_activity.return_value = b"validated fit bytes"
+
+    await async_archive_fit(
+        client=client,
+        activity_id="12345",
+        logical_id="a" * 24,
+        directory=directory,
+        inspect=_valid_inspector,
+    )
+
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    assert stat.S_IMODE((directory / fit_file_name("a" * 24)).stat().st_mode) == 0o600
+
+
+@pytest.mark.asyncio
 async def test_fit_archive_validation_failure_leaves_no_partial_file(tmp_path: Path) -> None:
     client = AsyncMock()
     client.download_activity.return_value = b"bad fit"
@@ -131,6 +151,31 @@ async def test_bad_existing_fit_is_not_replaced(tmp_path: Path) -> None:
         )
     client.download_activity.assert_not_awaited()
     assert final.read_bytes() == b"bad existing"
+
+
+@pytest.mark.asyncio
+async def test_symlinked_fit_target_is_rejected_without_following_or_replacing(
+    tmp_path: Path,
+) -> None:
+    client = AsyncMock()
+    target = tmp_path / "outside.fit"
+    target.write_bytes(b"outside")
+    target.chmod(0o600)
+    final = tmp_path / fit_file_name("1" * 24)
+    final.symlink_to(target)
+
+    with pytest.raises(FitArchiveError):
+        await async_archive_fit(
+            client=client,
+            activity_id="12345",
+            logical_id="1" * 24,
+            directory=tmp_path,
+            inspect=_valid_inspector,
+        )
+
+    client.download_activity.assert_not_awaited()
+    assert final.is_symlink()
+    assert target.read_bytes() == b"outside"
 
 
 @pytest.mark.asyncio

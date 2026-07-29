@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import stat
 import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -111,9 +112,16 @@ async def async_archive_fit(
     """Download, validate, and atomically archive one FIT file."""
     try:
         directory.mkdir(parents=True, exist_ok=True)
+        directory_stat = os.lstat(directory)
+        if not stat.S_ISDIR(directory_stat.st_mode) or stat.S_ISLNK(directory_stat.st_mode):
+            raise FitArchiveError("FIT directory is not private")
+        os.chmod(directory, 0o700)
         final_path = directory / fit_file_name(logical_id)
-        if final_path.exists():
-            if final_path.stat().st_mode & 0o777 != 0o600:
+        if os.path.lexists(final_path):
+            final_stat = os.lstat(final_path)
+            if stat.S_ISLNK(final_stat.st_mode) or not stat.S_ISREG(final_stat.st_mode):
+                raise FitArchiveError("FIT target is not a regular file")
+            if stat.S_IMODE(final_stat.st_mode) != 0o600:
                 raise FitArchiveError("FIT permissions are invalid")
             existing_summary = await asyncio.to_thread(inspect, final_path, 0o600)
             if not isinstance(existing_summary, Mapping):
@@ -136,6 +144,11 @@ async def async_archive_fit(
             safe_summary = _summary_without_file(summary)
             os.replace(temporary_path, final_path)
             os.chmod(final_path, 0o600)
+            directory_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
             return {"logical_id": logical_id, "path": final_path.name, "summary": safe_summary}
         finally:
             temporary_path.unlink(missing_ok=True)

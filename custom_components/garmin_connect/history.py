@@ -123,6 +123,11 @@ _PROSPECTIVE_CYCLE_INTERVAL = timedelta(minutes=15)
 _RECONCILIATION_WINDOW = timedelta(days=7)
 _FIT_PACING_INTERVAL = timedelta(hours=1)
 _PROSPECTIVE_CYCLE_FIT_LIMIT = 1
+_FIT_LOGICAL_ID_LENGTH = 24
+_FIT_QUEUE_MAX_ITEMS = 256
+_FIT_QUEUE_FIELDS = frozenset(
+    {"logical_id", "activity_id", "year", "calendar_date"}
+)
 _DATE_SUMMARY_BUCKET_TIME_ZONE = timezone(timedelta(hours=8))
 _PRESENCE_STATES = frozenset({"null", "empty", "all-null", "missing", "unsupported", "returned-empty", "present", "absent", "failed", "mixed", "unknown", "partial", "incomplete"})
 # The frozen numeric catalog currently produces 33 base presence keys: 13
@@ -715,6 +720,40 @@ def _fit_queue_entry(
     }
 
 
+def _parse_fit_queue_entry(item: Mapping[str, Any]) -> dict[str, str]:
+    """Validate one durable FIT queue record without coercing identity."""
+    if set(item) != _FIT_QUEUE_FIELDS:
+        raise ValueError("FIT queue entry fields are invalid")
+    logical_id = item.get("logical_id")
+    activity_id = item.get("activity_id")
+    year = item.get("year")
+    calendar_date = item.get("calendar_date")
+    if (
+        not isinstance(logical_id, str)
+        or len(logical_id) != _FIT_LOGICAL_ID_LENGTH
+        or any(character not in "0123456789abcdef" for character in logical_id)
+        or not isinstance(activity_id, str)
+        or not activity_id
+        or len(activity_id) > 128
+        or not isinstance(year, str)
+        or len(year) != 4
+        or not year.isdecimal()
+        or not isinstance(calendar_date, str)
+    ):
+        raise ValueError("FIT queue entry identity is invalid")
+    try:
+        parsed_calendar_date = date.fromisoformat(calendar_date)
+    except ValueError as err:
+        raise ValueError("FIT queue entry date is invalid") from err
+    if (
+        parsed_calendar_date.isoformat() != calendar_date
+        or str(parsed_calendar_date.year) != year
+        or parsed_calendar_date < _HISTORY_MIN_DATE
+    ):
+        raise ValueError("FIT queue entry date is invalid")
+    return _fit_queue_entry(logical_id, activity_id, year, parsed_calendar_date)
+
+
 HistoryArchiveClock = Callable[[], datetime]
 HistoryArchiveTimerFactory = Callable[
     [timedelta, Callable[[], None]], Callable[[], None]
@@ -943,7 +982,10 @@ class GarminHistoryArchive:
         self._health_events: dict[str, dict[str, dict[str, Any]]] = {}
         self._activities: dict[str, dict[str, dict[str, Any]]] = {}
         self._fit_archives: dict[str, dict[str, dict[str, Any]]] = {}
+        self._fit_partition_quarantine: dict[str, Any] = {}
         self._fit_queue: dict[str, dict[str, str]] = {}
+        self._fit_queue_quarantine: list[Any] = []
+        self._fit_queue_error: str | None = None
         self._fit_last_eligible_download: datetime | None = None
         self._sleep_partition_stores: dict[str, Any] = {}
         self._presence: dict[str, dict[str, str]] = {}
@@ -1601,7 +1643,10 @@ class GarminHistoryArchive:
                 fit_limit=fit_limit,
                 include_training_status=include_training_status,
                 force_dates=frozenset(forced_dates),
-                process_fit=self._archive_enabled,
+                # Manual Repair is an explicit operator request.  Archive
+                # disablement stops automatic cycles, but must not suppress
+                # the FIT work discovered by this repair.
+                process_fit=True,
             )
             for target, target_report in report.date_results:
                 # One Manual Repair observation must not settle a date without
@@ -2504,8 +2549,22 @@ class GarminHistoryArchive:
             raise FitArchiveError("FIT queue catalog unavailable")
         updated = dict(catalog)
         updated["fit_queue"] = self._fit_queue_records(queue)
+        updated["fit_queue_quarantine"] = list(self._fit_queue_quarantine)[
+            :_FIT_QUEUE_MAX_ITEMS
+        ]
+        updated["fit_queue_error"] = self._fit_queue_error
         updated["fit_last_eligible_download"] = self._fit_last_eligible_record()
         await self._store.async_save(updated)
+
+    async def _async_mark_fit_error(self, error_type: str) -> None:
+        """Record FIT-only failure state while retaining pending queue work."""
+        self._fit_queue_error = error_type
+        try:
+            await asyncio.shield(self._async_save_fit_state())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.warning("Garmin FIT failure state could not be persisted")
 
     async def _async_existing_fit_record(
         self, logical_id: str
@@ -2559,6 +2618,7 @@ class GarminHistoryArchive:
                 raise
             except Exception:
                 _LOGGER.warning("Garmin FIT partition load failed")
+                await self._async_mark_fit_error("fit_partition_schema")
                 return downloaded
             existing = self._fit_archives.get(year, {}).get(logical_id)
             if existing is None:
@@ -2572,6 +2632,7 @@ class GarminHistoryArchive:
                     )
                 except Exception:
                     _LOGGER.warning("Garmin FIT completion checkpoint failed")
+                    await self._async_mark_fit_error("fit_checkpoint_failed")
                     return downloaded
                 continue
             if downloaded >= max_downloads:
@@ -2602,6 +2663,7 @@ class GarminHistoryArchive:
                 raise
             except Exception:
                 _LOGGER.warning("Garmin FIT archive attempt failed")
+                await self._async_mark_fit_error("fit_archive_failed")
                 return downloaded
             downloaded += 1
         return downloaded
@@ -2630,6 +2692,7 @@ class GarminHistoryArchive:
             self._fit_archives,
             years={year},
         )
+        self._fit_queue_error = None
         remaining = {
             key: value for key, value in self._fit_queue.items() if key != logical_id
         }
@@ -2715,6 +2778,10 @@ class GarminHistoryArchive:
             "event_index": {year: sorted(records) for year, records in events_by_year.items()},
             "activity_index": {year: sorted(records) for year, records in activities_by_year.items()},
             "fit_queue": self._fit_queue_records(fit_queue),
+            "fit_queue_quarantine": list(self._fit_queue_quarantine)[
+                :_FIT_QUEUE_MAX_ITEMS
+            ],
+            "fit_queue_error": self._fit_queue_error,
             "fit_last_eligible_download": (
                 self._fit_last_eligible_record()
                 if fit_last_eligible_download is ...
@@ -3027,17 +3094,32 @@ class GarminHistoryArchive:
                     private=True,
                     atomic_writes=True,
                 )
+            fit_records = dict((fits_by_year or {}).get(year, {}))
+            if year not in (fits_by_year or {}):
+                existing_partition = await self._sleep_partition_stores[year].async_load()
+                existing_fits = (
+                    existing_partition.get("fits", {})
+                    if isinstance(existing_partition, Mapping)
+                    else {}
+                )
+                if isinstance(existing_fits, Mapping):
+                    fit_records = dict(existing_fits)
+            partition_record = {
+                "schema_version": HISTORY_STORE_VERSION,
+                "sleep_schema_version": _SLEEP_SCHEMA_VERSION,
+                "account_key": self._account_key(),
+                "year": year,
+                "sessions": dict(records),
+                "events": dict((events_by_year or {}).get(year, {})),
+                "activities": dict((activities_by_year or {}).get(year, {})),
+                "fits": fit_records,
+            }
+            if year in self._fit_partition_quarantine:
+                partition_record["fit_quarantine"] = dict(
+                    self._fit_partition_quarantine[year]
+                )
             await self._sleep_partition_stores[year].async_save(
-                {
-                    "schema_version": HISTORY_STORE_VERSION,
-                    "sleep_schema_version": _SLEEP_SCHEMA_VERSION,
-                    "account_key": self._account_key(),
-                    "year": year,
-                    "sessions": dict(records),
-                    "events": dict((events_by_year or {}).get(year, {})),
-                    "activities": dict((activities_by_year or {}).get(year, {})),
-                    "fits": dict((fits_by_year or {}).get(year, {})),
-                }
+                partition_record
             )
 
     async def _async_persist_observed_structured_records(
@@ -3174,6 +3256,7 @@ class GarminHistoryArchive:
             self._health_events.pop(year, None)
             self._activities.pop(year, None)
             self._fit_archives.pop(year, None)
+            self._fit_partition_quarantine.pop(year, None)
             if year not in self._sleep_partition_stores:
                 self._sleep_partition_stores[year] = store_factory(
                     self._hass,
@@ -3228,16 +3311,31 @@ class GarminHistoryArchive:
                         raise SleepSchemaError("activity partition is invalid")
                     parsed_activities[key] = dict(value)
                 self._activities[year] = parsed_activities
+                persisted_fit_quarantine = partition.get("fit_quarantine")
+                if isinstance(persisted_fit_quarantine, Mapping):
+                    self._fit_partition_quarantine[year] = dict(
+                        persisted_fit_quarantine
+                    )
+                    self._fit_queue_error = self._fit_queue_error or "fit_partition_schema"
                 raw_fits = partition.get("fits", {})
                 if not isinstance(raw_fits, Mapping):
-                    raise FitArchiveError("FIT partition is invalid")
+                    # FIT is an optional detail partition.  A damaged FIT
+                    # field must not invalidate already parsed structured
+                    # records or the catalog index for this year.
+                    self._fit_partition_quarantine[year] = {
+                        "fits": repr(raw_fits)[:256]
+                    }
+                    self._fit_queue_error = "fit_partition_schema"
+                    raw_fits = {}
                 parsed_fits: dict[str, dict[str, Any]] = {}
                 invalid_fit_keys: set[str] = set()
+                invalid_fit_records: dict[str, Any] = {}
                 for key, value in raw_fits.items():
                     try:
                         restored_fit = fit_record(value)
                         if restored_fit["logical_id"] != key or key not in parsed_activities:
                             invalid_fit_keys.add(key)
+                            invalid_fit_records[key] = value
                             continue
                         fit_directory = self._fit_directory().resolve()
                         fit_path = (fit_directory / restored_fit["path"]).resolve()
@@ -3256,12 +3354,23 @@ class GarminHistoryArchive:
                         parsed_fits[key] = fit_record(restored_fit)
                     except (OSError, RuntimeError, TypeError, ValueError):
                         invalid_fit_keys.add(key)
+                        invalid_fit_records[key] = value
                         continue
                 if invalid_fit_keys:
                     cleaned_partition = dict(partition)
                     cleaned_partition["fits"] = {
                         key: value for key, value in raw_fits.items() if key not in invalid_fit_keys
                     }
+                    existing_quarantine = cleaned_partition.get("fit_quarantine")
+                    quarantine = (
+                        dict(existing_quarantine)
+                        if isinstance(existing_quarantine, Mapping)
+                        else {}
+                    )
+                    quarantine["invalid_records"] = invalid_fit_records
+                    cleaned_partition["fit_quarantine"] = quarantine
+                    self._fit_partition_quarantine[year] = quarantine
+                    self._fit_queue_error = self._fit_queue_error or "fit_partition_schema"
                     try:
                         await self._sleep_partition_stores[year].async_save(cleaned_partition)
                     except (OSError, RuntimeError, TypeError, ValueError):
@@ -3384,6 +3493,8 @@ class GarminHistoryArchive:
                     "event_index": {},
                     "activity_index": {},
                     "fit_queue": [],
+                    "fit_queue_quarantine": [],
+                    "fit_queue_error": None,
                     "fit_last_eligible_download": None,
                 }
             )
@@ -3651,47 +3762,59 @@ class GarminHistoryArchive:
             parsed_reconciliation_presence[key] = bounded_families
         self._reconciliation_family_presence = parsed_reconciliation_presence
         raw_fit_queue = catalog.get("fit_queue", [])
+        raw_fit_quarantine = catalog.get("fit_queue_quarantine", [])
+        if not isinstance(raw_fit_quarantine, list):
+            raw_fit_quarantine = []
+            self._fit_queue_error = "fit_queue_schema"
+        self._fit_queue_quarantine = [
+            dict(item) if isinstance(item, Mapping) else {"raw": repr(item)[:256]}
+            for item in raw_fit_quarantine
+            if isinstance(item, Mapping) or item is not None
+        ][: _FIT_QUEUE_MAX_ITEMS]
+        raw_fit_error = catalog.get("fit_queue_error")
+        if isinstance(raw_fit_error, str) and len(raw_fit_error) <= 64:
+            self._fit_queue_error = raw_fit_error
+        elif raw_fit_error is not None:
+            self._fit_queue_error = "fit_queue_schema"
         if not isinstance(raw_fit_queue, list):
-            raise ValueError("FIT queue is invalid")
-        for item in raw_fit_queue:
-            if not isinstance(item, Mapping):
-                raise ValueError("FIT queue is invalid")
-            logical_id = item.get("logical_id")
-            activity_id = item.get("activity_id")
-            year = item.get("year")
-            calendar_date = item.get("calendar_date")
-            if (
-                not isinstance(logical_id, str)
-                or not logical_id
-                or any(character not in "0123456789abcdef" for character in logical_id)
-                or not isinstance(activity_id, str)
-                or not activity_id
-                or not isinstance(year, str)
-                or len(year) != 4
-                or not year.isdecimal()
-                or not isinstance(calendar_date, str)
-            ):
-                raise ValueError("FIT queue is invalid")
-            try:
-                parsed_calendar_date = date.fromisoformat(calendar_date)
-            except ValueError as err:
-                raise ValueError("FIT queue is invalid") from err
-            if parsed_calendar_date.isoformat() != calendar_date or str(parsed_calendar_date.year) != year:
-                raise ValueError("FIT queue is invalid")
-            self._fit_queue[logical_id] = _fit_queue_entry(
-                logical_id, activity_id, year, parsed_calendar_date
+            self._fit_queue_quarantine.append({"raw": repr(raw_fit_queue)[:256]})
+            self._fit_queue_error = "fit_queue_schema"
+            raw_fit_queue = []
+        if len(raw_fit_queue) > _FIT_QUEUE_MAX_ITEMS:
+            self._fit_queue_quarantine.extend(
+                {"raw": repr(item)[:256]} for item in raw_fit_queue[_FIT_QUEUE_MAX_ITEMS:]
             )
+            raw_fit_queue = raw_fit_queue[:_FIT_QUEUE_MAX_ITEMS]
+            self._fit_queue_error = "fit_queue_schema"
+        for item in raw_fit_queue:
+            try:
+                if not isinstance(item, Mapping):
+                    raise ValueError("FIT queue entry is not a mapping")
+                parsed_entry = _parse_fit_queue_entry(item)
+                logical_id = parsed_entry["logical_id"]
+                if logical_id in self._fit_queue:
+                    raise ValueError("FIT queue contains a duplicate logical ID")
+                self._fit_queue[logical_id] = parsed_entry
+            except (TypeError, ValueError):
+                self._fit_queue_quarantine.append(
+                    dict(item) if isinstance(item, Mapping) else {"raw": repr(item)[:256]}
+                )
+                self._fit_queue_error = "fit_queue_schema"
         raw_fit_last = catalog.get("fit_last_eligible_download")
         if raw_fit_last is not None:
-            if not isinstance(raw_fit_last, str):
-                raise ValueError("FIT pacing state is invalid")
             try:
+                if not isinstance(raw_fit_last, str):
+                    raise ValueError("FIT pacing state is invalid")
                 parsed_fit_last = datetime.fromisoformat(raw_fit_last)
-            except ValueError as err:
-                raise ValueError("FIT pacing state is invalid") from err
-            if parsed_fit_last.tzinfo is None or parsed_fit_last.utcoffset() is None:
-                raise ValueError("FIT pacing state is invalid")
-            self._fit_last_eligible_download = parsed_fit_last.astimezone(UTC)
+                if (
+                    parsed_fit_last.tzinfo is None
+                    or parsed_fit_last.utcoffset() is None
+                    or parsed_fit_last.astimezone(UTC).isoformat() != raw_fit_last
+                ):
+                    raise ValueError("FIT pacing state is invalid")
+                self._fit_last_eligible_download = parsed_fit_last.astimezone(UTC)
+            except ValueError:
+                self._fit_queue_error = "fit_pacing_schema"
         raw_sleep = catalog.get("sleep_index", catalog.get("sleep_sessions", {}))
         raw_events = catalog.get("event_index", {})
         raw_activities = catalog.get("activity_index", {})
@@ -3738,7 +3861,31 @@ class GarminHistoryArchive:
                 value for value in self._completed_dates
                 if value[:4] not in missing_years
             }
+        await self._async_persist_fit_recovery_state()
         await self._async_persist_numeric_replay_state()
+
+    async def _async_persist_fit_recovery_state(self) -> None:
+        """Durably record FIT-only repair work without failing startup."""
+        if self._store is None or (
+            self._fit_queue_error is None and not self._fit_queue_quarantine
+        ):
+            return
+        try:
+            catalog = await self._store.async_load()
+            if not isinstance(catalog, Mapping):
+                return
+            updated = dict(catalog)
+            updated["fit_queue"] = self._fit_queue_records()
+            updated["fit_queue_quarantine"] = list(self._fit_queue_quarantine)[
+                :_FIT_QUEUE_MAX_ITEMS
+            ]
+            updated["fit_queue_error"] = self._fit_queue_error
+            updated["fit_last_eligible_download"] = self._fit_last_eligible_record()
+            await self._store.async_save(updated)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.warning("Garmin FIT queue repair state could not be persisted")
 
     async def _async_persist_numeric_replay_state(self) -> None:
         """Keep startup-detected provenance loss durable without aborting setup."""

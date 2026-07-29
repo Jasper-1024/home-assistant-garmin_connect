@@ -146,6 +146,80 @@ async def test_activity_discovery_deduplicates_durable_fit_work_without_download
 
 
 @pytest.mark.asyncio
+async def test_malformed_fit_queue_is_quarantined_without_touching_activity_catalog():
+    activity = _activity()
+    activity_record = {
+        "logical_id": activity.logical_id,
+        "activity_id": activity.activity_id,
+        "revision": activity.revision,
+        "calendar_date": activity.calendar_date.isoformat(),
+        "activity_type": activity.activity_type,
+        "name": activity.name,
+        "start": activity.start.isoformat(),
+        "end": None,
+        "duration_seconds": activity.duration_seconds,
+        "training_effect": activity.training_effect,
+        "load": activity.load,
+        "recovery": activity.recovery,
+    }
+    account_key = "opaque-account-key-1234567890"
+    queue_item = {
+        "logical_id": activity.logical_id,
+        "activity_id": activity.activity_id,
+        "year": "2026",
+        "calendar_date": "2026-08-01",
+    }
+    store = _Store(
+        {
+            "schema_version": 1,
+            "account_key": account_key,
+            "completed_dates": [],
+            "presence": {"2026-08-01": {"heart_rate": "present"}},
+            "sleep_index": {},
+            "event_index": {},
+            "activity_index": {"2026": [activity.logical_id]},
+            "fit_queue": [queue_item, dict(queue_item), {"logical_id": "not-an-id"}],
+            "fit_last_eligible_download": None,
+        }
+    )
+    partition = _Store(
+        {
+            "schema_version": 1,
+            "sleep_schema_version": 1,
+            "account_key": account_key,
+            "year": "2026",
+            "sessions": {},
+            "events": {},
+            "activities": {activity.logical_id: activity_record},
+            "fits": {},
+        }
+    )
+    stores = {
+        "garmin_connect.entry-1.history_catalog": store,
+        "garmin_connect.entry-1.sleep_2026": partition,
+    }
+    archive = _archive(
+        MagicMock(),
+        MagicMock(),
+        store,
+        account_key=account_key,
+        stores=stores,
+    )
+
+    await archive.async_start()
+
+    assert archive.status.state.value == "disabled"
+    assert store.data["activity_index"] == {"2026": [activity.logical_id]}
+    events = await archive.async_get_calendar_events(
+        "activity", activity.calendar_date, activity.calendar_date
+    )
+    assert len(events) == 1
+    assert store.data["fit_queue"] == [queue_item]
+    assert len(store.data["fit_queue_quarantine"]) == 2
+    assert store.data["fit_queue_error"] == "fit_queue_schema"
+
+
+@pytest.mark.asyncio
 async def test_fit_queue_paces_downloads_and_recovers_pending_work_after_restart(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -259,6 +333,7 @@ async def test_fit_failure_keeps_structured_activity_and_pending_work(
     assert report.outcome == "written", report
     assert archive.status.state.value == "idle"
     assert store.data["fit_queue"]
+    assert store.data["fit_queue_error"] == "fit_archive_failed"
     assert store.data["activity_index"]["2026"] == [activity.logical_id]
 
 
@@ -307,7 +382,7 @@ async def test_valid_local_fit_completes_queue_without_download(
 
 
 @pytest.mark.asyncio
-async def test_disabled_archive_preserves_pending_fit_without_processing(
+async def test_manual_repair_processes_fit_when_archive_is_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ):
     activity = _activity()
@@ -322,16 +397,23 @@ async def test_disabled_archive_preserves_pending_fit_without_processing(
     client = MagicMock()
     client.download_activity = AsyncMock()
     store = _Store()
-    archive_fit = AsyncMock()
+    archive_fit = AsyncMock(
+        return_value={
+            "logical_id": activity.logical_id,
+            "path": fit_file_name(activity.logical_id),
+            "summary": _fit_summary(),
+        }
+    )
     monkeypatch.setattr(history_module, "async_archive_fit", archive_fit)
     archive = _archive(Source(), client, store)
     await archive.async_start()
 
-    await archive.async_sync_range(activity.calendar_date, activity.calendar_date)
+    report = await archive.async_sync_range(activity.calendar_date, activity.calendar_date)
 
-    archive_fit.assert_not_awaited()
-    client.download_activity.assert_not_awaited()
-    assert store.data["fit_queue"]
+    archive_fit.assert_awaited_once()
+    assert report.outcome == "written"
+    assert archive.archive_enabled is False
+    assert store.data["fit_queue"] == []
 
 
 @pytest.mark.asyncio

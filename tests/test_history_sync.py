@@ -2129,6 +2129,51 @@ async def test_bad_fit_is_removed_without_touching_same_year_activity_partition(
 
 
 @pytest.mark.asyncio
+async def test_fit_partition_schema_failure_preserves_activity_index_and_records() -> None:
+    activity = normalize_activities(
+        [{"activityId": 1002, "activityType": "running", "startTime": "2026-01-02T10:00:00Z", "durationInSeconds": 60}],
+        date(2026, 1, 2),
+    )[0]
+    activity_record = {
+        "logical_id": activity.logical_id, "activity_id": activity.activity_id,
+        "revision": activity.revision, "calendar_date": activity.calendar_date.isoformat(),
+        "activity_type": activity.activity_type, "name": activity.name,
+        "start": activity.start.isoformat(), "end": None,
+        "duration_seconds": activity.duration_seconds,
+        "training_effect": activity.training_effect, "load": activity.load,
+        "recovery": activity.recovery,
+    }
+    account_key = "opaque-account-key-1234567890"
+    catalog = _NamedStore({
+        "account_key": account_key, "schema_version": 1,
+        "completed_dates": ["2026-01-02"], "hrv_summaries": {}, "presence": {},
+        "sleep_index": {}, "event_index": {},
+        "activity_index": {"2026": [activity.logical_id]},
+        "fit_queue": [], "fit_last_eligible_download": None,
+    })
+    partition = _NamedStore({
+        "account_key": account_key, "schema_version": 1,
+        "sleep_schema_version": 1, "year": "2026", "sessions": {}, "events": {},
+        "activities": {activity.logical_id: activity_record}, "fits": [b"partial"],
+    })
+    stores = {
+        "garmin_connect.e.history_catalog": catalog,
+        "garmin_connect.e.sleep_2026": partition,
+    }
+    archive = _partition_archive(MagicMock(), MagicMock(), stores)
+
+    await archive.async_start()
+
+    assert archive.status.state is HistoryArchiveState.DISABLED
+    assert catalog.data["activity_index"] == {"2026": [activity.logical_id]}
+    assert partition.data["activities"] == {activity.logical_id: activity_record}
+    events = await archive.async_get_calendar_events(
+        "activity", activity.calendar_date, activity.calendar_date
+    )
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
 async def test_valid_fit_survives_restart_revalidation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     activity = normalize_activities(
         [{"activityId": 1000, "activityType": "running", "startTime": "2026-01-01T10:00:00Z", "durationInSeconds": 60}],
