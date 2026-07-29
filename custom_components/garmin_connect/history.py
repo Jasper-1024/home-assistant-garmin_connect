@@ -1740,32 +1740,51 @@ class GarminHistoryArchive:
         await self._async_load_sleep_partitions(
             {str(year) for year in range(start_date.year - 1, end_date.year + 2)}
         )
-        events: dict[tuple[datetime, datetime, str], HistoryCalendarEvent] = {}
+        events: dict[tuple[str, datetime, datetime, str], HistoryCalendarEvent] = {}
         if calendar == "activity":
             for records in self._activities.values():
-                for record in records.values():
+                for logical_id, record in records.items():
                     start = datetime.fromisoformat(record["start"])
                     end = datetime.fromisoformat(record["end"]) if record.get("end") else None
                     if end is not None and start.date() <= end_date and end.date() >= start_date:
                         summary = str(record.get("name") or record.get("activity_type") or "Activity")[:64]
-                        events[(start, end, summary)] = HistoryCalendarEvent(start, end, summary)
+                        events[(logical_id, start, end, summary)] = HistoryCalendarEvent(start, end, summary)
             return tuple(sorted(events.values(), key=lambda event: event.start))
         if calendar == "health":
             for records in self._health_events.values():
-                for record in records.values():
+                for logical_id, record in records.items():
                     health_start = datetime.fromisoformat(record["start"]) if record.get("start") else None
                     health_end = datetime.fromisoformat(record["end"]) if record.get("end") else None
-                    if health_start is not None and health_end is not None and start_date <= health_start.date() <= end_date:
+                    occurrence = datetime.fromisoformat(record["occurrence"]) if record.get("occurrence") else None
+                    health_start = health_start or occurrence or health_end
+                    health_end = health_end or occurrence or health_start
+                    if health_start is None or health_end is None:
+                        continue
+                    source_date: date | None = None
+                    raw_source_date = record.get("calendar_date")
+                    if isinstance(raw_source_date, str):
+                        try:
+                            source_date = date.fromisoformat(raw_source_date)
+                        except ValueError:
+                            continue
+                    overlaps_range = (
+                        health_start.date() <= end_date
+                        and health_end.date() >= start_date
+                    )
+                    if (
+                        source_date is not None
+                        and start_date <= source_date <= end_date
+                    ) or overlaps_range:
                         summary = str(record.get("category") or record.get("event_type") or "Health event")[:64]
-                        events[(health_start, health_end, summary)] = HistoryCalendarEvent(health_start, health_end, summary)
+                        events[(logical_id, health_start, health_end, summary)] = HistoryCalendarEvent(health_start, health_end, summary)
             return tuple(sorted(events.values(), key=lambda event: event.start))
         for records in self._sleep_sessions.values():
-            for record in records.values():
+            for logical_id, record in records.items():
                 start = datetime.fromisoformat(record["start"])
                 end = datetime.fromisoformat(record["end"])
                 if start.date() <= end_date and end.date() >= start_date:
                     summary = "Sleep" if record["kind"] == "main" else "Nap"
-                    events[(start, end, summary)] = HistoryCalendarEvent(start, end, summary)
+                    events[(logical_id, start, end, summary)] = HistoryCalendarEvent(start, end, summary)
         return tuple(sorted(events.values(), key=lambda event: event.start))
 
     async def _async_load_sleep_partitions(self, years: set[str]) -> None:

@@ -44,11 +44,14 @@ from custom_components.garmin_connect.history_source import (
     SegmentedData,
     SnapshotData,
     SourceSeries,
+    normalize_activities,
+    normalize_health_events,
 )
 from custom_components.garmin_connect.request_gate import (
     GarminRequestGate,
     GarminRequestPriority,
 )
+from custom_components.garmin_connect.sleep_archive import parse_sleep_sessions
 
 
 class FakeStore:
@@ -253,6 +256,309 @@ async def test_numeric_source_calendar_dates_are_durable_across_restart_and_upse
     assert numeric_store.data["dates"][statistic_id] == {
         "2026-07-24T23:30:00+00:00": "2026-07-25"
     }
+
+
+@pytest.mark.asyncio
+async def test_calendar_exposes_instantaneous_health_source_record() -> None:
+    """A health event with only a Source Instant remains Calendar-queryable."""
+    target = date(2026, 7, 24)
+    hass = _hass()
+    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=None
+    )
+    stores: dict[str, FakeStore] = {}
+
+    def store_factory(_hass, _version, path, **kwargs):
+        return stores.setdefault(path, FakeStore())
+
+    health_event = normalize_health_events(
+        {
+            "events": [
+                {
+                    "source": "GARMIN",
+                    "type": "abnormalHeartRate",
+                    "category": "abnormal",
+                    "occurrenceTime": "2026-07-24T00:34:56+02:00",
+                }
+            ]
+        },
+        target,
+    )[0]
+
+    class Source:
+        async def async_fetch_details(self, _request_date: date, metric: str) -> object:
+            if metric == "health_events_daily":
+                return (health_event,)
+            if metric in {
+                "sleep_sessions",
+                "health_events_body_battery",
+                "timed_activities",
+            }:
+                return ()
+            return SourceSeries((), "missing")
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=store_factory,
+        source_factory=lambda _client, _gate: Source(),
+        recorder_factory=lambda: recorder,
+    )
+    await archive.async_start()
+
+    assert (await archive.async_sync_range(target, target)).outcome == "written"
+
+    events = await archive.async_get_calendar_events("health", target, target)
+    assert [(event.summary, event.start, event.end) for event in events] == [
+        (
+            "abnormal",
+            datetime(2026, 7, 23, 22, 34, 56, tzinfo=UTC),
+            datetime(2026, 7, 23, 22, 34, 56, tzinfo=UTC),
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_calendar_retains_distinct_same_time_activities() -> None:
+    """Calendar deduplication cannot thin distinct activity Source Records."""
+    target = date(2026, 7, 24)
+    hass = _hass()
+    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=None
+    )
+    stores: dict[str, FakeStore] = {}
+
+    def store_factory(_hass, _version, path, **kwargs):
+        return stores.setdefault(path, FakeStore())
+
+    activities = normalize_activities(
+        {
+            "activities": [
+                {
+                    "activityId": 1,
+                    "activityType": "running",
+                    "activityName": "Morning run",
+                    "startTime": "2026-07-24T06:00:00Z",
+                    "endTime": "2026-07-24T07:00:00Z",
+                },
+                {
+                    "activityId": 2,
+                    "activityType": "running",
+                    "activityName": "Morning run",
+                    "startTime": "2026-07-24T06:00:00Z",
+                    "endTime": "2026-07-24T07:00:00Z",
+                },
+            ]
+        },
+        target,
+    )
+
+    class Source:
+        async def async_fetch_details(self, _request_date: date, metric: str) -> object:
+            if metric == "timed_activities":
+                return activities
+            if metric in {
+                "sleep_sessions",
+                "health_events_daily",
+                "health_events_body_battery",
+            }:
+                return ()
+            return SourceSeries((), "missing")
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=store_factory,
+        source_factory=lambda _client, _gate: Source(),
+        recorder_factory=lambda: recorder,
+    )
+    await archive.async_start()
+
+    assert (await archive.async_sync_range(target, target)).outcome == "written"
+    events = await archive.async_get_calendar_events("activity", target, target)
+
+    assert [event.summary for event in events] == ["Morning run", "Morning run"]
+    assert len(stores["garmin_connect.entry-1.sleep_2026"].data["activities"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_structured_archive_upserts_and_survives_disabled_restart_per_account() -> None:
+    """Structured Source Records stay durable, revision-aware, and account-isolated."""
+    target = date(2026, 7, 24)
+    hass = _hass()
+    entry = _entry(data={"history_account_key": "opaque-account-one-123"})
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=None
+    )
+    stores: dict[str, FakeStore] = {}
+
+    def store_factory(_hass, _version, path, **kwargs):
+        return stores.setdefault(path, FakeStore())
+
+    class Source:
+        def __init__(self) -> None:
+            self.revised = False
+
+        async def async_fetch_details(self, _request_date: date, metric: str) -> object:
+            if metric == "sleep_sessions":
+                return parse_sleep_sessions(
+                    {
+                        "sleepData": {
+                            "sleepStartTimestampGMT": "2026-07-24T00:30:00+02:00",
+                            "sleepEndTimestampGMT": "2026-07-24T08:30:00+02:00",
+                            "sleepScores": {"overall": 81 if self.revised else 80},
+                        }
+                    },
+                    target,
+                )
+            if metric == "health_events_daily":
+                return normalize_health_events(
+                    {
+                        "events": [
+                            {
+                                "source": "GARMIN",
+                                "type": "abnormalHeartRate",
+                                "category": "revised" if self.revised else "abnormal",
+                                "occurrenceTime": "2026-07-24T00:15:00+02:00",
+                            }
+                        ]
+                    },
+                    target,
+                )
+            if metric == "timed_activities":
+                return normalize_activities(
+                    {
+                        "activities": [
+                            {
+                                "activityId": 99,
+                                "activityType": "running",
+                                "activityName": "Revised run" if self.revised else "Morning run",
+                                "startTime": "2026-07-24T06:00:00Z",
+                                "endTime": "2026-07-24T07:00:00Z",
+                            }
+                        ]
+                    },
+                    target,
+                )
+            if metric == "health_events_body_battery":
+                return ()
+            return SourceSeries((), "missing")
+
+    source = Source()
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+
+    def make_archive(config_entry: MagicMock, source_factory) -> GarminHistoryArchive:
+        return GarminHistoryArchive(
+            hass,
+            config_entry,
+            recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+            store_factory=store_factory,
+            source_factory=source_factory,
+            recorder_factory=lambda: recorder,
+        )
+
+    archive = make_archive(entry, lambda _client, _gate: source)
+    await archive.async_start()
+    assert (await archive.async_sync_range(target, target)).outcome == "written"
+    first_partition = stores["garmin_connect.entry-1.sleep_2026"].data
+    first_revisions = {
+        family: next(iter(first_partition[family].values()))["revision"]
+        for family in ("sessions", "events", "activities")
+    }
+
+    assert [event.summary for event in await archive.async_get_calendar_events("sleep", target, target)] == ["Sleep"]
+    assert [event.summary for event in await archive.async_get_calendar_events("health", target, target)] == ["abnormal"]
+    assert [event.summary for event in await archive.async_get_calendar_events("activity", target, target)] == ["Morning run"]
+
+    source.revised = True
+    archive._completed_dates.clear()
+    assert (await archive.async_sync_range(target, target)).outcome == "written"
+    revised_partition = stores["garmin_connect.entry-1.sleep_2026"].data
+    assert {
+        family: len(revised_partition[family])
+        for family in ("sessions", "events", "activities")
+    } == {"sessions": 1, "events": 1, "activities": 1}
+    assert {
+        family: next(iter(revised_partition[family].values()))["revision"]
+        for family in ("sessions", "events", "activities")
+    } != first_revisions
+
+    no_request_source = MagicMock()
+    no_request_source.async_fetch_details = AsyncMock(side_effect=AssertionError)
+    restarted = make_archive(entry, lambda _client, _gate: no_request_source)
+    await restarted.async_start()
+    no_request_source.async_fetch_details.assert_not_awaited()
+    assert restarted.archive_enabled is False
+    assert [event.summary for event in await restarted.async_get_calendar_events("sleep", target, target)] == ["Sleep"]
+    assert [event.summary for event in await restarted.async_get_calendar_events("health", target, target)] == ["revised"]
+    assert [event.summary for event in await restarted.async_get_calendar_events("activity", target, target)] == ["Revised run"]
+
+    other_entry = _entry(
+        entry_id="entry-2", data={"history_account_key": "opaque-account-two-123"}
+    )
+    other_entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=None
+    )
+    other_source = Source()
+    other_archive = make_archive(other_entry, lambda _client, _gate: other_source)
+    await other_archive.async_start()
+    assert (await other_archive.async_sync_range(target, target)).outcome == "written"
+
+    assert [event.summary for event in await other_archive.async_get_calendar_events("activity", target, target)] == ["Morning run"]
+    assert stores["garmin_connect.entry-1.sleep_2026"].data["account_key"] == "opaque-account-one-123"
+    assert stores["garmin_connect.entry-2.sleep_2026"].data["account_key"] == "opaque-account-two-123"
+
+
+@pytest.mark.asyncio
+async def test_malformed_structured_record_fails_archive_without_blocking_foreground_work() -> None:
+    """A malformed structured record is isolated from healthy current-value work."""
+    target = date(2026, 7, 24)
+    gate = GarminRequestGate()
+    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=gate
+    )
+
+    class Source:
+        async def async_fetch_details(self, _request_date: date, metric: str) -> object:
+            if metric == "sleep_sessions":
+                return "malformed sleep structure"
+            if metric in {
+                "health_events_daily",
+                "health_events_body_battery",
+                "timed_activities",
+            }:
+                return ()
+            return SourceSeries((), "missing")
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = GarminHistoryArchive(
+        _hass(),
+        entry,
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=_store_factory(FakeStore()),
+        source_factory=lambda _client, _gate: Source(),
+        recorder_factory=lambda: recorder,
+    )
+    await archive.async_start()
+
+    report = await archive.async_sync_range(target, target)
+
+    assert (report.outcome, report.error_type) == ("failed", "sync_failed")
+    assert archive.status.state is HistoryArchiveState.FAILED
+    assert await gate.async_request(
+        GarminRequestPriority.FOREGROUND, _current_value
+    ) == "current-value"
 
 
 @pytest.mark.asyncio

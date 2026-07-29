@@ -316,6 +316,8 @@ def normalize_health_events(payload: Any, target_date: date) -> tuple[Normalized
         start = event_time(event, ("startTime", "startTimeGMT", "start"))
         end = event_time(event, ("endTime", "endTimeGMT", "end"))
         occurrence = event_time(event, ("occurrenceTime", "occurrenceTimeGMT", "eventTime", "timestamp", "time"))
+        if all(value is None for value in (source, event_type, category, start, end, occurrence)):
+            continue
         logical_id, revision = _health_identity_revision(event_type, source, category, start, end, occurrence)
         result[logical_id] = NormalizedHealthEvent(logical_id, revision, target_date, source, event_type, category, start, end, occurrence)
     return tuple(sorted(result.values(), key=lambda item: (item.start or item.occurrence or datetime.min.replace(tzinfo=UTC), item.logical_id)))
