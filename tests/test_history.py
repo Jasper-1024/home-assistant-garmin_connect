@@ -6,7 +6,9 @@ import tempfile
 from datetime import UTC, date, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
+import pytest
 from homeassistant import loader
 from homeassistant.config_entries import ConfigEntries
 from homeassistant.core import HomeAssistant
@@ -150,12 +152,35 @@ async def test_enablement_persists_local_activation_date() -> None:
     checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
     now = datetime(2026, 8, 3, 1, 30, tzinfo=UTC)
 
-    with patch("custom_components.garmin_connect.history.dt_util.now", return_value=now):
+    with patch("custom_components.garmin_connect.history.dt_util.utcnow", return_value=now):
         await _archive(hass, entry, checker).async_start()
 
     persisted = hass.config_entries.async_update_entry.call_args.kwargs["data"]
     assert persisted[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-08-03"
     assert persisted[CONF_ARCHIVE_PREVIOUSLY_ENABLED] is True
+
+
+async def test_enablement_uses_configured_local_date_across_utc_midnight() -> None:
+    """Enablement uses HA's local calendar date, not the UTC date."""
+    hass = _hass()
+    entry = _entry(data={CONF_ARCHIVE_PREVIOUSLY_ENABLED: False})
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
+
+    with (
+        patch(
+            "custom_components.garmin_connect.history.dt_util.utcnow",
+            return_value=datetime(2026, 8, 3, 23, 30, tzinfo=UTC),
+        ),
+        patch(
+            "custom_components.garmin_connect.history.dt_util.DEFAULT_TIME_ZONE",
+            ZoneInfo("Asia/Taipei"),
+        ),
+    ):
+        await _archive(hass, entry, checker).async_start()
+
+    persisted = hass.config_entries.async_update_entry.call_args.kwargs["data"]
+    assert persisted[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-08-04"
 
 
 async def test_reenablement_replaces_activation_date_without_starting_backfill() -> None:
@@ -172,7 +197,7 @@ async def test_reenablement_replaces_activation_date_without_starting_backfill()
     checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
     now = datetime(2026, 8, 3, 1, 30, tzinfo=UTC)
 
-    with patch("custom_components.garmin_connect.history.dt_util.now", return_value=now):
+    with patch("custom_components.garmin_connect.history.dt_util.utcnow", return_value=now):
         archive = _archive(hass, entry, checker)
         await archive.async_start()
 
@@ -180,6 +205,31 @@ async def test_reenablement_replaces_activation_date_without_starting_backfill()
     assert persisted[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-08-03"
     assert persisted[CONF_ARCHIVE_PREVIOUSLY_ENABLED] is True
     assert archive.async_sync_range is not None
+
+
+@pytest.mark.parametrize("activation_date", [None, "not-a-date"])
+async def test_enabled_archive_fails_closed_for_invalid_persisted_activation_date(
+    activation_date: str | None,
+) -> None:
+    """A recorded enablement cannot silently lose its archive boundary."""
+    hass = _hass()
+    data = {
+        "history_account_key": "opaque-account-key-1234567890",
+        CONF_ARCHIVE_PREVIOUSLY_ENABLED: True,
+    }
+    if activation_date is not None:
+        data[CONF_ARCHIVE_ACTIVATION_DATE] = activation_date
+    entry = _entry(data=data)
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
+
+    archive = _archive(hass, entry, checker)
+    await archive.async_start()
+
+    assert archive.status.state is HistoryArchiveState.FAILED
+    assert archive.status.error_type == "activation_date_invalid"
+    assert archive.activation_date is None
+    hass.config_entries.async_update_entry.assert_not_called()
 
 
 async def test_archive_lifecycle_persists_through_reload_restart_and_reenablement() -> None:
@@ -191,7 +241,7 @@ async def test_archive_lifecycle_persists_through_reload_restart_and_reenablemen
     store = FakeStore()
     first_now = datetime(2026, 8, 3, 1, 30, tzinfo=UTC)
 
-    with patch("custom_components.garmin_connect.history.dt_util.now", return_value=first_now):
+    with patch("custom_components.garmin_connect.history.dt_util.utcnow", return_value=first_now):
         first = _archive(hass, entry, checker, store)
         await first.async_start()
 
@@ -221,7 +271,7 @@ async def test_archive_lifecycle_persists_through_reload_restart_and_reenablemen
     entry.data = disabled_persisted
     entry.options = {CONF_ARCHIVE_ENABLED: True}
     second_now = datetime(2026, 8, 10, 1, 30, tzinfo=UTC)
-    with patch("custom_components.garmin_connect.history.dt_util.now", return_value=second_now):
+    with patch("custom_components.garmin_connect.history.dt_util.utcnow", return_value=second_now):
         reenabled = _archive(hass, entry, checker, FakeStore(data=store.data))
         await reenabled.async_start()
 

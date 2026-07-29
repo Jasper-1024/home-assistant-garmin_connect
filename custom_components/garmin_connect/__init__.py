@@ -153,6 +153,8 @@ def _migrate_entity_unique_ids(
 
 async def async_setup_entry(hass: HomeAssistant, entry: GarminConnectConfigEntry) -> bool:
     """Set up Garmin Connect from a config entry."""
+    _persist_archive_enablement_transition(hass, entry)
+
     if CONF_TOKEN not in entry.data:
         # Migration from v1 bumps version and starts reauth but setup still runs.
         # Without valid DI tokens there's nothing to set up — reauth will fix it.

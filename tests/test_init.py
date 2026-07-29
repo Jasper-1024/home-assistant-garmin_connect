@@ -102,7 +102,7 @@ async def test_options_update_persists_transition_before_reload() -> None:
     hass.async_create_task = MagicMock(side_effect=tasks.append)
 
     with patch(
-        "custom_components.garmin_connect.history.dt_util.now",
+        "custom_components.garmin_connect.history.dt_util.utcnow",
         return_value=datetime(2026, 8, 3, 23, 59, tzinfo=UTC),
     ):
         await async_options_update_listener(hass, entry)
@@ -125,7 +125,7 @@ async def test_options_update_does_not_rewrite_stable_enablement() -> None:
     hass.async_create_task = MagicMock(side_effect=tasks.append)
 
     with patch(
-        "custom_components.garmin_connect.history.dt_util.now",
+        "custom_components.garmin_connect.history.dt_util.utcnow",
         return_value=datetime(2026, 8, 4, 0, 1, tzinfo=UTC),
     ):
         await async_options_update_listener(hass, entry)
@@ -133,6 +133,37 @@ async def test_options_update_does_not_rewrite_stable_enablement() -> None:
 
     hass.config_entries.async_update_entry.assert_not_called()
     reload.assert_awaited_once_with("entry-1")
+
+
+async def test_setup_persists_enablement_before_current_refresh_failure() -> None:
+    """Setup records enablement before the current-value path can fail."""
+    entry = MagicMock(entry_id="entry-1")
+    entry.data = {
+        **ENTRY_DATA,
+        CONF_ARCHIVE_PREVIOUSLY_ENABLED: False,
+    }
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    hass = MagicMock()
+    hass.config.country = "US"
+    hass.config_entries.async_update_entry = MagicMock(
+        side_effect=lambda updated_entry, *, data: setattr(updated_entry, "data", data)
+    )
+
+    coord = _coord_mock()
+    coord.async_config_entry_first_refresh.side_effect = RuntimeError("current refresh failed")
+    with ExitStack() as stack:
+        stack.enter_context(patch("custom_components.garmin_connect.GarminAuth"))
+        stack.enter_context(patch("custom_components.garmin_connect.GarminClient"))
+        _stack_coordinators(stack, coord)
+        with patch(
+            "custom_components.garmin_connect.history.dt_util.utcnow",
+            return_value=datetime(2026, 8, 3, 23, 30, tzinfo=UTC),
+        ):
+            with pytest.raises(RuntimeError, match="current refresh failed"):
+                await async_setup_entry(hass, entry)
+
+    assert entry.data[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-08-03"
+    assert entry.data[CONF_ARCHIVE_PREVIOUSLY_ENABLED] is True
 
 
 async def test_enablement_date_survives_store_failure_after_midnight() -> None:
@@ -152,7 +183,7 @@ async def test_enablement_date_survives_store_failure_after_midnight() -> None:
     async def reload(_entry_id: str) -> None:
         archive = GarminHistoryArchive(hass, entry, store_factory=failing_store)
         with patch(
-            "custom_components.garmin_connect.history.dt_util.now",
+            "custom_components.garmin_connect.history.dt_util.utcnow",
             return_value=datetime(2026, 8, 4, 0, 1, tzinfo=UTC),
         ):
             await archive.async_start()
@@ -162,7 +193,7 @@ async def test_enablement_date_survives_store_failure_after_midnight() -> None:
     hass.async_create_task = MagicMock(side_effect=tasks.append)
 
     with patch(
-        "custom_components.garmin_connect.history.dt_util.now",
+        "custom_components.garmin_connect.history.dt_util.utcnow",
         return_value=datetime(2026, 8, 3, 23, 59, tzinfo=UTC),
     ):
         await async_options_update_listener(hass, entry)
@@ -198,7 +229,7 @@ async def test_enablement_date_survives_recorder_startup_failure_after_midnight(
             store_factory=lambda *_args, **_kwargs: store,
         )
         with patch(
-            "custom_components.garmin_connect.history.dt_util.now",
+            "custom_components.garmin_connect.history.dt_util.utcnow",
             return_value=datetime(2026, 8, 4, 0, 1, tzinfo=UTC),
         ):
             await archive.async_start()
@@ -208,7 +239,7 @@ async def test_enablement_date_survives_recorder_startup_failure_after_midnight(
     hass.async_create_task = MagicMock(side_effect=tasks.append)
 
     with patch(
-        "custom_components.garmin_connect.history.dt_util.now",
+        "custom_components.garmin_connect.history.dt_util.utcnow",
         return_value=datetime(2026, 8, 3, 23, 59, tzinfo=UTC),
     ):
         await async_options_update_listener(hass, entry)
@@ -288,7 +319,7 @@ async def test_real_config_entry_lifecycle_keeps_backfill_dormant_and_surfaces_v
             assert entry.data["history_account_key"] == account_key
 
             with patch(
-                "custom_components.garmin_connect.history.dt_util.now",
+                "custom_components.garmin_connect.history.dt_util.utcnow",
                 return_value=datetime(2026, 8, 10, tzinfo=UTC),
             ):
                 hass.config_entries.async_update_entry(entry, options={CONF_ARCHIVE_ENABLED: True})

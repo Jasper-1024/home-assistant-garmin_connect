@@ -179,6 +179,10 @@ class HistorySyncReport:
     error_type: str | None = None
 
 
+class _InvalidArchiveActivationDateError(ValueError):
+    """Raised when enabled archival has no trustworthy persisted boundary."""
+
+
 def _persist_archive_enablement_transition(
     hass: HomeAssistant, entry: ConfigEntry
 ) -> dict[str, Any]:
@@ -193,7 +197,7 @@ def _persist_archive_enablement_transition(
     was_enabled = data.get(CONF_ARCHIVE_PREVIOUSLY_ENABLED) is True
 
     if enabled and not was_enabled:
-        data[CONF_ARCHIVE_ACTIVATION_DATE] = dt_util.now().date().isoformat()
+        data[CONF_ARCHIVE_ACTIVATION_DATE] = dt_util.as_local(dt_util.utcnow()).date().isoformat()
         data[CONF_ARCHIVE_PREVIOUSLY_ENABLED] = True
     elif not enabled and was_enabled:
         data[CONF_ARCHIVE_PREVIOUSLY_ENABLED] = False
@@ -433,6 +437,9 @@ class GarminHistoryArchive:
             self._started = False
             await self.async_stop()
             raise
+        except _InvalidArchiveActivationDateError:
+            self._set_failed("activation_date_invalid")
+            return
         except Exception:
             self._set_failed("identity_initialization")
             _LOGGER.warning(
@@ -1109,6 +1116,18 @@ class GarminHistoryArchive:
             and self._entry.options.get(CONF_ARCHIVE_ENABLED, False)
         )
         raw_activation_date = data.get(CONF_ARCHIVE_ACTIVATION_DATE)
+        if self._archive_enabled:
+            if not isinstance(raw_activation_date, str):
+                raise _InvalidArchiveActivationDateError
+            try:
+                parsed_activation_date = date.fromisoformat(raw_activation_date)
+            except ValueError as err:
+                raise _InvalidArchiveActivationDateError from err
+            if parsed_activation_date.isoformat() != raw_activation_date:
+                raise _InvalidArchiveActivationDateError
+            self._activation_date = parsed_activation_date
+            return
+
         try:
             self._activation_date = (
                 date.fromisoformat(raw_activation_date)
