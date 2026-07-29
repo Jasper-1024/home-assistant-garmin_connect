@@ -38,11 +38,14 @@ from .const import (
 from .fit_archive import (
     FitArchiveError,
     async_archive_fit,
+    ensure_private_fit_directory,
     fit_file_name,
     fit_record,
     inspect_fit,
+    validate_private_fit_file,
     validated_fit_summary,
 )
+from .fit_queue import serialize_fit_pacing, serialize_fit_queue
 from .history_calendar import (
     HistoryCalendarEvent,
     add_structured_calendar_event,
@@ -733,8 +736,9 @@ def _parse_fit_queue_entry(item: Mapping[str, Any]) -> dict[str, str]:
         or len(logical_id) != _FIT_LOGICAL_ID_LENGTH
         or any(character not in "0123456789abcdef" for character in logical_id)
         or not isinstance(activity_id, str)
-        or not activity_id
-        or len(activity_id) > 128
+        or not activity_id.isdecimal()
+        or len(activity_id) > 32
+        or str(int(activity_id)) != activity_id
         or not isinstance(year, str)
         or len(year) != 4
         or not year.isdecimal()
@@ -2248,7 +2252,15 @@ class GarminHistoryArchive:
                         "end": activity.end.isoformat() if activity.end else None, "duration_seconds": activity.duration_seconds,
                         "training_effect": activity.training_effect, "load": activity.load, "recovery": activity.recovery,
                     }
-                    if callable(getattr(client, "download_activity", None)):
+                    if (
+                        callable(getattr(client, "download_activity", None))
+                        and activity.activity_id.isdecimal()
+                        and str(int(activity.activity_id)) == activity.activity_id
+                        and all(
+                            queued.get("activity_id") != activity.activity_id
+                            for queued in self._fit_queue.values()
+                        )
+                    ):
                         if (
                             activity.logical_id not in self._fit_archives.get(year, {})
                             and activity.logical_id not in self._fit_queue
@@ -2523,13 +2535,11 @@ class GarminHistoryArchive:
     ) -> list[dict[str, str]]:
         """Serialize pending FIT work in deterministic order."""
         selected = self._fit_queue if queue is None else queue
-        return [dict(selected[key]) for key in sorted(selected)]
+        return serialize_fit_queue(selected)
 
     def _fit_last_eligible_record(self) -> str | None:
         """Serialize the durable pacing checkpoint."""
-        if self._fit_last_eligible_download is None:
-            return None
-        return self._fit_last_eligible_download.astimezone(UTC).isoformat()
+        return serialize_fit_pacing(self._fit_last_eligible_download)
 
     async def _async_save_fit_state(
         self,
@@ -2570,13 +2580,15 @@ class GarminHistoryArchive:
         self, logical_id: str
     ) -> dict[str, Any] | None:
         """Validate an already-owned local FIT without spending pacing budget."""
-        path = self._fit_directory() / fit_file_name(logical_id)
-        if not path.is_file():
-            return None
         try:
+            directory = ensure_private_fit_directory(self._fit_directory(), create=False)
+            if directory is None:
+                return None
+            path = directory / fit_file_name(logical_id)
+            validate_private_fit_file(path)
             inspected = await asyncio.to_thread(inspect_fit, path, 0o600)
             safe_summary = validated_fit_summary(inspected)
-        except (OSError, RuntimeError, TypeError, ValueError, FitArchiveError):
+        except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError, FitArchiveError):
             return None
         return {
             "logical_id": logical_id,
@@ -2599,14 +2611,17 @@ class GarminHistoryArchive:
 
         async def gated_download(activity_id: int, file_format: str) -> bytes:
             async def request() -> bytes:
-                return await download_activity(activity_id, file_format)
+                return cast(bytes, await download_activity(activity_id, file_format))
 
             if request_gate is None or not callable(
                 getattr(request_gate, "async_request", None)
             ):
                 return await request()
-            return await request_gate.async_request(
-                GarminRequestPriority.BACKGROUND, request
+            return cast(
+                bytes,
+                await request_gate.async_request(
+                    GarminRequestPriority.BACKGROUND, request
+                ),
             )
 
         fit_client = SimpleNamespace(download_activity=gated_download)
@@ -3311,71 +3326,9 @@ class GarminHistoryArchive:
                         raise SleepSchemaError("activity partition is invalid")
                     parsed_activities[key] = dict(value)
                 self._activities[year] = parsed_activities
-                persisted_fit_quarantine = partition.get("fit_quarantine")
-                if isinstance(persisted_fit_quarantine, Mapping):
-                    self._fit_partition_quarantine[year] = dict(
-                        persisted_fit_quarantine
-                    )
-                    self._fit_queue_error = self._fit_queue_error or "fit_partition_schema"
-                raw_fits = partition.get("fits", {})
-                if not isinstance(raw_fits, Mapping):
-                    # FIT is an optional detail partition.  A damaged FIT
-                    # field must not invalidate already parsed structured
-                    # records or the catalog index for this year.
-                    self._fit_partition_quarantine[year] = {
-                        "fits": repr(raw_fits)[:256]
-                    }
-                    self._fit_queue_error = "fit_partition_schema"
-                    raw_fits = {}
-                parsed_fits: dict[str, dict[str, Any]] = {}
-                invalid_fit_keys: set[str] = set()
-                invalid_fit_records: dict[str, Any] = {}
-                for key, value in raw_fits.items():
-                    try:
-                        restored_fit = fit_record(value)
-                        if restored_fit["logical_id"] != key or key not in parsed_activities:
-                            invalid_fit_keys.add(key)
-                            invalid_fit_records[key] = value
-                            continue
-                        fit_directory = self._fit_directory().resolve()
-                        fit_path = (fit_directory / restored_fit["path"]).resolve()
-                        legacy_directory = self._fit_base_directory().resolve()
-                        legacy_path = (legacy_directory / restored_fit["path"]).resolve()
-                        if fit_path.parent != fit_directory or not fit_path.is_file():
-                            if legacy_path.parent != legacy_directory or not legacy_path.is_file():
-                                invalid_fit_keys.add(key)
-                                continue
-                            fit_path = legacy_path
-                        if not fit_path.is_file():
-                            invalid_fit_keys.add(key)
-                            continue
-                        inspected = await asyncio.to_thread(inspect_fit, fit_path, 0o600)
-                        restored_fit = {"logical_id": key, "path": fit_path.name, "summary": validated_fit_summary(inspected)}
-                        parsed_fits[key] = fit_record(restored_fit)
-                    except (OSError, RuntimeError, TypeError, ValueError):
-                        invalid_fit_keys.add(key)
-                        invalid_fit_records[key] = value
-                        continue
-                if invalid_fit_keys:
-                    cleaned_partition = dict(partition)
-                    cleaned_partition["fits"] = {
-                        key: value for key, value in raw_fits.items() if key not in invalid_fit_keys
-                    }
-                    existing_quarantine = cleaned_partition.get("fit_quarantine")
-                    quarantine = (
-                        dict(existing_quarantine)
-                        if isinstance(existing_quarantine, Mapping)
-                        else {}
-                    )
-                    quarantine["invalid_records"] = invalid_fit_records
-                    cleaned_partition["fit_quarantine"] = quarantine
-                    self._fit_partition_quarantine[year] = quarantine
-                    self._fit_queue_error = self._fit_queue_error or "fit_partition_schema"
-                    try:
-                        await self._sleep_partition_stores[year].async_save(cleaned_partition)
-                    except (OSError, RuntimeError, TypeError, ValueError):
-                        pass
-                self._fit_archives[year] = parsed_fits
+                await self._async_load_fit_records(
+                    year, partition, parsed_activities
+                )
             except (KeyError, TypeError, ValueError, OSError):
                 self._sleep_sessions.pop(year, None)
                 self._health_events.pop(year, None)
@@ -3383,6 +3336,69 @@ class GarminHistoryArchive:
                 self._fit_archives.pop(year, None)
                 self._completed_dates = {value for value in self._completed_dates if value[:4] != year}
                 await self._async_invalidate_activity_index(year)
+
+    async def _async_load_fit_records(
+        self,
+        year: str,
+        partition: Mapping[str, Any],
+        activities: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        """Load optional FIT detail without invalidating structured records."""
+        raw_fits = partition.get("fits", {})
+        parsed_fits: dict[str, dict[str, Any]] = {}
+        invalid_fit_records: dict[str, Any] = {}
+        persisted_fit_quarantine = partition.get("fit_quarantine")
+        quarantine = (
+            dict(persisted_fit_quarantine)
+            if isinstance(persisted_fit_quarantine, Mapping)
+            else {}
+        )
+        if isinstance(persisted_fit_quarantine, Mapping):
+            self._fit_partition_quarantine[year] = dict(persisted_fit_quarantine)
+            self._fit_queue_error = self._fit_queue_error or "fit_partition_schema"
+        if not isinstance(raw_fits, Mapping):
+            invalid_fit_records["__schema__"] = repr(raw_fits)[:256]
+            raw_fits = {}
+        try:
+            directory = ensure_private_fit_directory(self._fit_directory(), create=False)
+            for key, value in raw_fits.items():
+                try:
+                    restored_fit = fit_record(value)
+                    if restored_fit["logical_id"] != key or key not in activities:
+                        raise FitArchiveError("FIT activity association is invalid")
+                    if directory is None:
+                        raise FitArchiveError("FIT account directory is unavailable")
+                    fit_path = directory / restored_fit["path"]
+                    validate_private_fit_file(fit_path)
+                    inspected = await asyncio.to_thread(inspect_fit, fit_path, 0o600)
+                    parsed_fits[key] = fit_record(
+                        {
+                            "logical_id": key,
+                            "path": fit_path.name,
+                            "summary": validated_fit_summary(inspected),
+                        }
+                    )
+                except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError, FitArchiveError):
+                    invalid_fit_records[key] = value
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            invalid_fit_records["__schema__"] = "FIT detail validation failed"
+            parsed_fits = {}
+
+        self._fit_archives[year] = parsed_fits
+        if not invalid_fit_records:
+            return
+        quarantine["invalid_records"] = invalid_fit_records
+        self._fit_partition_quarantine[year] = quarantine
+        self._fit_queue_error = self._fit_queue_error or "fit_partition_schema"
+        cleaned_partition = dict(partition)
+        cleaned_partition["fits"] = parsed_fits
+        cleaned_partition["fit_quarantine"] = quarantine
+        try:
+            await self._sleep_partition_stores[year].async_save(cleaned_partition)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            pass
 
     async def _async_invalidate_activity_index(self, year: str) -> None:
         """Best-effort removal of an invalid annual activity index entry."""
@@ -3786,15 +3802,17 @@ class GarminHistoryArchive:
             )
             raw_fit_queue = raw_fit_queue[:_FIT_QUEUE_MAX_ITEMS]
             self._fit_queue_error = "fit_queue_schema"
+        seen_activity_ids: set[str] = set()
         for item in raw_fit_queue:
             try:
                 if not isinstance(item, Mapping):
                     raise ValueError("FIT queue entry is not a mapping")
                 parsed_entry = _parse_fit_queue_entry(item)
                 logical_id = parsed_entry["logical_id"]
-                if logical_id in self._fit_queue:
-                    raise ValueError("FIT queue contains a duplicate logical ID")
+                if logical_id in self._fit_queue or parsed_entry["activity_id"] in seen_activity_ids:
+                    raise ValueError("FIT queue contains a duplicate activity")
                 self._fit_queue[logical_id] = parsed_entry
+                seen_activity_ids.add(parsed_entry["activity_id"])
             except (TypeError, ValueError):
                 self._fit_queue_quarantine.append(
                     dict(item) if isinstance(item, Mapping) else {"raw": repr(item)[:256]}

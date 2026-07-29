@@ -118,6 +118,26 @@ async def test_fit_archive_rejects_crc_or_decode_failure(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("content", [b"\x0e\x20", b"\x0e\x10\x00\x00\x00"])
+async def test_fit_archive_rejects_real_partial_fit_bytes(
+    tmp_path: Path, content: bytes
+) -> None:
+    client = AsyncMock()
+    client.download_activity.return_value = content
+
+    with pytest.raises(FitArchiveError):
+        await async_archive_fit(
+            client=client,
+            activity_id="12345",
+            logical_id="2" * 24,
+            directory=tmp_path,
+            inspect=inspect_fit,
+        )
+
+    assert not (tmp_path / fit_file_name("2" * 24)).exists()
+
+
+@pytest.mark.asyncio
 async def test_valid_existing_fit_is_reused_without_download(tmp_path: Path) -> None:
     client = AsyncMock()
     final = tmp_path / fit_file_name("d" * 24)
@@ -151,6 +171,25 @@ async def test_bad_existing_fit_is_not_replaced(tmp_path: Path) -> None:
         )
     client.download_activity.assert_not_awaited()
     assert final.read_bytes() == b"bad existing"
+
+
+@pytest.mark.asyncio
+async def test_existing_fit_with_insecure_permissions_is_rejected(tmp_path: Path) -> None:
+    client = AsyncMock()
+    final = tmp_path / fit_file_name("0" * 24)
+    final.write_bytes(b"existing")
+    final.chmod(0o644)
+
+    with pytest.raises(FitArchiveError):
+        await async_archive_fit(
+            client=client,
+            activity_id="12345",
+            logical_id="0" * 24,
+            directory=tmp_path,
+            inspect=_valid_inspector,
+        )
+
+    client.download_activity.assert_not_awaited()
 
 
 @pytest.mark.asyncio

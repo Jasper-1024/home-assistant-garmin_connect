@@ -2187,11 +2187,13 @@ async def test_valid_fit_survives_restart_revalidation(tmp_path: Path, monkeypat
         "load": activity.load, "recovery": activity.recovery,
     }
     summary = json.loads((Path(__file__).parent / "fixtures" / "garmin_fit_structural_summary.json").read_text())["summary"]
-    fit_path = tmp_path / fit_file_name(activity.logical_id)
+    account_key = "opaque-account-key-1234567890"
+    fit_path = tmp_path / account_key / fit_file_name(activity.logical_id)
+    fit_path.parent.mkdir(mode=0o700)
     fit_path.write_bytes(b"private fit")
     fit_path.chmod(0o600)
-    catalog = _NamedStore({"account_key": "opaque-account-key-1234567890", "schema_version": 1, "completed_dates": [], "hrv_summaries": {}, "presence": {}, "sleep_index": {}, "event_index": {}, "activity_index": {"2026": [activity.logical_id]}})
-    partition = _NamedStore({"account_key": "opaque-account-key-1234567890", "schema_version": 1, "sleep_schema_version": 1, "year": "2026", "sessions": {}, "events": {}, "activities": {activity.logical_id: activity_record}, "fits": {activity.logical_id: {"logical_id": activity.logical_id, "path": fit_path.name, "summary": summary}}})
+    catalog = _NamedStore({"account_key": account_key, "schema_version": 1, "completed_dates": [], "hrv_summaries": {}, "presence": {}, "sleep_index": {}, "event_index": {}, "activity_index": {"2026": [activity.logical_id]}})
+    partition = _NamedStore({"account_key": account_key, "schema_version": 1, "sleep_schema_version": 1, "year": "2026", "sessions": {}, "events": {}, "activities": {activity.logical_id: activity_record}, "fits": {activity.logical_id: {"logical_id": activity.logical_id, "path": fit_path.name, "summary": summary}}})
     stores = {"garmin_connect.e.history_catalog": catalog, "garmin_connect.e.sleep_2026": partition}
     archive = _partition_archive(MagicMock(), MagicMock(), stores)
     archive._hass.config.path.side_effect = lambda *parts: str(tmp_path.joinpath(*parts[2:]))
@@ -2206,8 +2208,11 @@ async def test_valid_fit_survives_restart_revalidation(tmp_path: Path, monkeypat
     monkeypatch.setattr(history_module, "inspect_fit", inspect_valid_fit)
     await archive.async_start()
     assert inspected_paths == [fit_path]
-    assert activity.logical_id in archive._fit_archives["2026"]
     assert partition.data["fits"][activity.logical_id]["logical_id"] == activity.logical_id
+    events = await archive.async_get_calendar_events(
+        "activity", activity.calendar_date, activity.calendar_date
+    )
+    assert len(events) == 1
 
 
 @pytest.mark.asyncio
@@ -2235,7 +2240,6 @@ async def test_background_fit_limit_defers_then_converges_across_restart(tmp_pat
     archive._entry.runtime_data.core.client = client
     archive._hass.config.path.return_value = str(tmp_path)
     await archive.async_start()
-    archive._archive_enabled = True
     first = await archive.async_sync_range(date(2026, 1, 1), date(2026, 1, 1), fit_limit=1, include_training_status=False)
     assert first.outcome == "written"
     assert first.fit_count == 1

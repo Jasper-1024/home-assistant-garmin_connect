@@ -517,10 +517,6 @@ async def test_option_disablement_reload_cancels_recurring_archive_work(tmp_path
             first_archive = entry.runtime_data.history_archive
             await asyncio.wait_for(client.first_sync_done.wait(), timeout=0.1)
             await hass.async_block_till_done()
-            for _ in range(100):
-                if timer.active:
-                    break
-                await asyncio.sleep(0)
             assert timer.active, (first_archive.status, client.requests, client.events)
 
             client.block_cycle = True
@@ -641,15 +637,9 @@ async def test_runtime_archive_prioritizes_foreground_work_through_shared_gate(t
 
             client.release_cycle.set()
             assert await asyncio.wait_for(current_task, timeout=0.1) == "current-value"
+            await hass.async_block_till_done()
 
             current_index = client.events.index("current")
-            for _ in range(100):
-                if any(
-                    index > current_index and event.startswith("archive-")
-                    for index, event in enumerate(client.events)
-                ):
-                    break
-                await asyncio.sleep(0.01)
             next_archive_index = next(
                 index
                 for index, event in enumerate(client.events)

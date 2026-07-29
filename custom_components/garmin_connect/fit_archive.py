@@ -23,6 +23,40 @@ class FitArchiveError(ValueError):
     """FIT download, validation, or persistence failed."""
 
 
+def ensure_private_fit_directory(directory: Path, *, create: bool) -> Path | None:
+    """Return an account FIT directory after enforcing its private boundary."""
+    try:
+        directory_stat = os.lstat(directory)
+    except FileNotFoundError:
+        if not create:
+            return None
+        directory.mkdir(parents=True, exist_ok=True)
+        directory_stat = os.lstat(directory)
+    if stat.S_ISLNK(directory_stat.st_mode) or not stat.S_ISDIR(directory_stat.st_mode):
+        raise FitArchiveError("FIT directory is not private")
+    if stat.S_IMODE(directory_stat.st_mode) != 0o700:
+        os.chmod(directory, 0o700)
+        directory_stat = os.lstat(directory)
+        if (
+            stat.S_ISLNK(directory_stat.st_mode)
+            or not stat.S_ISDIR(directory_stat.st_mode)
+            or stat.S_IMODE(directory_stat.st_mode) != 0o700
+        ):
+            raise FitArchiveError("FIT directory permissions are invalid")
+    return directory
+
+
+def validate_private_fit_file(path: Path) -> None:
+    """Reject symlinked, non-regular, or non-private FIT files."""
+    file_stat = os.lstat(path)
+    if (
+        stat.S_ISLNK(file_stat.st_mode)
+        or not stat.S_ISREG(file_stat.st_mode)
+        or stat.S_IMODE(file_stat.st_mode) != 0o600
+    ):
+        raise FitArchiveError("FIT file is not private")
+
+
 def inspect_fit(path: Path, required_mode: int = 0o600) -> dict[str, Any]:
     """Use the checked-in privacy-minimizing FIT inspector."""
     inspector = cast(Callable[[Path, int], dict[str, Any]], _inspect_fit)
@@ -111,18 +145,10 @@ async def async_archive_fit(
 ) -> dict[str, Any]:
     """Download, validate, and atomically archive one FIT file."""
     try:
-        directory.mkdir(parents=True, exist_ok=True)
-        directory_stat = os.lstat(directory)
-        if not stat.S_ISDIR(directory_stat.st_mode) or stat.S_ISLNK(directory_stat.st_mode):
-            raise FitArchiveError("FIT directory is not private")
-        os.chmod(directory, 0o700)
+        ensure_private_fit_directory(directory, create=True)
         final_path = directory / fit_file_name(logical_id)
         if os.path.lexists(final_path):
-            final_stat = os.lstat(final_path)
-            if stat.S_ISLNK(final_stat.st_mode) or not stat.S_ISREG(final_stat.st_mode):
-                raise FitArchiveError("FIT target is not a regular file")
-            if stat.S_IMODE(final_stat.st_mode) != 0o600:
-                raise FitArchiveError("FIT permissions are invalid")
+            validate_private_fit_file(final_path)
             existing_summary = await asyncio.to_thread(inspect, final_path, 0o600)
             if not isinstance(existing_summary, Mapping):
                 raise FitArchiveError("FIT summary is invalid")
@@ -143,7 +169,7 @@ async def async_archive_fit(
                 raise FitArchiveError("FIT summary is invalid")
             safe_summary = _summary_without_file(summary)
             os.replace(temporary_path, final_path)
-            os.chmod(final_path, 0o600)
+            validate_private_fit_file(final_path)
             directory_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
             try:
                 os.fsync(directory_fd)
