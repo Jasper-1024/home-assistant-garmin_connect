@@ -17,7 +17,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, Protocol, cast
 
-from ha_garmin.exceptions import GarminConnectError
+from ha_garmin.exceptions import (
+    GarminAuthError,
+    GarminConnectError,
+    GarminRateLimitError,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
@@ -128,6 +132,7 @@ _PROSPECTIVE_CYCLE_INTERVAL = timedelta(minutes=15)
 _RECONCILIATION_WINDOW = timedelta(days=7)
 _FIT_PACING_INTERVAL = timedelta(hours=1)
 _PROSPECTIVE_CYCLE_FIT_LIMIT = 1
+_ARCHIVE_RATE_LIMIT_BACKOFF = timedelta(hours=24)
 _FIT_LOGICAL_ID_LENGTH = 24
 _FIT_QUEUE_QUARANTINE_MAX_ITEMS = 256
 _FIT_QUEUE_FIELDS = frozenset(
@@ -483,6 +488,8 @@ async def _async_observe_family(
         raise
     except Exception as error:
         error_type = _safe_family_error_type(error)
+        if error_type in {"rate_limited", "reauth_required"}:
+            raise _ArchivePolicyError(error_type) from error
         observation = accumulator.record_failure(family, error_type)
         _LOGGER.warning("Garmin structured family failed for %s (%s)", target, family)
         return observation
@@ -492,6 +499,18 @@ async def _async_observe_family(
 
 def _safe_family_error_type(error: BaseException) -> str:
     """Map a family exception to a privacy-safe public error class."""
+    return _archive_error_type(error)
+
+
+def _archive_error_type(error: BaseException) -> str:
+    """Classify an archive failure without exposing exception details."""
+    status = getattr(error, "status", None)
+    if status is None:
+        status = getattr(error, "status_code", None)
+    if isinstance(error, GarminRateLimitError) or status == 429:
+        return "rate_limited"
+    if isinstance(error, GarminAuthError) or status == 401:
+        return "reauth_required"
     return "garmin_client_error" if isinstance(error, GarminConnectError) else "sync_failed"
 
 
@@ -682,6 +701,14 @@ class _NumericFamilyError(RuntimeError):
         self.error_type = error_type
         self.write_failure = write_failure
         self.observation = observation
+
+
+class _ArchivePolicyError(RuntimeError):
+    """Stop archive work when a policy requires a state transition."""
+
+    def __init__(self, error_type: str) -> None:
+        super().__init__(error_type)
+        self.error_type = error_type
 
 
 @dataclass(frozen=True, slots=True)
@@ -997,6 +1024,8 @@ class GarminHistoryArchive:
         self._archive_enabled = False
         self._activation_date: date | None = None
         self._account_key_value: str | None = None
+        self._archive_backoff_until: datetime | None = None
+        self._archive_reauth_requested = False
         self._backfill: BackfillScheduler | None = None
         self._backfill_task: asyncio.Task[Any] | None = None
         self._cycle_timer_cancel: Callable[[], None] | None = None
@@ -1044,15 +1073,35 @@ class GarminHistoryArchive:
         return self._activation_date
 
     def _backfill_status_fields(self) -> dict[str, Any]:
+        archive_backoff = self._archive_backoff_until
+        archive_backoff_value = (
+            archive_backoff.astimezone(UTC).isoformat()
+            if archive_backoff is not None and self._utc_now() < archive_backoff
+            else None
+        )
         return {
             "activation_date": self._activation_date.isoformat() if self._activation_date else None,
             "queued_count": self._status.queued_count,
             "completed_count": self._status.completed_count,
-            "next_eligible_run": self._status.next_eligible_run,
+            "next_eligible_run": archive_backoff_value or self._status.next_eligible_run,
             "last_success": self._status.last_success,
-            "backoff_until": self._status.backoff_until,
+            "backoff_until": archive_backoff_value or self._status.backoff_until,
             "safe_error_class": self._status.safe_error_class,
         }
+
+    def _archive_backoff_active(self) -> bool:
+        """Return whether archive work is inside its persisted cooldown."""
+        return (
+            self._archive_backoff_until is not None
+            and self._utc_now() < self._archive_backoff_until
+        )
+
+    def _archive_next_delay(self) -> timedelta:
+        """Return the next archive wakeup without shortening backoff."""
+        backoff_until = self._archive_backoff_until
+        if backoff_until is not None and self._utc_now() < backoff_until:
+            return max(backoff_until - self._utc_now(), timedelta())
+        return _PROSPECTIVE_CYCLE_INTERVAL
 
     def _fit_base_directory(self) -> Path:
         """Return the shared FIT root without mixing account files."""
@@ -1216,16 +1265,28 @@ class GarminHistoryArchive:
             return
 
         self._status = HistoryStatus(
-            HistoryArchiveState.IDLE if self._archive_enabled else HistoryArchiveState.DISABLED,
+            (
+                HistoryArchiveState.BACKOFF
+                if self._archive_enabled and self._archive_backoff_active()
+                else HistoryArchiveState.IDLE
+                if self._archive_enabled
+                else HistoryArchiveState.DISABLED
+            ),
+            error_type="rate_limited"
+            if self._archive_enabled and self._archive_backoff_active()
+            else None,
             **self._backfill_status_fields(),
         )
 
         if self._archive_enabled:
-            first_sync = self._async_run_first_sync_in_background()
-            if isinstance(self._hass, HomeAssistant):
-                self._first_sync_task = self._hass.async_create_task(first_sync)
+            if self._archive_backoff_active():
+                self._schedule_next_cycle()
             else:
-                self._first_sync_task = asyncio.create_task(first_sync)
+                first_sync = self._async_run_first_sync_in_background()
+                if isinstance(self._hass, HomeAssistant):
+                    self._first_sync_task = self._hass.async_create_task(first_sync)
+                else:
+                    self._first_sync_task = asyncio.create_task(first_sync)
 
     async def _async_run_first_sync_in_background(self) -> None:
         """Run first synchronization without delaying current-value setup."""
@@ -1245,6 +1306,13 @@ class GarminHistoryArchive:
 
     async def _async_run_first_sync(self) -> None:
         """Import one bounded batch for the current Home Assistant local date."""
+        if self._archive_backoff_active():
+            self._status = HistoryStatus(
+                HistoryArchiveState.BACKOFF,
+                error_type="rate_limited",
+                **self._backfill_status_fields(),
+            )
+            return
         runtime_data = getattr(self._entry, "runtime_data", None)
         client = getattr(getattr(runtime_data, "core", None), "client", None)
         if client is None:
@@ -1266,7 +1334,10 @@ class GarminHistoryArchive:
                 target_date, report, is_current_date=True
             )
         if report.outcome != "written":
-            if self._status.state is not HistoryArchiveState.FAILED:
+            if self._status.state not in {
+                HistoryArchiveState.FAILED,
+                HistoryArchiveState.BACKOFF,
+            }:
                 self._set_failed(report.error_type or "first_sync")
             return
         self._schedule_next_cycle()
@@ -1289,6 +1360,84 @@ class GarminHistoryArchive:
         self._reconciliation = self._parse_reconciliation_state(
             catalog.get("reconciliation", {})
         )
+
+    async def _async_save_archive_backoff(self) -> None:
+        """Persist only the archive cooldown boundary."""
+        if self._store is None:
+            raise ValueError("Store catalog is unavailable")
+        catalog = await self._store.async_load()
+        if not isinstance(catalog, Mapping):
+            raise ValueError("Store catalog is unavailable")
+        updated = dict(catalog)
+        updated["archive_backoff_until"] = (
+            self._archive_backoff_until.astimezone(UTC).isoformat()
+            if self._archive_backoff_until is not None
+            else None
+        )
+        await self._store.async_save(updated)
+
+    async def _async_enter_archive_backoff(self) -> bool:
+        """Persist a 24-hour archive-only rate-limit cooldown."""
+        now = self._utc_now()
+        candidate = now + _ARCHIVE_RATE_LIMIT_BACKOFF
+        if self._archive_backoff_until is None or candidate > self._archive_backoff_until:
+            self._archive_backoff_until = candidate
+        try:
+            await self._async_save_archive_backoff()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.warning(
+                "Garmin archive rate-limit cooldown could not be persisted",
+                exc_info=True,
+            )
+            self._status = HistoryStatus(
+                HistoryArchiveState.FAILED,
+                error_type="store_unavailable",
+                **self._backfill_status_fields(),
+            )
+            return False
+        self._status = HistoryStatus(
+            HistoryArchiveState.BACKOFF,
+            error_type="rate_limited",
+            **self._backfill_status_fields(),
+        )
+        if self._cycle_timer_cancel is not None:
+            self._cycle_timer_cancel()
+            self._cycle_timer_cancel = None
+            self._schedule_next_cycle()
+        return True
+
+    async def _async_clear_archive_backoff(self) -> None:
+        """Forget an expired cooldown after a successful archive attempt."""
+        if self._archive_backoff_until is None:
+            return
+        if self._archive_backoff_active():
+            return
+        self._archive_backoff_until = None
+        try:
+            await self._async_save_archive_backoff()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.warning(
+                "Expired Garmin archive cooldown could not be cleared",
+                exc_info=True,
+            )
+        self._status = replace(
+            self._status,
+            next_eligible_run=None,
+            backoff_until=None,
+            safe_error_class=None,
+            error_type=None,
+        )
+
+    async def _async_request_archive_reauth_once(self) -> None:
+        """Use account reauthentication once for a genuine archive auth failure."""
+        if self._archive_reauth_requested:
+            return
+        self._archive_reauth_requested = True
+        await self._async_backfill_reauth()
 
     @staticmethod
     def _parse_reconciliation_state(raw: Any) -> dict[str, _ReconciliationEntry]:
@@ -1543,7 +1692,7 @@ class GarminHistoryArchive:
             return
         try:
             self._cycle_timer_cancel = self._timer_factory(
-                _PROSPECTIVE_CYCLE_INTERVAL, self._async_cycle_tick
+                self._archive_next_delay(), self._async_cycle_tick
             )
         except asyncio.CancelledError:
             raise
@@ -1579,6 +1728,13 @@ class GarminHistoryArchive:
     async def _async_run_cycle(self) -> None:
         """Synchronize current and durable Open Archive Dates in the background."""
         try:
+            if self._archive_backoff_active():
+                self._status = HistoryStatus(
+                    HistoryArchiveState.BACKOFF,
+                    error_type="rate_limited",
+                    **self._backfill_status_fields(),
+                )
+                return
             target_date = self._current_local_date()
             async with self._sync_lock:
                 current_report = await self._async_sync_range(
@@ -1621,7 +1777,8 @@ class GarminHistoryArchive:
                     reports.append(reconciliation_report)
             if (
                 any(report.outcome != "written" for report in reports)
-                and self._status.state is not HistoryArchiveState.FAILED
+                and self._status.state
+                not in {HistoryArchiveState.FAILED, HistoryArchiveState.BACKOFF}
             ):
                 failed_report = next(
                     report for report in reports if report.outcome != "written"
@@ -1709,6 +1866,13 @@ class GarminHistoryArchive:
         validation_error = _validate_sync_range(start_date, end_date)
         if validation_error:
             return HistorySyncReport(outcome="invalid", error_type=validation_error)
+        if self._archive_backoff_active():
+            return HistorySyncReport(outcome="disabled", error_type="rate_limited")
+        if self._status.state is HistoryArchiveState.BACKOFF:
+            self._status = HistoryStatus(
+                self._resting_state(),
+                **self._backfill_status_fields(),
+            )
         if self._status.state not in {
             HistoryArchiveState.IDLE,
             HistoryArchiveState.DISABLED,
@@ -1938,6 +2102,9 @@ class GarminHistoryArchive:
         explicitly requested bounded range.
         """
 
+        if self._archive_backoff_active():
+            return HistorySyncReport(outcome="disabled", error_type="rate_limited")
+
         runtime_data = getattr(self._entry, "runtime_data", None)
         client = getattr(getattr(runtime_data, "core", None), "client", None)
         request_gate = getattr(runtime_data, "request_gate", None)
@@ -2072,9 +2239,12 @@ class GarminHistoryArchive:
                         ValueError,
                         RuntimeError,
                     ) as error:
+                        error_type = _safe_family_error_type(error)
+                        if error_type in {"rate_limited", "reauth_required"}:
+                            raise _ArchivePolicyError(error_type) from error
                         failed_families.add(metric)
                         presence.setdefault(target_key, {})[metric] = "failed"
-                        failed_family_error = _safe_family_error_type(error)
+                        failed_family_error = error_type
                         family_observations.record_failure(metric, failed_family_error)
                         _LOGGER.warning(
                             "Garmin numeric family failed for %s (%s)", target_key, metric
@@ -2568,6 +2738,80 @@ class GarminHistoryArchive:
                     outcome="failed", error_type=error.error_type,
                     date_results=tuple(date_results),
                 )
+            except _ArchivePolicyError as error:
+                self._remember_date_reconciliation_observation(
+                    target_key, family_observations
+                )
+                try:
+                    await self._async_persist_numeric_recovery_state(
+                        include_partition=not numeric_write_failed
+                    )
+                    await self._async_persist_observed_structured_records(checkpoint)
+                except (
+                    AttributeError,
+                    ImportError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                    RuntimeError,
+                ):
+                    _LOGGER.warning(
+                        "Garmin archive recovery could not be checkpointed after %s for %s",
+                        error.error_type,
+                        target_key,
+                    )
+                try:
+                    await self._async_update_reconciliation_state(
+                        target,
+                        HistorySyncReport(
+                            outcome="failed", error_type=error.error_type
+                        ),
+                    )
+                except (
+                    AttributeError,
+                    ImportError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                    RuntimeError,
+                ):
+                    _LOGGER.warning(
+                        "Garmin reconciliation could not be checkpointed after %s for %s",
+                        error.error_type,
+                        target_key,
+                    )
+                self._runtime_sync_failure = True
+                public_error = error.error_type
+                if error.error_type == "rate_limited":
+                    if not await self._async_enter_archive_backoff():
+                        public_error = "store_unavailable"
+                else:
+                    try:
+                        await self._async_request_archive_reauth_once()
+                    except Exception:
+                        _LOGGER.warning(
+                            "Garmin archive reauthentication request failed",
+                            exc_info=True,
+                        )
+                date_results.append(build_failed_date_result(target, public_error))
+                if self._status.state is not HistoryArchiveState.BACKOFF:
+                    self._status = HistoryStatus(
+                        HistoryArchiveState.FAILED,
+                        current_date=target_key,
+                        processed_dates=len(processed),
+                        record_count=inserted,
+                        error_type=public_error,
+                        **self._backfill_status_fields(),
+                    )
+                return HistorySyncReport(
+                    tuple(processed),
+                    inserted,
+                    updated,
+                    skipped,
+                    outcome="failed",
+                    error_type=public_error,
+                    date_results=tuple(date_results),
+                )
             except (GarminConnectError, AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError) as error:
                 self._remember_date_reconciliation_observation(target_key, family_observations)
                 await self._async_persist_numeric_recovery_state(
@@ -2593,7 +2837,7 @@ class GarminHistoryArchive:
                         target_key,
                     )
                 self._runtime_sync_failure = True
-                error_type = "garmin_client_error" if isinstance(error, GarminConnectError) else "sync_failed"
+                error_type = _archive_error_type(error)
                 date_results.append(build_failed_date_result(target, error_type))
                 self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type=error_type, **self._backfill_status_fields())
                 return HistorySyncReport(
@@ -2605,6 +2849,8 @@ class GarminHistoryArchive:
                     error_type=error_type,
                     date_results=tuple(date_results),
                 )
+        await self._async_clear_archive_backoff()
+        self._archive_reauth_requested = False
         self._runtime_sync_failure = False
         self._status = HistoryStatus(self._resting_state(), current_date=end_date.isoformat(), processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
         return HistorySyncReport(
@@ -2718,7 +2964,12 @@ class GarminHistoryArchive:
                 await self._async_load_sleep_partitions({year})
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as error:
+                error_type = _archive_error_type(
+                    error.__cause__ if error.__cause__ is not None else error
+                )
+                if error_type in {"rate_limited", "reauth_required"}:
+                    raise _ArchivePolicyError(error_type) from error
                 _LOGGER.warning("Garmin FIT partition load failed")
                 await self._async_mark_fit_error("fit_partition_schema")
                 return downloaded
@@ -2732,7 +2983,12 @@ class GarminHistoryArchive:
                         client_events=self._health_events,
                         client_activities=self._activities,
                     )
-                except Exception:
+                except Exception as error:
+                    error_type = _archive_error_type(
+                        error.__cause__ if error.__cause__ is not None else error
+                    )
+                    if error_type in {"rate_limited", "reauth_required"}:
+                        raise _ArchivePolicyError(error_type) from error
                     _LOGGER.warning("Garmin FIT completion checkpoint failed")
                     await self._async_mark_fit_error("fit_checkpoint_failed")
                     return downloaded
@@ -2763,7 +3019,12 @@ class GarminHistoryArchive:
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as error:
+                error_type = _archive_error_type(
+                    error.__cause__ if error.__cause__ is not None else error
+                )
+                if error_type in {"rate_limited", "reauth_required"}:
+                    raise _ArchivePolicyError(error_type) from error
                 _LOGGER.warning("Garmin FIT archive attempt failed")
                 await self._async_mark_fit_error("fit_archive_failed")
                 return downloaded
@@ -2821,6 +3082,11 @@ class GarminHistoryArchive:
             "schema_version": HISTORY_STORE_VERSION,
             "sleep_schema_version": _SLEEP_SCHEMA_VERSION,
             "account_key": self._account_key(),
+            "archive_backoff_until": (
+                self._archive_backoff_until.astimezone(UTC).isoformat()
+                if self._archive_backoff_until is not None
+                else None
+            ),
             "completed_dates": sorted(completed_dates),
             "reconciliation": _reconciliation_records(
                 self._reconciliation if reconciliation is None else reconciliation
@@ -3580,6 +3846,7 @@ class GarminHistoryArchive:
                 {
                     "schema_version": HISTORY_STORE_VERSION,
                     "account_key": account_key,
+                    "archive_backoff_until": None,
                     "completed_dates": [],
                     "reconciliation": {},
                     "hrv_summaries": {},
@@ -3603,6 +3870,22 @@ class GarminHistoryArchive:
             return
         if not isinstance(catalog, Mapping) or catalog.get("account_key") != account_key:
             raise ValueError("Store identity mismatch")
+        raw_archive_backoff = catalog.get("archive_backoff_until")
+        if raw_archive_backoff is not None:
+            if not isinstance(raw_archive_backoff, str):
+                raise ValueError("Archive backoff state is invalid")
+            try:
+                parsed_archive_backoff = datetime.fromisoformat(raw_archive_backoff)
+            except ValueError as err:
+                raise ValueError("Archive backoff state is invalid") from err
+            if (
+                parsed_archive_backoff.tzinfo is None
+                or parsed_archive_backoff.utcoffset() is None
+                or parsed_archive_backoff.astimezone(UTC).isoformat()
+                != raw_archive_backoff
+            ):
+                raise ValueError("Archive backoff state is invalid")
+            self._archive_backoff_until = parsed_archive_backoff.astimezone(UTC)
         completed = catalog.get("completed_dates", [])
         if not isinstance(completed, list) or any(not isinstance(item, str) for item in completed):
             raise ValueError("Store checkpoint is invalid")

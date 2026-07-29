@@ -14,7 +14,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
-from ha_garmin.exceptions import GarminConnectError
+from ha_garmin.exceptions import (
+    GarminAPIError,
+    GarminAuthError,
+    GarminConnectError,
+    GarminRateLimitError,
+)
 from homeassistant import loader
 from homeassistant.config_entries import ConfigEntries
 from homeassistant.core import HomeAssistant
@@ -3369,6 +3374,140 @@ async def test_failed_first_sync_does_not_start_recurring_cadence() -> None:
 
     assert archive.status.state is HistoryArchiveState.FAILED
     assert timer.active == []
+
+
+@pytest.mark.asyncio
+async def test_archive_rate_limit_enters_durable_backoff_without_cadence() -> None:
+    """An archive 429 pauses only archive work for the durable 24-hour window."""
+    now = [datetime(2026, 8, 5, tzinfo=UTC)]
+    timer = DeterministicTimer()
+    store = FakeStore()
+
+    class RateLimitedSource(ReconciliationSource):
+        def __init__(self) -> None:
+            super().__init__({})
+            self.fail_once = True
+
+        async def async_fetch_details(self, target_date: date, metric: str) -> object:
+            if self.fail_once and metric == "heart_rate":
+                self.fail_once = False
+                self.requested.append(target_date)
+                raise GarminRateLimitError("429")
+            return await super().async_fetch_details(target_date, metric)
+
+    source = RateLimitedSource()
+    archive = _enabled_reconciliation_archive(store, source, now, timer)
+
+    await archive.async_start()
+    await _wait_for_archive_state(archive, HistoryArchiveState.BACKOFF)
+
+    assert archive.status.as_attributes() == {
+        "archive_state": "backoff",
+        "activation_date": "2026-08-01",
+        "next_eligible_run": "2026-08-06T00:00:00+00:00",
+        "safe_error_class": "rate_limited",
+    }
+    assert store.data["archive_backoff_until"] == "2026-08-06T00:00:00+00:00"
+    assert timer.active == []
+    await archive.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_archive_rate_limit_backoff_survives_restart_and_expires_once() -> None:
+    """Restart preserves an active backoff and expiry permits one normal attempt."""
+    store = FakeStore(
+        {
+            "schema_version": 1,
+            "account_key": "opaque-account-key-1234567890",
+            "completed_dates": [],
+            "reconciliation": {},
+            "reconciliation_family_presence": {},
+            "hrv_summaries": {},
+            "numeric_source_date_index": [],
+            "numeric_source_date_dates": {},
+            "numeric_source_date_pending": {},
+            "numeric_source_date_tombstones": {},
+            "numeric_source_date_outbox": {},
+            "numeric_source_date_confirmed": {},
+            "presence": {},
+            "sleep_index": {},
+            "event_index": {},
+            "activity_index": {},
+            "archive_backoff_until": "2026-08-06T00:00:00+00:00",
+        }
+    )
+    source = ReconciliationSource({})
+    before_expiry = [datetime(2026, 8, 5, 23, 59, tzinfo=UTC)]
+    before_timer = DeterministicTimer()
+    before = _enabled_reconciliation_archive(
+        store, source, before_expiry, before_timer
+    )
+
+    await before.async_start()
+    await _wait_for_archive_state(before, HistoryArchiveState.BACKOFF)
+    assert source.requested == []
+    assert [slot[0] for slot in before_timer.active] == [timedelta(minutes=1)]
+    before_timer.fire_next()
+    await asyncio.sleep(0)
+    assert source.requested == []
+    assert [slot[0] for slot in before_timer.active] == [timedelta(minutes=1)]
+    await before.async_stop()
+
+    after_expiry = [datetime(2026, 8, 6, tzinfo=UTC)]
+    after_timer = DeterministicTimer()
+    after = _enabled_reconciliation_archive(store, source, after_expiry, after_timer)
+    await after.async_start()
+    await _wait_for_remote_requests(source, 19)
+    first_sync_requests = len(source.requested)
+    assert after.status.state is HistoryArchiveState.IDLE
+    assert first_sync_requests == 19
+    assert [slot[0] for slot in after_timer.active] == [timedelta(minutes=15)]
+    await after.async_stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "should_reauth"),
+    ((GarminAPIError("forbidden", 403), False), (GarminAuthError("expired"), True)),
+)
+async def test_archive_auth_classification_requires_genuine_account_failure(
+    error: GarminConnectError, should_reauth: bool
+) -> None:
+    """Ordinary endpoint authorization errors do not trigger account reauth."""
+    reauth = AsyncMock()
+    timer = DeterministicTimer()
+    store = FakeStore()
+
+    class ErrorSource(ReconciliationSource):
+        async def async_fetch_details(self, target_date: date, metric: str) -> object:
+            if metric == "heart_rate":
+                self.requested.append(target_date)
+                raise error
+            return await super().async_fetch_details(target_date, metric)
+
+    archive = _enabled_reconciliation_archive(
+        store,
+        ErrorSource({}),
+        [datetime(2026, 8, 5, tzinfo=UTC)],
+        timer,
+    )
+    archive._entry.async_start_reauth = reauth
+
+    await archive.async_start()
+    await _wait_for_archive_state(archive, HistoryArchiveState.FAILED)
+
+    if should_reauth:
+        reauth.assert_awaited_once_with(archive._hass)
+        assert archive.status.error_type == "reauth_required"
+    else:
+        reauth.assert_not_awaited()
+        assert archive.status.error_type == "garmin_client_error"
+    assert archive.status.state is HistoryArchiveState.FAILED
+    assert archive.status.as_attributes()["safe_error_class"] in {
+        "garmin_client_error",
+        "reauth_required",
+    }
+    await archive.async_stop()
 
 
 async def test_restart_restores_one_cadence_without_replaying_missed_ticks() -> None:
