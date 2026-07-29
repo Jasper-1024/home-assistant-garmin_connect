@@ -127,6 +127,9 @@ account-wide reauthentication flow.
 74. As a release operator, I want release guidance to include backup, upgrade, restart, explicit enablement, persistence verification, and reversible disablement, so that deployment is controlled.
 75. As a release operator, I want release gates to prove that no normal startup path can construct or start automatic Historical Backfill, so that the old product behavior cannot regress.
 76. As a Home Assistant operator, I want recurring synchronization to begin only after the first bounded current-day synchronization passes its startup checks, so that a failed activation cannot create an uncontrolled request loop.
+77. As a longitudinal-data consumer, I want activity conversion to retain Garmin's original `startTimeLocal` or an equivalent Source Calendar Date separately from the aware `startTime` Source Instant, so that source-local day identity survives normalization.
+78. As a longitudinal-data consumer, I want activities returned by an unscoped feed such as `get_activities()` to keep their own source date rather than inherit the synchronization request's `target_date`, so that repeated Manual Repair cannot duplicate or misarchive the same activity under multiple days.
+79. As a longitudinal-data consumer, I want activity conversion to use the aware `startTime` UTC date only when source-local date provenance is genuinely absent, so that the conservative degradation is explicit and never preferred over Garmin source metadata.
 
 ## Implementation Decisions
 
@@ -192,8 +195,18 @@ account-wide reauthentication flow.
 - Timestamped records preserve the Source Instant represented by an aware
   Garmin timestamp. Statistics identity is based on the normalized absolute
   instant, not the original offset spelling.
-- Source Calendar Date remains separate request and checkpoint metadata. It is
-  not derived from UTC date or Display Time. When `daily_summary` or
+- Source Calendar Date remains separate source provenance and checkpoint
+  metadata. At the collection and conversion boundary, Garmin's original
+  source-local timestamp such as `startTimeLocal`, or an equivalent explicit
+  source calendar date, is retained independently of the aware `startTime`
+  Source Instant.
+- A request date supplies Source Calendar Date only for a date-scoped source
+  whose contract makes that date authoritative. Activities returned by an
+  unscoped feed such as `get_activities()` must never inherit the caller's
+  `target_date`. If source-local date provenance is genuinely absent,
+  conversion explicitly degrades to the UTC date of the aware `startTime`;
+  this fallback is not the normal source-date rule.
+- Display Time never supplies Source Calendar Date. When `daily_summary` or
   `training_status` supplies only a calendar date and no aware Garmin timestamp,
   Recorder identity uses the explicit canonical date-summary bucket instant:
   00:00 at UTC+08:00, normalized to UTC. This is not a Garmin-provided Source
@@ -311,6 +324,12 @@ account-wide reauthentication flow.
   boundary, distinct Source Calendar Date metadata, cross-midnight samples,
   daylight-saving boundaries, travel offsets, equivalent-offset spellings of
   one instant, and rejection or explicit handling of naive values.
+- Activity provenance tests cross the Garmin/`ha-garmin` conversion boundary,
+  archive normalization and persistence, and Calendar query. They prove that
+  `startTimeLocal` or an equivalent Source Calendar Date survives beside the
+  aware `startTime` Source Instant, that an unscoped `get_activities()` result
+  never inherits `target_date`, and that genuinely missing local provenance
+  uses the aware `startTime` UTC date as the explicit conservative degradation.
 - Recorder verification includes a scratch Recorder query through the archive
   for absolute instant identity, revision upsert, restart, and provenance
   confirmation, without requiring a live Home Assistant instance.

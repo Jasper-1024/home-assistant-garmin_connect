@@ -51,9 +51,14 @@ source offset spelling is not part of statistics identity.
 _Avoid_: Display time, wall-clock text
 
 **Source Calendar Date**:
-The Garmin-reported or request-local date associated with a Source Record,
-stored separately from its Source Instant.
-_Avoid_: UTC date, display date
+The source-local calendar date associated with a Source Record, stored
+separately from its Source Instant. It comes from an explicit Garmin calendar
+date or source-local timestamp such as `startTimeLocal`. A request date may
+supply it only for a date-scoped source whose contract makes that date
+authoritative. An unscoped feed must never stamp records with its caller's
+target date. If source-local date provenance is genuinely absent, the explicit
+conservative degradation is the UTC date of the aware Source Instant.
+_Avoid_: Display date, target date stamped onto an unscoped feed
 
 **Canonical Date-Summary Bucket Instant**:
 The deterministic instant assigned only to a daily summary or training-status

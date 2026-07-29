@@ -52,9 +52,17 @@ not exposed by the beta and cannot start during normal integration setup.
 - A settled date receives no further automatic requests. Explicit manual repair
   may reopen and update it.
 - Store Garmin Source Calendar Dates separately from normalized timestamp
-  instants. For date-only `daily_summary` and `training_status`, use the
-  explicit 00:00 UTC+08:00 canonical date-summary bucket, normalized to UTC;
-  do not label that derived identity a Garmin Source Instant.
+  instants. Preserve Garmin's original `startTimeLocal` or an equivalent Source
+  Calendar Date at the collection and conversion boundary, independently of
+  the aware `startTime` Source Instant.
+- Treat a request date as source provenance only for a date-scoped source whose
+  contract makes it authoritative. Never stamp activities returned by an
+  unscoped `get_activities()` feed with the synchronization `target_date`.
+- Only when activity source-local date provenance is genuinely absent, use the
+  aware `startTime` UTC date as an explicit conservative degradation. For
+  date-only `daily_summary` and `training_status`, use the explicit 00:00
+  UTC+08:00 canonical date-summary bucket, normalized to UTC; do not label that
+  derived identity a Garmin Source Instant.
 
 ### 4. Capture and persistence
 
@@ -140,6 +148,12 @@ FIT queue bookkeeping remain internal.
 - FIT one-per-hour, valid-file skip, failure isolation, and restart tests.
 - Timestamp tests for source UTC+2, HA UTC+8 display semantics, source calendar
   date separation, midnight, DST, and travel offsets.
+- Activity provenance tests across Garmin/`ha-garmin` conversion, archive
+  normalization and persistence, and Calendar query: preserve
+  `startTimeLocal` or an equivalent Source Calendar Date beside the aware
+  `startTime` Source Instant; reject `target_date` stamping for unscoped
+  `get_activities()` results; and use `startTime` UTC date only when local
+  provenance is genuinely absent.
 - Existing Recorder, Store, Calendar, privacy, config-flow, migration,
   coordinator, sensor, action, diagnostics, entity-ID, and multi-account
   regression suites remain green.
