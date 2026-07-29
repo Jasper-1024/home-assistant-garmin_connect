@@ -31,6 +31,7 @@ class SleepStream:
 
     metric: str
     points: tuple[SleepStreamPoint, ...]
+    presence: str = "present"
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,7 +156,10 @@ _STREAM_DESCRIPTOR_FIELDS = {
 
 
 def _stream_descriptors(item: dict[str, Any], metric: str) -> dict[str, int] | None:
-    raw = next((item[key] for key in _STREAM_DESCRIPTOR_FIELDS[metric] if key in item), None)
+    raw = next(
+        (item[key] for key in _STREAM_DESCRIPTOR_FIELDS[metric] if key in item and item[key] is not None),
+        None,
+    )
     if raw is None:
         return None
     if not isinstance(raw, list):
@@ -188,7 +192,7 @@ def _sleep_streams(item: dict[str, Any]) -> tuple[SleepStream, ...]:
             continue
         values = item[key]
         if values is None:
-            result.append(SleepStream(metric, ()))
+            result.append(SleepStream(metric, (), "null"))
             continue
         if not isinstance(values, list):
             raise SleepSchemaError("sleep stream has invalid type")
@@ -220,7 +224,13 @@ def _sleep_streams(item: dict[str, Any]) -> tuple[SleepStream, ...]:
                 raise SleepSchemaError("sleep stream value has invalid type")
             by_timestamp[parsed_time] = SleepStreamPoint(parsed_time, raw_time, None if raw_value is None else float(raw_value))
         points.extend(by_timestamp[key] for key in sorted(by_timestamp))
-        result.append(SleepStream(metric, tuple(points)))
+        if not values:
+            presence = "empty"
+        elif not points or all(point.value is None for point in points):
+            presence = "all-null"
+        else:
+            presence = "present"
+        result.append(SleepStream(metric, tuple(points), presence))
     return tuple(result)
 
 
@@ -322,6 +332,7 @@ def session_record(session: SleepSession) -> dict[str, Any]:
             ]
             for stream in session.streams
         },
+        "stream_presence": {stream.metric: stream.presence for stream in session.streams},
     }
 
 
@@ -360,6 +371,9 @@ def session_from_record(record: dict[str, Any]) -> SleepSession:
         raw_streams = record.get("streams", {})
         if not isinstance(raw_streams, dict):
             raise SleepSchemaError("sleep Store record is invalid")
+        raw_presence = record.get("stream_presence", {})
+        if not isinstance(raw_presence, dict):
+            raise SleepSchemaError("sleep Store record is invalid")
         streams: list[SleepStream] = []
         for metric, points in raw_streams.items():
             if metric not in _STREAM_FIELDS or not isinstance(points, list):
@@ -375,7 +389,16 @@ def session_from_record(record: dict[str, Any]) -> SleepSession:
                 restored_by_timestamp[timestamp] = SleepStreamPoint(
                     timestamp, point["raw_timestamp"], None if value is None else float(value)
                 )
-            streams.append(SleepStream(metric, tuple(restored_by_timestamp[key] for key in sorted(restored_by_timestamp))))
+            presence = raw_presence.get(metric, "present")
+            if presence not in {"null", "empty", "all-null", "present"}:
+                raise SleepSchemaError("sleep Store record is invalid")
+            streams.append(
+                SleepStream(
+                    metric,
+                    tuple(restored_by_timestamp[key] for key in sorted(restored_by_timestamp)),
+                    presence,
+                )
+            )
         return SleepSession(
             logical_id=logical_id, kind=kind, start=start, end=end,
             calendar_date=calendar_date, revision=revision, score=bounded_score,

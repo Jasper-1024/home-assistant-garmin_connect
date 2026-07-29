@@ -358,6 +358,66 @@ def test_hrv_raw_readings_tolerate_missing_summary_and_keep_zero() -> None:
     assert parsed.summary is None
 
 
+def test_hrv_aliases_use_first_non_null_and_reject_first_non_null_malformed_values() -> None:
+    parsed = parse_hrv_data(
+        {
+            "hrvReadings": [
+                {
+                    "readingTimeGMT": None,
+                    "readingTimeGmt": "2026-07-24T01:00:00Z",
+                    "hrvValue": None,
+                    "value": 42,
+                }
+            ]
+        },
+        date(2026, 7, 24),
+    )
+    assert [sample.value for sample in parsed.readings] == [42.0]
+
+    with pytest.raises(HistorySchemaError):
+        parse_hrv_data(
+            {
+                "hrvReadings": [
+                    {
+                        "readingTimeGMT": "malformed",
+                        "readingTimeGmt": "2026-07-24T01:00:00Z",
+                        "hrvValue": 42,
+                    }
+                ]
+            },
+            date(2026, 7, 24),
+        )
+
+
+def test_descriptor_aliases_use_first_non_null_and_fail_closed_when_selected_alias_is_bad() -> None:
+    payload = {
+        "heartRateValueDescriptors": None,
+        "heartRateValueDescriptorsDTOList": [
+            {"key": "timestamp", "index": 0},
+            {"key": "heartRate", "index": 1},
+        ],
+        "heartRateValues": [["2026-07-24T01:00:00Z", 61]],
+    }
+    assert normalize_pair_series(
+        payload,
+        values_key="heartRateValues",
+        descriptor_keys=("heartRateValueDescriptors", "heartRateValueDescriptorsDTOList"),
+        value_keys=("heartRate",),
+    )[0].value == 61.0
+
+    with pytest.raises(HistorySchemaError):
+        normalize_pair_series(
+            {
+                "heartRateValueDescriptors": "malformed",
+                "heartRateValueDescriptorsDTOList": payload["heartRateValueDescriptorsDTOList"],
+                "heartRateValues": payload["heartRateValues"],
+            },
+            values_key="heartRateValues",
+            descriptor_keys=("heartRateValueDescriptors", "heartRateValueDescriptorsDTOList"),
+            value_keys=("heartRate",),
+        )
+
+
 def test_hrv_mixed_null_rows_preserve_valid_objects_and_reject_malformed_objects() -> None:
     parsed = parse_hrv_data(
         {

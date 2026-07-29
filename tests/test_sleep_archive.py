@@ -157,6 +157,27 @@ def test_sleep_parser_preserves_sanitized_high_resolution_streams() -> None:
     assert session_from_record(session_record(session)) == session
 
 
+def test_sleep_stream_presence_distinguishes_sparse_states() -> None:
+    session = parse_sleep_sessions(
+        {
+            "startTime": "2026-07-24T23:45:00Z",
+            "endTime": "2026-07-25T07:15:00Z",
+            "sleepHeartRate": None,
+            "hrvData": [],
+            "sleepStress": [["2026-07-25T00:00:00Z", None]],
+            "sleepRespiration": [["2026-07-25T00:01:00Z", 14]],
+        },
+        date(2026, 7, 24),
+    )[0]
+    streams = {stream.metric: stream for stream in session.streams}
+
+    assert streams["heart_rate"].presence == "null"
+    assert streams["hrv"].presence == "empty"
+    assert streams["stress"].presence == "all-null"
+    assert streams["respiration"].presence == "present"
+    assert session_from_record(session_record(session)) == session
+
+
 def test_sanitized_stream_fixture_has_representative_batch_sizes() -> None:
     fixture = json.loads(
         (Path(__file__).parent / "fixtures" / "garmin_sleep_streams.json").read_text()

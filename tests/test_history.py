@@ -464,6 +464,70 @@ async def test_malformed_numeric_partition_does_not_abort_archive_startup() -> N
     assert catalog.data["numeric_source_date_pending"]["2026"] == [target.isoformat()]
 
 
+@pytest.mark.asyncio
+async def test_numeric_partition_replay_is_date_scoped_and_empty_retries_settle() -> None:
+    first_date = date(2026, 7, 24)
+    second_date = date(2026, 7, 25)
+    hass = _hass()
+    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
+    catalog = FakeStore(
+        {
+            "schema_version": 1,
+            "account_key": "opaque-account-key-123",
+            "completed_dates": [first_date.isoformat(), second_date.isoformat()],
+            "hrv_summaries": {},
+            "numeric_source_date_index": ["2026"],
+            "numeric_source_date_dates": {"2026": [first_date.isoformat()]},
+            "numeric_source_date_pending": {},
+            "presence": {},
+            "sleep_index": {},
+            "event_index": {},
+            "activity_index": {},
+        }
+    )
+    stores = {
+        "garmin_connect.entry-1.history_catalog": catalog,
+        "garmin_connect.entry-1.numeric_source_dates_2026": FakeStore({"corrupt": True}),
+    }
+
+    def factory(_hass, _version, path, **kwargs):
+        return stores.setdefault(path, FakeStore())
+
+    class Source:
+        async def async_fetch_details(self, _request_date: date, metric: str) -> object:
+            if metric in {"sleep_sessions", "health_events_daily", "health_events_body_battery", "timed_activities"}:
+                return ()
+            return SourceSeries((), "empty")
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=factory,
+        source_factory=lambda _client, _gate: Source(),
+        recorder_factory=lambda: recorder,
+    )
+    await archive.async_start()
+
+    assert archive._completed_dates == set()
+    assert catalog.data["numeric_source_date_pending"]["2026"] == [
+        first_date.isoformat(),
+        second_date.isoformat(),
+    ]
+
+    first = await archive.async_sync_range(first_date, first_date)
+
+    assert first.outcome == "written"
+    assert catalog.data["completed_dates"] == [first_date.isoformat()]
+    assert catalog.data["numeric_source_date_pending"]["2026"] == [second_date.isoformat()]
+    assert first_date.isoformat() not in archive._numeric_source_date_replay_dates
+
+    assert (await archive.async_sync_range(first_date, first_date)).skipped_count == 1
+    assert catalog.data["numeric_source_date_pending"]["2026"] == [second_date.isoformat()]
+
+
 def test_history_status_and_archive_metadata_use_one_public_contract() -> None:
     """Public archive states and persisted metadata names stay bounded."""
     assert {state.value for state in HistoryArchiveState} == {

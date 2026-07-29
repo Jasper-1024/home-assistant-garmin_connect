@@ -78,7 +78,6 @@ from .history_recorder import (
     VIGOROUS_INTENSITY_DAILY_METADATA,
     VIGOROUS_INTENSITY_METADATA,
     GarminHistoryRecorder,
-    RecorderWriteOutcome,
     statistic_id_for,
 )
 from .history_source import (
@@ -111,11 +110,11 @@ _HISTORY_MAX_DAYS = 31
 _FIRST_SYNC_FIT_LIMIT = 1
 _PROSPECTIVE_CYCLE_INTERVAL = timedelta(minutes=15)
 _PROSPECTIVE_CYCLE_FIT_LIMIT = 0
-_PRESENCE_STATES = frozenset({"null", "empty", "missing", "unsupported", "returned-empty", "present", "absent"})
-# The frozen numeric catalog currently produces 33 presence keys: 13 base
-# families, 12 segmented total contexts, and 8 snapshot fields. Fifteen
-# bounded slots cover additive aliases without accepting an unbounded payload.
-_MAX_PRESENCE_METRICS = 48
+_PRESENCE_STATES = frozenset({"null", "empty", "all-null", "missing", "unsupported", "returned-empty", "present", "absent", "failed"})
+# The frozen numeric catalog currently produces 33 base presence keys: 13
+# families, 12 segmented total contexts, and 8 snapshot fields. The remaining
+# bounded slots cover sleep-stream states without accepting an unbounded payload.
+_MAX_PRESENCE_METRICS = 64
 _SLEEP_SCHEMA_VERSION = 1
 _SLEEP_STREAM_METADATA = {
     "heart_rate": SLEEP_HEART_RATE_METADATA,
@@ -190,6 +189,15 @@ class HistorySyncReport:
 
 class _InvalidArchiveActivationDateError(ValueError):
     """Raised when enabled archival has no trustworthy persisted boundary."""
+
+
+class _NumericFamilyError(RuntimeError):
+    """Raised when one numeric family cannot be archived for a date."""
+
+    def __init__(self, error_type: str = "numeric_family_failed", *, write_failure: bool = False) -> None:
+        super().__init__(error_type)
+        self.error_type = error_type
+        self.write_failure = write_failure
 
 
 HistoryArchiveClock = Callable[[], datetime]
@@ -773,6 +781,145 @@ class GarminHistoryArchive:
         async with self._sync_lock:
             return await self._async_sync_range(start_date, end_date, fit_limit=fit_limit, include_training_status=include_training_status)
 
+    async def _async_import_numeric_metric(
+        self,
+        source: GarminHistorySource,
+        recorder: Any,
+        target: date,
+        target_key: str,
+        metric: str,
+        metadata: Any,
+        presence: dict[str, dict[str, str]],
+        health_events: list[NormalizedHealthEvent],
+    ) -> tuple[int, int, int]:
+        """Import one numeric family without deciding the date checkpoint."""
+        try:
+            details_descriptor = inspect.getattr_static(source, "async_fetch_details")
+        except AttributeError:
+            details_descriptor = None
+        details: Any = None
+        if callable(details_descriptor):
+            bound_details = source.async_fetch_details
+            if inspect.iscoroutinefunction(details_descriptor) or inspect.iscoroutinefunction(bound_details):
+                details = bound_details(target, metric)
+            elif callable(bound_details):
+                candidate = bound_details(target, metric)
+                if inspect.isawaitable(candidate) or isinstance(candidate, (HRVData, SegmentedData, SourceSeries, SnapshotData, tuple)):
+                    details = candidate
+        if inspect.isawaitable(details):
+            details = await details
+        if not isinstance(details, (HRVData, SegmentedData, SourceSeries, SnapshotData, tuple)):
+            details = await source.async_fetch(target, metric)
+
+        inserted = updated = skipped = 0
+        if isinstance(details, HRVData):
+            samples = details.readings
+            presence.setdefault(target_key, {})[metric] = details.presence
+            if details.summary is not None:
+                self._hrv_summaries[target_key] = {
+                    "status": details.summary.status,
+                    "last_night_avg": details.summary.last_night_avg,
+                    "last_night_5_min_high": details.summary.last_night_5_min_high,
+                    "weekly_avg": details.summary.weekly_avg,
+                    "baseline": details.summary.baseline,
+                }
+        elif isinstance(details, SegmentedData):
+            samples = details.readings
+            presence.setdefault(target_key, {})[metric] = details.presence
+            for total_key, state in details.total_presence.items():
+                presence.setdefault(target_key, {})[f"{metric}:{total_key}"] = state
+        elif isinstance(details, SourceSeries):
+            samples = details.readings
+            presence.setdefault(target_key, {})[metric] = details.presence
+        elif isinstance(details, SnapshotData):
+            health_events.extend(details.events)
+            samples = ()
+            snapshot_metadata = {
+                "abnormal_heart_rate_alerts": DAILY_ABNORMAL_HR_METADATA,
+                "acute_load": TRAINING_ACUTE_LOAD_METADATA,
+                "chronic_load": TRAINING_CHRONIC_LOAD_METADATA,
+                "load_balance": TRAINING_LOAD_BALANCE_METADATA,
+                "acwr": TRAINING_ACWR_METADATA,
+                "vo2_max": TRAINING_VO2_MAX_METADATA,
+                "fitness_trend": TRAINING_FITNESS_TREND_METADATA,
+                "recovery_time": TRAINING_RECOVERY_TIME_METADATA,
+            }
+            for field, (state, value) in details.fields.items():
+                presence.setdefault(target_key, {})[f"{metric}:{field}"] = state
+                metadata_for_field = snapshot_metadata.get(field)
+                if state != "present" or value is None or metadata_for_field is None:
+                    continue
+                snapshot = NormalizedSample(details.timestamp, target, details.raw_timestamp, value)
+                snapshot_outcome = await recorder.async_write(
+                    statistic_id_for(self._account_key(), metadata_for_field.key),
+                    metadata_for_field,
+                    (snapshot,),
+                )
+                if snapshot_outcome.outcome != "written":
+                    raise _NumericFamilyError(
+                        snapshot_outcome.error_type or "sync_failed", write_failure=True
+                    )
+                self._remember_numeric_source_dates(
+                    statistic_id_for(self._account_key(), metadata_for_field.key), (snapshot,)
+                )
+                inserted += getattr(snapshot_outcome, "inserted_count", snapshot_outcome.accepted_count)
+                updated += getattr(snapshot_outcome, "updated_count", 0)
+                skipped += getattr(snapshot_outcome, "skipped_count", 0)
+            return inserted, updated, skipped
+        elif metadata is None:
+            return 0, 0, 0
+        else:
+            samples = details
+
+        outcome = await recorder.async_write(
+            statistic_id_for(self._account_key(), metric), metadata, samples
+        )
+        if outcome.outcome != "written":
+            raise _NumericFamilyError(outcome.error_type or "sync_failed", write_failure=True)
+
+        if isinstance(details, SegmentedData) and details.totals:
+            total_metadata = {
+                ("steps", "totalSteps"): STEPS_DAILY_TOTAL_METADATA,
+                ("floors", "floorsAscended"): FLOORS_ASCENDED_DAILY_METADATA,
+                ("floors", "floorsDescended"): FLOORS_DESCENDED_DAILY_METADATA,
+                ("floors", "floorsAscendedInMeters"): FLOORS_ASCENDED_METERS_DAILY_METADATA,
+                ("floors", "floorsDescendedInMeters"): FLOORS_DESCENDED_METERS_DAILY_METADATA,
+                ("floors", "totalFloors"): FLOORS_TOTAL_DAILY_METADATA,
+                ("intensity_moderate", "moderateIntensityMinutes"): MODERATE_INTENSITY_DAILY_METADATA,
+                ("intensity_moderate", "vigorousIntensityMinutes"): VIGOROUS_INTENSITY_DAILY_METADATA,
+                ("intensity_vigorous", "vigorousIntensityMinutes"): VIGOROUS_INTENSITY_DAILY_METADATA,
+                ("intensity_moderate", "totalIntensityMinutes"): INTENSITY_TOTAL_DAILY_METADATA,
+                ("intensity_vigorous", "moderateIntensityMinutes"): MODERATE_INTENSITY_DAILY_METADATA,
+                ("intensity_vigorous", "totalIntensityMinutes"): INTENSITY_TOTAL_DAILY_METADATA,
+            }
+            for total_key, total_value in details.totals.items():
+                total_metric = total_metadata.get((metric, total_key))
+                if total_metric is None:
+                    continue
+                total_sample = NormalizedSample(
+                    datetime.combine(target, time.min, tzinfo=UTC), target, target.isoformat(), total_value
+                )
+                total_outcome = await recorder.async_write(
+                    statistic_id_for(self._account_key(), total_metric.key), total_metric, (total_sample,)
+                )
+                if total_outcome.outcome != "written":
+                    raise _NumericFamilyError(
+                        total_outcome.error_type or "sync_failed", write_failure=True
+                    )
+                self._remember_numeric_source_dates(
+                    statistic_id_for(self._account_key(), total_metric.key), (total_sample,)
+                )
+                inserted += getattr(total_outcome, "inserted_count", total_outcome.accepted_count)
+                updated += getattr(total_outcome, "updated_count", 0)
+                skipped += getattr(total_outcome, "skipped_count", 0)
+
+        inserted += getattr(outcome, "inserted_count", outcome.accepted_count)
+        updated += getattr(outcome, "updated_count", 0)
+        skipped += getattr(outcome, "skipped_count", 0)
+        if metadata is not None:
+            self._remember_numeric_source_dates(statistic_id_for(self._account_key(), metric), samples)
+        return inserted, updated, skipped
+
     async def _async_sync_range(
         self,
         start_date: date,
@@ -847,132 +994,37 @@ class GarminHistoryArchive:
                 )
                 if not include_training_status:
                     metrics = tuple(item for item in metrics if item[0] != "training_status")
+                failed_families: set[str] = set()
+                failed_family_error = "sync_failed"
                 for metric, metadata in metrics:
                     try:
-                        details_descriptor = inspect.getattr_static(source, "async_fetch_details")
-                    except AttributeError:
-                        details_descriptor = None
-                    details: Any = None
-                    if callable(details_descriptor):
-                        bound_details = source.async_fetch_details
-                        if inspect.iscoroutinefunction(details_descriptor) or inspect.iscoroutinefunction(bound_details):
-                            details = bound_details(target, metric)
-                        elif callable(bound_details):
-                            candidate = bound_details(target, metric)
-                            if inspect.isawaitable(candidate) or isinstance(candidate, (HRVData, SegmentedData, SourceSeries, SnapshotData, tuple)):
-                                details = candidate
-                    if inspect.isawaitable(details):
-                        details = await details
-                    if not isinstance(details, (HRVData, SegmentedData, SourceSeries, SnapshotData, tuple)):
-                        details = await source.async_fetch(target, metric)
-                    if isinstance(details, HRVData):
-                        samples = details.readings
-                        presence.setdefault(target_key, {})[metric] = details.presence
-                        if details.summary is not None:
-                            self._hrv_summaries[target_key] = {
-                                "status": details.summary.status,
-                                "last_night_avg": details.summary.last_night_avg,
-                                "last_night_5_min_high": details.summary.last_night_5_min_high,
-                                "weekly_avg": details.summary.weekly_avg,
-                                "baseline": details.summary.baseline,
-                            }
-                    elif isinstance(details, SegmentedData):
-                        samples = details.readings
-                        presence.setdefault(target_key, {})[metric] = details.presence
-                        for total_key, state in details.total_presence.items():
-                            presence.setdefault(target_key, {})[f"{metric}:{total_key}"] = state
-                    elif isinstance(details, SourceSeries):
-                        samples = details.readings
-                        presence.setdefault(target_key, {})[metric] = details.presence
-                    elif isinstance(details, SnapshotData):
-                        health_events.extend(details.events)
-                        samples = ()
-                        snapshot_metadata = {
-                            "abnormal_heart_rate_alerts": DAILY_ABNORMAL_HR_METADATA,
-                            **{
-                                "acute_load": TRAINING_ACUTE_LOAD_METADATA,
-                                "chronic_load": TRAINING_CHRONIC_LOAD_METADATA,
-                                "load_balance": TRAINING_LOAD_BALANCE_METADATA,
-                                "acwr": TRAINING_ACWR_METADATA,
-                                "vo2_max": TRAINING_VO2_MAX_METADATA,
-                                "fitness_trend": TRAINING_FITNESS_TREND_METADATA,
-                                "recovery_time": TRAINING_RECOVERY_TIME_METADATA,
-                            },
-                        }
-                        for field, (state, value) in details.fields.items():
-                            presence.setdefault(target_key, {})[f"{metric}:{field}"] = state
-                            metadata_for_field = snapshot_metadata.get(field)
-                            if state != "present" or value is None or metadata_for_field is None:
-                                continue
-                            snapshot = NormalizedSample(details.timestamp, target, details.raw_timestamp, value)
-                            snapshot_outcome = await recorder.async_write(
-                                statistic_id_for(self._account_key(), metadata_for_field.key),
-                                metadata_for_field,
-                                (snapshot,),
-                            )
-                            if snapshot_outcome.outcome != "written":
-                                return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome=snapshot_outcome.outcome, error_type=snapshot_outcome.error_type)
-                            self._remember_numeric_source_dates(
-                                statistic_id_for(self._account_key(), metadata_for_field.key),
-                                (snapshot,),
-                            )
-                            inserted += getattr(snapshot_outcome, "inserted_count", snapshot_outcome.accepted_count)
-                            updated += getattr(snapshot_outcome, "updated_count", 0)
-                            skipped += getattr(snapshot_outcome, "skipped_count", 0)
-                        outcome = RecorderWriteOutcome(0)
-                    elif metadata is None:
-                        outcome = RecorderWriteOutcome(0)
-                    else:
-                        samples = details
-                    if isinstance(details, SnapshotData) or metadata is None:
-                        outcome = RecorderWriteOutcome(0)
-                    else:
-                        outcome = await recorder.async_write(
-                            statistic_id_for(self._account_key(), metric), metadata, samples
+                        metric_inserted, metric_updated, metric_skipped = await self._async_import_numeric_metric(
+                            source, recorder, target, target_key, metric, metadata, presence, health_events
                         )
-                    if isinstance(details, SegmentedData) and details.totals:
-                        total_metadata = {
-                            ("steps", "totalSteps"): STEPS_DAILY_TOTAL_METADATA,
-                            ("floors", "floorsAscended"): FLOORS_ASCENDED_DAILY_METADATA,
-                            ("floors", "floorsDescended"): FLOORS_DESCENDED_DAILY_METADATA,
-                            ("floors", "floorsAscendedInMeters"): FLOORS_ASCENDED_METERS_DAILY_METADATA,
-                            ("floors", "floorsDescendedInMeters"): FLOORS_DESCENDED_METERS_DAILY_METADATA,
-                            ("floors", "totalFloors"): FLOORS_TOTAL_DAILY_METADATA,
-                            ("intensity_moderate", "moderateIntensityMinutes"): MODERATE_INTENSITY_DAILY_METADATA,
-                            ("intensity_moderate", "vigorousIntensityMinutes"): VIGOROUS_INTENSITY_DAILY_METADATA,
-                            ("intensity_vigorous", "vigorousIntensityMinutes"): VIGOROUS_INTENSITY_DAILY_METADATA,
-                            ("intensity_moderate", "totalIntensityMinutes"): INTENSITY_TOTAL_DAILY_METADATA,
-                            ("intensity_vigorous", "moderateIntensityMinutes"): MODERATE_INTENSITY_DAILY_METADATA,
-                            ("intensity_vigorous", "totalIntensityMinutes"): INTENSITY_TOTAL_DAILY_METADATA,
-                        }
-                        for total_key, total_value in details.totals.items():
-                            total_metric = total_metadata.get((metric, total_key))
-                            if total_metric is None:
-                                continue
-                            total_sample = NormalizedSample(datetime.combine(target, time.min, tzinfo=UTC), target, target.isoformat(), total_value)
-                            total_outcome = await recorder.async_write(statistic_id_for(self._account_key(), total_metric.key), total_metric, (total_sample,))
-                            if total_outcome.outcome != "written":
-                                self._runtime_sync_failure = True
-                                self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, error_type=total_outcome.error_type or "sync_failed", **self._backfill_status_fields())
-                                return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome=total_outcome.outcome, error_type=total_outcome.error_type)
-                            self._remember_numeric_source_dates(
-                                statistic_id_for(self._account_key(), total_metric.key),
-                                (total_sample,),
-                            )
-                            inserted += getattr(total_outcome, "inserted_count", total_outcome.accepted_count)
-                            updated += getattr(total_outcome, "updated_count", 0)
-                            skipped += getattr(total_outcome, "skipped_count", 0)
-                    if outcome.outcome != "written":
-                        self._runtime_sync_failure = True
-                        self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type=outcome.error_type or "sync_failed", **self._backfill_status_fields())
-                        return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome=outcome.outcome, error_type=outcome.error_type)
-                    inserted += getattr(outcome, "inserted_count", outcome.accepted_count)
-                    updated += getattr(outcome, "updated_count", 0)
-                    skipped += getattr(outcome, "skipped_count", 0)
-                    if metadata is not None:
-                        self._remember_numeric_source_dates(
-                            statistic_id_for(self._account_key(), metric), samples
+                    except asyncio.CancelledError:
+                        raise
+                    except _NumericFamilyError as error:
+                        if error.write_failure:
+                            raise
+                        failed_families.add(metric)
+                        failed_family_error = error.error_type
+                        presence.setdefault(target_key, {})[metric] = "failed"
+                        _LOGGER.warning(
+                            "Garmin numeric family failed for %s (%s)", target_key, metric
                         )
+                        continue
+                    except (AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError) as error:
+                        failed_families.add(metric)
+                        presence.setdefault(target_key, {})[metric] = "failed"
+                        failed_family_error = "sync_failed"
+                        _LOGGER.warning(
+                            "Garmin numeric family failed for %s (%s)", target_key, metric
+                        )
+                        del error
+                        continue
+                    inserted += metric_inserted
+                    updated += metric_updated
+                    skipped += metric_skipped
                 try:
                     sleep_descriptor = inspect.getattr_static(source, "async_fetch_details")
                 except AttributeError:
@@ -988,6 +1040,12 @@ class GarminHistoryArchive:
                 for session in sleep_details:
                     year = str(session.start.year)
                     sleep_sessions.setdefault(year, {})[session.logical_id] = session_record(session)
+                    streams_by_metric = {stream.metric: stream for stream in session.streams}
+                    for stream_metric, stream_metadata in _SLEEP_STREAM_METADATA.items():
+                        stream = streams_by_metric.get(stream_metric)
+                        presence.setdefault(target_key, {})[
+                            f"{stream_metadata.key}:{session.logical_id}"
+                        ] = "missing" if stream is None else stream.presence
                     for stream in session.streams:
                         metadata_for_stream = _SLEEP_STREAM_METADATA.get(stream.metric)
                         if metadata_for_stream is None:
@@ -1059,13 +1117,49 @@ class GarminHistoryArchive:
                         )
                         self._fit_archives.setdefault(year, {})[activity.logical_id] = fit_result
                         fit_count += 1
+                if failed_families:
+                    await self._async_save_numeric_source_manifest()
+                    await self._async_save_numeric_source_partitions()
+                    await store.async_save(
+                        self._catalog_record(
+                            completed_dates=self._completed_dates,
+                            presence=presence,
+                            sessions_by_year=self._sleep_sessions,
+                            events_by_year=self._health_events,
+                            activities_by_year=self._activities,
+                        )
+                    )
+                    self._presence = presence
+                    self._runtime_sync_failure = True
+                    self._status = HistoryStatus(
+                        HistoryArchiveState.FAILED,
+                        current_date=target_key,
+                        processed_dates=len(processed),
+                        record_count=inserted + updated,
+                        error_type=failed_family_error,
+                        **self._backfill_status_fields(),
+                    )
+                    return HistorySyncReport(
+                        tuple(processed), inserted, updated, skipped,
+                        outcome="failed", error_type=failed_family_error,
+                    )
                 processed.append(target)
                 completed_dates = self._completed_dates | {target_key}
                 numeric_checkpoint_years = set(self._numeric_source_date_dirty_years)
+                pending_years = {
+                    year for year, dates in self._numeric_source_date_pending.items()
+                    if target_key in dates
+                }
                 await self._async_save_numeric_source_manifest()
                 await self._async_save_numeric_source_partitions()
-                for year in numeric_checkpoint_years:
-                    self._numeric_source_date_pending.pop(year, None)
+                for year in numeric_checkpoint_years | pending_years:
+                    dates = self._numeric_source_date_pending.get(year)
+                    if dates is None:
+                        continue
+                    dates.discard(target_key)
+                    if not dates:
+                        self._numeric_source_date_pending.pop(year, None)
+                self._numeric_source_date_replay_dates.discard(target_key)
                 await self._async_save_sleep_partitions(sleep_sessions, events_by_year, activities_by_year, self._fit_archives)
                 self._sleep_sessions = sleep_sessions
                 self._health_events = events_by_year
@@ -1105,6 +1199,20 @@ class GarminHistoryArchive:
             except asyncio.CancelledError:
                 self._status = HistoryStatus(self._resting_state(), current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
                 raise
+            except _NumericFamilyError as error:
+                self._runtime_sync_failure = True
+                self._status = HistoryStatus(
+                    HistoryArchiveState.FAILED,
+                    current_date=target_key,
+                    processed_dates=len(processed),
+                    record_count=inserted,
+                    error_type=error.error_type,
+                    **self._backfill_status_fields(),
+                )
+                return HistorySyncReport(
+                    tuple(processed), inserted, updated, skipped,
+                    outcome="failed", error_type=error.error_type,
+                )
             except (AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError) as error:
                 self._runtime_sync_failure = True
                 self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type="sync_failed", **self._backfill_status_fields())
@@ -1277,11 +1385,10 @@ class GarminHistoryArchive:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                replay_dates = self._numeric_source_date_year_dates.get(year, set())
-                if not replay_dates:
-                    replay_dates = {
-                        item for item in self._completed_dates if item.startswith(f"{year}-")
-                    }
+                replay_dates = set(self._numeric_source_date_year_dates.get(year, set()))
+                replay_dates.update(
+                    item for item in self._completed_dates if item.startswith(f"{year}-")
+                )
                 self._numeric_source_date_replay_dates.update(replay_dates)
                 self._numeric_source_date_pending.setdefault(year, set()).update(replay_dates)
                 self._completed_dates.difference_update(replay_dates)
@@ -1658,7 +1765,7 @@ class GarminHistoryArchive:
         for year, dates in raw_numeric_date_dates.items():
             if not isinstance(year, str) or year not in self._numeric_source_date_years or not isinstance(dates, list):
                 raise ValueError("Store numeric source-date dates are invalid")
-            parsed_dates: set[str] = set()
+            parsed_source_dates: set[str] = set()
             for item in dates:
                 try:
                     parsed = date.fromisoformat(item)
@@ -1666,8 +1773,8 @@ class GarminHistoryArchive:
                     raise ValueError("Store numeric source-date dates are invalid") from err
                 if parsed.isoformat() != item or parsed < _HISTORY_MIN_DATE:
                     raise ValueError("Store numeric source-date dates are invalid")
-                parsed_dates.add(item)
-            self._numeric_source_date_year_dates.setdefault(year, set()).update(parsed_dates)
+                parsed_source_dates.add(item)
+            self._numeric_source_date_year_dates.setdefault(year, set()).update(parsed_source_dates)
         for year in self._numeric_source_date_years:
             self._numeric_source_date_year_dates.setdefault(year, set()).update(
                 item for item in self._completed_dates if item.startswith(f"{year}-")

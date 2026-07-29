@@ -376,6 +376,8 @@ def _descriptors(payload: dict[str, Any], keys: tuple[str, ...]) -> dict[str, in
         if key not in payload:
             continue
         raw = payload[key]
+        if raw is None:
+            continue
         if not isinstance(raw, list):
             raise HistorySchemaError(f"{key} is not a descriptor list")
         result: dict[str, int] = {}
@@ -811,7 +813,7 @@ def parse_hrv_data(payload: Any, target_date: date) -> HRVData:
             continue
         if not isinstance(reading, dict):
             raise HistorySchemaError("HRV reading is not an object")
-        raw_time = next((reading[key] for key in ("readingTimeGMT", "readingTimeGmt", "readingTime") if key in reading), _MISSING)
+        raw_time = _first_non_null(reading, ("readingTimeGMT", "readingTimeGmt", "readingTime"))
         raw_value = _first_non_null(reading, ("hrvValue", "value"))
         if raw_time is _MISSING or raw_value is _MISSING:
             raise HistorySchemaError("HRV reading lacks required fields")

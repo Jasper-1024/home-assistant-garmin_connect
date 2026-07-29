@@ -537,6 +537,101 @@ async def test_malformed_numeric_record_fails_archive_date_observably():
 
 
 @pytest.mark.asyncio
+async def test_numeric_family_failure_does_not_block_other_families_or_checkpoint() -> None:
+    target = date(2026, 1, 1)
+    sample = NormalizedSample(datetime(2026, 1, 1, 1, tzinfo=UTC), target, "raw", 12.0)
+
+    class Source:
+        async def async_fetch_details(self, _target: date, metric: str) -> object:
+            if metric == "heart_rate":
+                raise ValueError("malformed heart-rate family")
+            if metric in {"stress", "spo2_single", "spo2_continuous", "spo2_hourly"}:
+                return SourceSeries((sample,), "present")
+            if metric == "steps":
+                return SegmentedData((sample,), {"totalSteps": 7.0}, "present", {"totalSteps": "present"})
+            if metric == "daily_summary":
+                return SnapshotData(
+                    {"abnormal_heart_rate_alerts": ("present", 2.0)},
+                    sample.timestamp,
+                    sample.raw_timestamp,
+                )
+            return ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(1, inserted_count=1))
+    store = _Store()
+    archive = _sync_archive(Source(), recorder, store)
+    await archive.async_start()
+
+    report = await archive.async_sync_range(target, target)
+
+    assert report.outcome == "failed"
+    assert report.error_type == "sync_failed"
+    assert store.data.get("completed_dates", []) == []
+    presence = archive.get_history_presence(target, target)[target.isoformat()]
+    assert presence["heart_rate"] == "failed"
+    assert presence["stress"] == "present"
+    assert presence["steps:totalSteps"] == "present"
+    assert presence["daily_summary:abnormal_heart_rate_alerts"] == "present"
+    assert {call.args[1].key for call in recorder.async_write.await_args_list} >= {
+        "stress",
+        "spo2_single",
+        "spo2_continuous",
+        "spo2_hourly",
+        "steps",
+        "steps_daily_total",
+        "daily_abnormal_heart_rate_alerts",
+    }
+
+
+@pytest.mark.asyncio
+async def test_sleep_numeric_stream_presence_is_sparse_and_valid_points_are_written() -> None:
+    target = date(2026, 7, 24)
+    session = parse_sleep_sessions(
+        {
+            "startTime": "2026-07-24T23:45:00Z",
+            "endTime": "2026-07-25T07:15:00Z",
+            "sleepHeartRate": None,
+            "hrvData": [],
+            "sleepStress": [["2026-07-25T00:00:00Z", None]],
+            "sleepRespiration": [
+                ["2026-07-25T00:01:00Z", None],
+                ["2026-07-25T00:02:00Z", 14],
+            ],
+        },
+        target,
+    )[0]
+
+    class Source:
+        async def async_fetch_details(self, _target: date, metric: str) -> object:
+            return (session,) if metric == "sleep_sessions" else ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(1, inserted_count=1))
+    store = _Store()
+    archive = _sync_archive(Source(), recorder, store)
+    await archive.async_start()
+
+    report = await archive.async_sync_range(target, target)
+
+    assert report.outcome == "written"
+    presence = store.data["presence"][target.isoformat()]
+    assert presence[f"sleep_heart_rate:{session.logical_id}"] == "null"
+    assert presence[f"sleep_hrv:{session.logical_id}"] == "empty"
+    assert presence[f"sleep_stress:{session.logical_id}"] == "all-null"
+    assert presence[f"sleep_respiration:{session.logical_id}"] == "present"
+    assert presence[f"sleep_body_battery:{session.logical_id}"] == "missing"
+    respiration_write = next(
+        call for call in recorder.async_write.await_args_list if call.args[1].key == "sleep_respiration"
+    )
+    assert [point.value for point in respiration_write.args[2]] == [14.0]
+
+    restarted = _sync_archive(Source(), recorder, _Store(store.data))
+    await restarted.async_start()
+    assert restarted.get_history_presence(target, target)[target.isoformat()] == presence
+
+
+@pytest.mark.asyncio
 async def test_presence_catalog_loads_all_bounded_states():
     """The private catalog preserves each availability classification."""
     states = dict(zip(
