@@ -10,7 +10,6 @@ from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, timezone
 from enum import StrEnum
-from math import isfinite
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -39,6 +38,12 @@ from .fit_archive import (
     fit_record,
     inspect_fit,
     validated_fit_summary,
+)
+from .history_calendar import (
+    HistoryCalendarEvent,
+    add_structured_calendar_event,
+    project_activity_interval,
+    project_health_interval,
 )
 from .history_recorder import (
     BODY_BATTERY_METADATA,
@@ -295,48 +300,6 @@ def _persist_archive_enablement_transition(
     if data != original:
         hass.config_entries.async_update_entry(entry, data=data)
     return data
-
-
-@dataclass(frozen=True, slots=True)
-class HistoryCalendarEvent:
-    """Safe Calendar result shape reserved for the future query interface."""
-
-    start: datetime
-    end: datetime
-    summary: str
-
-
-def _add_structured_calendar_event(
-    events: dict[tuple[str, datetime, datetime, str], HistoryCalendarEvent],
-    *,
-    logical_id: str,
-    record: Mapping[str, Any],
-    start: datetime,
-    end: datetime,
-    summary: str,
-    query_start_date: date,
-    query_end_date: date,
-) -> None:
-    """Add one deduplicated activity or health event matching a date query."""
-    source_calendar_date: date | None = None
-    raw_source_calendar_date = record.get("calendar_date")
-    if isinstance(raw_source_calendar_date, str):
-        try:
-            source_calendar_date = date.fromisoformat(raw_source_calendar_date)
-        except ValueError:
-            pass
-    source_calendar_date_matches = (
-        source_calendar_date is not None
-        and query_start_date <= source_calendar_date <= query_end_date
-    )
-    source_instants_overlap = (
-        start.date() <= query_end_date and end.date() >= query_start_date
-    )
-    if not source_calendar_date_matches and not source_instants_overlap:
-        return
-    events[(logical_id, start, end, summary)] = HistoryCalendarEvent(
-        start, end, summary
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1804,25 +1767,16 @@ class GarminHistoryArchive:
         if calendar == "activity":
             for records in self._activities.values():
                 for logical_id, record in records.items():
-                    start = datetime.fromisoformat(record["start"])
-                    end = datetime.fromisoformat(record["end"]) if record.get("end") else None
-                    if end is None:
-                        duration = record.get("duration_seconds")
-                        if (
-                            isinstance(duration, int | float)
-                            and not isinstance(duration, bool)
-                            and isfinite(duration)
-                            and duration >= 0
-                        ):
-                            end = start + timedelta(seconds=max(duration, 1.0))
-                    if end is None:
+                    interval = project_activity_interval(record)
+                    if interval is None:
                         continue
+                    start, end = interval
                     summary = str(
                         record.get("name")
                         or record.get("activity_type")
                         or "Activity"
                     )[:64]
-                    _add_structured_calendar_event(
+                    add_structured_calendar_event(
                         events,
                         logical_id=logical_id,
                         record=record,
@@ -1836,32 +1790,16 @@ class GarminHistoryArchive:
         if calendar == "health":
             for records in self._health_events.values():
                 for logical_id, record in records.items():
-                    health_start = datetime.fromisoformat(record["start"]) if record.get("start") else None
-                    health_end = datetime.fromisoformat(record["end"]) if record.get("end") else None
-                    occurrence = datetime.fromisoformat(record["occurrence"]) if record.get("occurrence") else None
-                    if health_start is None and health_end is None and occurrence is not None:
-                        health_start = occurrence
-                        health_end = occurrence + timedelta(seconds=1)
-                    elif health_start is not None and health_end is None and occurrence is None:
-                        health_end = health_start + timedelta(seconds=1)
-                    elif health_start is None and health_end is not None and occurrence is None:
-                        health_start = health_end
-                        health_end += timedelta(seconds=1)
-                    else:
-                        health_start = health_start or occurrence or health_end
-                        health_end = health_end or occurrence or health_start
-                    if health_start is None or health_end is None:
+                    interval = project_health_interval(record)
+                    if interval is None:
                         continue
-                    if health_start == health_end:
-                        health_end += timedelta(seconds=1)
-                    elif health_end < health_start:
-                        continue
+                    health_start, health_end = interval
                     summary = str(
                         record.get("category")
                         or record.get("event_type")
                         or "Health event"
                     )[:64]
-                    _add_structured_calendar_event(
+                    add_structured_calendar_event(
                         events,
                         logical_id=logical_id,
                         record=record,

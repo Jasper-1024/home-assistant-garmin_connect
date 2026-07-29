@@ -38,6 +38,7 @@ from custom_components.garmin_connect.history_source import (
     DAILY_SUMMARY_FIELDS,
     TRAINING_STATUS_FIELDS,
     GarminHistorySource,
+    HistorySchemaError,
     HRVData,
     HRVSummary,
     NormalizedSample,
@@ -1568,42 +1569,22 @@ async def test_activity_calendar_derives_end_from_duration_without_changing_sour
     assert stores["garmin_connect.e.sleep_2026"].data["activities"][activity.logical_id]["end"] is None
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("duration", [-1.0, float("nan"), float("inf")])
-async def test_activity_calendar_rejects_negative_or_non_finite_duration(
+def test_activity_normalization_rejects_negative_or_non_finite_duration(
     duration: float,
 ) -> None:
-    activity = normalize_activities(
-        [
-            {
-                "activityId": 125,
-                "activityType": "running",
-                "startTime": "2026-07-24T10:00:00Z",
-                "durationInSeconds": duration,
-            }
-        ],
-        date(2026, 7, 24),
-    )[0]
-
-    class Source:
-        async def async_fetch_details(self, target, metric):
-            return (activity,) if metric == "timed_activities" else ()
-
-    recorder = MagicMock()
-    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
-    stores = {"garmin_connect.e.history_catalog": _NamedStore()}
-    archive = _partition_archive(Source(), recorder, stores)
-    await archive.async_start()
-    await archive.async_sync_range(date(2026, 7, 24), date(2026, 7, 24))
-
-    calendar = GarminActivityCalendar(archive, "e")
-    events = await calendar.async_get_events(
-        MagicMock(),
-        datetime(2026, 7, 24, tzinfo=UTC),
-        datetime(2026, 7, 25, tzinfo=UTC),
-    )
-
-    assert events == []
+    with pytest.raises(HistorySchemaError):
+        normalize_activities(
+            [
+                {
+                    "activityId": 125,
+                    "activityType": "running",
+                    "startTime": "2026-07-24T10:00:00Z",
+                    "durationInSeconds": duration,
+                }
+            ],
+            date(2026, 7, 24),
+        )
 
 
 @pytest.mark.asyncio
@@ -1643,6 +1624,52 @@ async def test_activity_calendar_projects_zero_duration_without_changing_source_
     )
 
     assert [(event.start, event.end) for event in events] == [
+        (activity.start, activity.start + timedelta(seconds=1))
+    ]
+
+
+@pytest.mark.asyncio
+async def test_zero_length_activity_record_survives_persistence_and_restart() -> None:
+    activity = normalize_activities(
+        [{
+            "activityId": 127,
+            "activityType": "running",
+            "startTime": "2026-07-24T10:00:00Z",
+            "endTime": "2026-07-24T10:00:00Z",
+            "durationInSeconds": 0.0,
+        }],
+        date(2026, 7, 24),
+    )[0]
+    assert activity.end == activity.start
+
+    class Source:
+        async def async_fetch_details(self, _target: date, metric: str) -> object:
+            return (activity,) if metric == "timed_activities" else ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    stores = {"garmin_connect.e.history_catalog": _NamedStore()}
+    archive = _partition_archive(Source(), recorder, stores)
+    await archive.async_start()
+    await archive.async_sync_range(date(2026, 7, 24), date(2026, 7, 24))
+
+    stored = stores["garmin_connect.e.sleep_2026"].data["activities"][activity.logical_id]
+    assert stored["start"] == activity.start.isoformat()
+    assert stored["end"] == activity.end.isoformat()
+    assert stored["duration_seconds"] == 0.0
+    first_events = await archive.async_get_calendar_events(
+        "activity", date(2026, 7, 24), date(2026, 7, 24)
+    )
+    assert [(event.start, event.end) for event in first_events] == [
+        (activity.start, activity.start + timedelta(seconds=1))
+    ]
+
+    restarted = _partition_archive(Source(), recorder, stores)
+    await restarted.async_start()
+    restarted_events = await restarted.async_get_calendar_events(
+        "activity", date(2026, 7, 24), date(2026, 7, 24)
+    )
+    assert [(event.start, event.end) for event in restarted_events] == [
         (activity.start, activity.start + timedelta(seconds=1))
     ]
 

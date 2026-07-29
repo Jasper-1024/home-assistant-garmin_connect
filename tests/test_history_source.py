@@ -153,6 +153,45 @@ def test_activity_and_health_timestamp_aliases_keep_priority_and_timezone_rules(
     assert health.occurrence == datetime(2026, 7, 24, 2, 30, tzinfo=UTC)
 
 
+def test_timestamp_aliases_skip_unparseable_values_before_valid_aliases() -> None:
+    activity = normalize_activities(
+        [{
+            "activityId": 2,
+            "activityType": "running",
+            "startTime": "not-a-timestamp",
+            "startTimeGMT": "2026-07-24T02:00:00.000",
+            "endTime": "also-not-a-timestamp",
+            "endTimeGMT": "2026-07-24T03:00:00.000",
+        }],
+        date(2026, 7, 24),
+    )[0]
+    health = normalize_health_events(
+        {"events": [{
+            "startTime": "not-a-timestamp",
+            "startTimeGMT": "2026-07-24T02:00:00.000",
+            "endTime": "also-not-a-timestamp",
+            "endTimeGMT": "2026-07-24T03:00:00.000",
+        }]},
+        date(2026, 7, 24),
+    )[0]
+
+    assert activity.start == health.start == datetime(2026, 7, 24, 2, tzinfo=UTC)
+    assert activity.end == health.end == datetime(2026, 7, 24, 3, tzinfo=UTC)
+
+
+def test_activity_normalization_rejects_reversed_source_interval() -> None:
+    with pytest.raises(HistorySchemaError):
+        normalize_activities(
+            [{
+                "activityId": 3,
+                "activityType": "running",
+                "startTime": "2026-07-24T03:00:00Z",
+                "endTime": "2026-07-24T02:00:00Z",
+            }],
+            date(2026, 7, 24),
+        )
+
+
 @pytest.mark.asyncio
 async def test_timed_activities_uses_pagination_and_deduplicates_overlap() -> None:
     client = MagicMock()
@@ -206,6 +245,26 @@ async def test_timed_activity_pagination_parses_naive_gmt_page_dates() -> None:
         (0, 100),
         (100, 100),
     ]
+
+
+@pytest.mark.asyncio
+async def test_timed_activity_pagination_uses_valid_gmt_when_start_time_is_bad() -> None:
+    old_activity = {
+        "activityId": "old-1",
+        "activityType": "running",
+        "startTime": "not-a-timestamp",
+        "startTimeGMT": "2026-07-23T23:30:00.000",
+        "endTimeGMT": "2026-07-24T00:30:00.000",
+    }
+    client = MagicMock()
+    client.get_activities = AsyncMock(side_effect=[[old_activity] * 100])
+
+    result = await GarminHistorySource(client, _ImmediateGate()).async_fetch_details(
+        date(2026, 7, 24), "timed_activities"
+    )
+
+    assert result == ()
+    assert client.get_activities.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -315,7 +374,14 @@ def test_health_event_revision_keeps_identity_and_rejects_bounds() -> None:
 
 def test_normalize_health_events_keeps_empty_structures_absent() -> None:
     """An empty source structure is not converted into a synthetic event."""
-    assert normalize_health_events({"events": [{}]}, date(2026, 7, 24)) == ()
+    target = date(2026, 7, 24)
+    assert normalize_health_events({"events": None}, target) == ()
+    assert normalize_health_events({"events": []}, target) == ()
+    assert normalize_health_events({}, target) == ()
+    assert normalize_health_events({"events": [{}]}, target) == ()
+
+    with pytest.raises(HistorySchemaError):
+        normalize_health_events({"events": "malformed"}, target)
 
 
 @pytest.mark.parametrize(

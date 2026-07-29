@@ -7,6 +7,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta, timezone
+from math import isfinite
 from typing import TYPE_CHECKING, Any
 
 from .request_gate import GarminRequestGate, GarminRequestPriority
@@ -183,6 +184,10 @@ def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedAct
                 raise HistorySchemaError("activity summary has invalid type")
             return float(value)
         duration = numeric(item, "durationInSeconds", "duration")
+        if duration is not None and (not isfinite(duration) or duration < 0):
+            raise HistorySchemaError("activity duration is invalid")
+        if end is not None and end < start:
+            raise HistorySchemaError("activity interval is reversed")
         activity_name = item.get("activityName") if isinstance(item.get("activityName"), str) else None
         training_effect = numeric(item, "trainingEffect", "aerobicTrainingEffect")
         load = numeric(item, "activityTrainingLoad", "trainingLoad")
@@ -202,7 +207,10 @@ def activity_from_record(record: Mapping[str, Any]) -> NormalizedActivity:
         calendar_date = date.fromisoformat(record["calendar_date"])
         values = (record.get("duration_seconds"), record.get("training_effect"), record.get("load"), record.get("recovery"))
         name = record.get("name")
-        if not isinstance(activity_type, str) or len(activity_type) > 64 or not isinstance(activity_id, str) or (name is not None and (not isinstance(name, str) or len(name) > 128)) or start is None or (end is not None and end <= start) or any(value is not None and (isinstance(value, bool) or not isinstance(value, int | float)) for value in values):
+        if not isinstance(activity_type, str) or len(activity_type) > 64 or not isinstance(activity_id, str) or (name is not None and (not isinstance(name, str) or len(name) > 128)) or start is None or (end is not None and end < start) or any(value is not None and (isinstance(value, bool) or not isinstance(value, int | float)) for value in values):
+            raise HistorySchemaError("activity record is invalid")
+        duration = values[0]
+        if duration is not None and (not isfinite(float(duration)) or duration < 0):
             raise HistorySchemaError("activity record is invalid")
         logical_id, revision = _activity_hashes(activity_type, activity_id, start, end, values[0], name, values[1], values[2], values[3])
         if record.get("logical_id") != logical_id or record.get("revision") != revision:
@@ -288,7 +296,11 @@ def normalize_health_events(payload: Any, target_date: date) -> tuple[Normalized
         }
     raw_events: Any = payload
     if isinstance(payload, dict):
-        raw_events = next((payload[key] for key in ("events", "dailyEvents", "bodyBatteryEvents", "eventList") if key in payload), payload)
+        event_aliases = ("events", "dailyEvents", "bodyBatteryEvents", "eventList")
+        event_key = next((key for key in event_aliases if key in payload), None)
+        raw_events = payload if event_key is None else payload[event_key]
+        if raw_events is None:
+            return ()
     if isinstance(raw_events, dict):
         raw_events = [raw_events]
     if not isinstance(raw_events, list):
@@ -415,18 +427,22 @@ def _timestamp_as_utc(value: Any) -> datetime | None:
 def _timestamp_from_aliases(
     mapping: Mapping[str, Any], aliases: tuple[str, ...]
 ) -> tuple[Any, datetime | None]:
-    """Select and parse the first non-null timestamp alias."""
+    """Select the first non-null timestamp alias that parses successfully."""
+    first_value: Any = _MISSING
     for alias in aliases:
         value = mapping.get(alias)
         if value is None:
             continue
+        if first_value is _MISSING:
+            first_value = value
         parsed = (
             _timestamp_as_utc(value)
             if alias.endswith("GMT")
             else _timestamp(value)
         )
-        return value, parsed
-    return _MISSING, None
+        if parsed is not None:
+            return value, parsed
+    return first_value, None
 
 
 def _activity_source_calendar_date(
