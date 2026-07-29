@@ -323,9 +323,10 @@ class _FamilyObservationAccumulator:
     def record(self, family: str, observation: _FamilyObservation) -> None:
         previous = self.observations.get(family)
         if previous is not None:
-            previous_rank = _RECONCILIATION_EVIDENCE_RANK.get(previous.presence, 0)
-            current_rank = _RECONCILIATION_EVIDENCE_RANK.get(observation.presence, 0)
-            if previous_rank > current_rank:
+            merged_presence = _merge_reconciliation_evidence(
+                previous.presence, observation.presence
+            )
+            if merged_presence != observation.presence:
                 return
         self.observations[family] = observation
 
@@ -408,8 +409,8 @@ def _safe_family_error_type(error: BaseException) -> str:
     return "garmin_client_error" if isinstance(error, GarminConnectError) else "sync_failed"
 
 
-def _merge_reconciliation_presence(previous: str | None, current: str) -> str:
-    """Retain more severe unavailable evidence across observations."""
+def _merge_reconciliation_evidence(previous: str | None, current: str) -> str:
+    """Retain the most severe reconciliation evidence across observations."""
     previous_rank = _RECONCILIATION_EVIDENCE_RANK.get(previous or "", 0)
     current_rank = _RECONCILIATION_EVIDENCE_RANK.get(current, 0)
     if previous_rank > current_rank:
@@ -1105,8 +1106,10 @@ class GarminHistoryArchive:
             else:
                 outcome = "records"
             if previous is not None:
-                if previous.outcome == "failed" or outcome == "failed":
-                    outcome = "failed"
+                if not (
+                    outcome == "records" and previous.outcome == "incomplete"
+                ):
+                    outcome = _merge_reconciliation_evidence(previous.outcome, outcome)
             evidence_requires_open = outcome in {"failed", "incomplete"}
             if (
                 report.outcome != "written"
@@ -1144,7 +1147,7 @@ class GarminHistoryArchive:
         current = accumulator.presence
         merged = dict(previous)
         for family, state in current.items():
-            merged[family] = _merge_reconciliation_presence(
+            merged[family] = _merge_reconciliation_evidence(
                 previous.get(family), state
             )
         self._reconciliation_family_presence[target_key] = merged

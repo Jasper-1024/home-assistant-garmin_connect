@@ -667,6 +667,42 @@ async def test_partial_then_empty_observation_remains_open_after_window_end() ->
 
 
 @pytest.mark.asyncio
+async def test_incomplete_checkpoint_survives_restart_and_empty_window() -> None:
+    """An incomplete checkpoint keeps an empty date Open across restart."""
+    target = date(2026, 8, 4)
+    store = _reconciliation_store(target)
+    store.data["reconciliation"][target.isoformat()]["outcome"] = "incomplete"
+    source = ReconciliationSource({})
+    now = [datetime(2026, 8, 5, tzinfo=UTC)]
+    timer = DeterministicTimer()
+    archive = _enabled_reconciliation_archive(store, source, now, timer)
+
+    await archive.async_start()
+    await _wait_for_remote_requests(source, 19)
+    await archive.async_stop()
+
+    restarted_timer = DeterministicTimer()
+    restarted = _enabled_reconciliation_archive(store, source, now, restarted_timer)
+    await restarted.async_start()
+    await _wait_for_remote_requests(source, len(source.requested) + 19)
+    await _run_reconciliation_cycle(restarted, restarted_timer, source)
+    assert store.data["reconciliation"][target.isoformat()]["outcome"] == "incomplete"
+
+    now[0] = datetime(2026, 8, 12, tzinfo=UTC)
+    await _run_reconciliation_cycle(restarted, restarted_timer, source)
+    persisted = store.data["reconciliation"][target.isoformat()]
+    assert persisted["state"] == "open"
+    assert persisted["has_records"] is False
+    assert persisted["outcome"] == "incomplete"
+    requests_before_reopen_probe = source.requested.count(target)
+
+    now[0] = datetime(2026, 8, 10, tzinfo=UTC)
+    await _run_reconciliation_cycle(restarted, restarted_timer, source)
+    assert source.requested.count(target) > requests_before_reopen_probe
+    await restarted.async_stop()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("interruption", ("success", "failure", "cancel"))
 async def test_reconciliation_family_checkpoint_survives_interruption(
     interruption: str,
