@@ -179,6 +179,30 @@ class HistorySyncReport:
     error_type: str | None = None
 
 
+def _persist_archive_enablement_transition(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> dict[str, Any]:
+    """Persist an Archive Enablement transition and return its entry data."""
+    options = getattr(entry, "options", None)
+    enabled = isinstance(options, Mapping) and bool(
+        options.get(CONF_ARCHIVE_ENABLED, False)
+    )
+    raw_data = getattr(entry, "data", {})
+    data = dict(raw_data) if isinstance(raw_data, Mapping) else {}
+    original = dict(data)
+    was_enabled = data.get(CONF_ARCHIVE_PREVIOUSLY_ENABLED) is True
+
+    if enabled and not was_enabled:
+        data[CONF_ARCHIVE_ACTIVATION_DATE] = dt_util.now().date().isoformat()
+        data[CONF_ARCHIVE_PREVIOUSLY_ENABLED] = True
+    elif not enabled and was_enabled:
+        data[CONF_ARCHIVE_PREVIOUSLY_ENABLED] = False
+
+    if data != original:
+        hass.config_entries.async_update_entry(entry, data=data)
+    return data
+
+
 @dataclass(frozen=True, slots=True)
 class HistoryCalendarEvent:
     """Safe Calendar result shape reserved for the future query interface."""
@@ -1069,27 +1093,21 @@ class GarminHistoryArchive:
 
     def _async_update_enablement_state(self) -> None:
         """Persist Archive Enablement transitions without starting sync work."""
-        options = getattr(self._entry, "options", None)
-        enabled = isinstance(options, Mapping) and bool(
-            options.get(CONF_ARCHIVE_ENABLED, False)
-        )
         raw_data = getattr(self._entry, "data", {})
-        data = dict(raw_data) if isinstance(raw_data, Mapping) else {}
-        original = dict(data)
-        was_enabled = data.get(CONF_ARCHIVE_PREVIOUSLY_ENABLED) is True
-
-        if enabled and not was_enabled:
-            data[CONF_ARCHIVE_ACTIVATION_DATE] = dt_util.now().date().isoformat()
-            data[CONF_ARCHIVE_PREVIOUSLY_ENABLED] = True
-        elif not enabled and was_enabled:
-            data[CONF_ARCHIVE_PREVIOUSLY_ENABLED] = False
-
-        if data != original:
-            if self._account_key_value is not None:
-                data[CONF_HISTORY_ACCOUNT_KEY] = self._account_key_value
+        original = dict(raw_data) if isinstance(raw_data, Mapping) else {}
+        data = _persist_archive_enablement_transition(self._hass, self._entry)
+        if (
+            self._account_key_value is not None
+            and data != original
+            and data.get(CONF_HISTORY_ACCOUNT_KEY) != self._account_key_value
+        ):
+            data[CONF_HISTORY_ACCOUNT_KEY] = self._account_key_value
             self._hass.config_entries.async_update_entry(self._entry, data=data)
 
-        self._archive_enabled = enabled
+        self._archive_enabled = bool(
+            isinstance(self._entry.options, Mapping)
+            and self._entry.options.get(CONF_ARCHIVE_ENABLED, False)
+        )
         raw_activation_date = data.get(CONF_ARCHIVE_ACTIVATION_DATE)
         try:
             self._activation_date = (

@@ -18,13 +18,18 @@ from custom_components.garmin_connect import (
     async_unload_entry,
 )
 from custom_components.garmin_connect.const import (
+    CONF_ARCHIVE_ACTIVATION_DATE,
     CONF_ARCHIVE_ENABLED,
+    CONF_ARCHIVE_PREVIOUSLY_ENABLED,
     CONF_CLIENT_ID,
     CONF_REFRESH_TOKEN,
     CONF_TOKEN,
     DOMAIN,
 )
-from custom_components.garmin_connect.history import GarminHistoryArchive
+from custom_components.garmin_connect.history import (
+    GarminHistoryArchive,
+    RecorderCompatibilityResult,
+)
 from custom_components.garmin_connect.request_gate import (
     GarminRequestGate,
     GarminRequestPriority,
@@ -76,6 +81,141 @@ async def test_options_update_listener_reloads_config_entry() -> None:
     await tasks[0]
 
     reload.assert_awaited_once_with("entry-1")
+
+
+async def test_options_update_persists_transition_before_reload() -> None:
+    """Enablement date is persisted before setup can reload the entry."""
+    entry = MagicMock(entry_id="entry-1")
+    entry.data = {CONF_ARCHIVE_PREVIOUSLY_ENABLED: False}
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    hass = MagicMock()
+    hass.config_entries.async_update_entry = MagicMock(
+        side_effect=lambda updated_entry, *, data: setattr(updated_entry, "data", data)
+    )
+    tasks = []
+
+    async def reload(_entry_id: str) -> None:
+        assert entry.data[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-08-03"
+        assert entry.data[CONF_ARCHIVE_PREVIOUSLY_ENABLED] is True
+
+    hass.config_entries.async_reload = reload
+    hass.async_create_task = MagicMock(side_effect=tasks.append)
+
+    with patch(
+        "custom_components.garmin_connect.history.dt_util.now",
+        return_value=datetime(2026, 8, 3, 23, 59, tzinfo=UTC),
+    ):
+        await async_options_update_listener(hass, entry)
+    await tasks[0]
+
+
+async def test_options_update_does_not_rewrite_stable_enablement() -> None:
+    """A reload of already-enabled archival does not create another transition."""
+    entry = MagicMock(entry_id="entry-1")
+    entry.data = {
+        CONF_ARCHIVE_ACTIVATION_DATE: "2026-08-03",
+        CONF_ARCHIVE_PREVIOUSLY_ENABLED: True,
+    }
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    hass = MagicMock()
+    hass.config_entries.async_update_entry = MagicMock()
+    reload = AsyncMock()
+    tasks = []
+    hass.config_entries.async_reload = reload
+    hass.async_create_task = MagicMock(side_effect=tasks.append)
+
+    with patch(
+        "custom_components.garmin_connect.history.dt_util.now",
+        return_value=datetime(2026, 8, 4, 0, 1, tzinfo=UTC),
+    ):
+        await async_options_update_listener(hass, entry)
+    await tasks[0]
+
+    hass.config_entries.async_update_entry.assert_not_called()
+    reload.assert_awaited_once_with("entry-1")
+
+
+async def test_enablement_date_survives_store_failure_after_midnight() -> None:
+    """A Store startup failure cannot replace the transition date after midnight."""
+    entry = MagicMock(entry_id="entry-1")
+    entry.data = {CONF_ARCHIVE_PREVIOUSLY_ENABLED: False}
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    hass = MagicMock()
+    hass.config_entries.async_update_entry = MagicMock(
+        side_effect=lambda updated_entry, *, data: setattr(updated_entry, "data", data)
+    )
+    tasks = []
+
+    def failing_store(*_args, **_kwargs):
+        raise OSError("private storage unavailable")
+
+    async def reload(_entry_id: str) -> None:
+        archive = GarminHistoryArchive(hass, entry, store_factory=failing_store)
+        with patch(
+            "custom_components.garmin_connect.history.dt_util.now",
+            return_value=datetime(2026, 8, 4, 0, 1, tzinfo=UTC),
+        ):
+            await archive.async_start()
+        assert archive.status.error_type == "store_initialization"
+
+    hass.config_entries.async_reload = reload
+    hass.async_create_task = MagicMock(side_effect=tasks.append)
+
+    with patch(
+        "custom_components.garmin_connect.history.dt_util.now",
+        return_value=datetime(2026, 8, 3, 23, 59, tzinfo=UTC),
+    ):
+        await async_options_update_listener(hass, entry)
+    await tasks[0]
+
+    assert entry.data[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-08-03"
+    assert entry.data[CONF_ARCHIVE_PREVIOUSLY_ENABLED] is True
+
+
+async def test_enablement_date_survives_recorder_startup_failure_after_midnight() -> None:
+    """A Recorder startup failure cannot replace the transition date after midnight."""
+    entry = MagicMock(entry_id="entry-1")
+    entry.data = {CONF_ARCHIVE_PREVIOUSLY_ENABLED: False}
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    hass = MagicMock()
+    hass.config_entries.async_update_entry = MagicMock(
+        side_effect=lambda updated_entry, *, data: setattr(updated_entry, "data", data)
+    )
+    tasks = []
+    store = MagicMock()
+    store.async_load = AsyncMock(return_value=None)
+    store.async_save = AsyncMock()
+    checker = MagicMock()
+    checker.async_check = AsyncMock(
+        return_value=RecorderCompatibilityResult.incompatible_result("recorder_signature")
+    )
+
+    async def reload(_entry_id: str) -> None:
+        archive = GarminHistoryArchive(
+            hass,
+            entry,
+            recorder_checker=checker,
+            store_factory=lambda *_args, **_kwargs: store,
+        )
+        with patch(
+            "custom_components.garmin_connect.history.dt_util.now",
+            return_value=datetime(2026, 8, 4, 0, 1, tzinfo=UTC),
+        ):
+            await archive.async_start()
+        assert archive.status.error_type == "recorder_signature"
+
+    hass.config_entries.async_reload = reload
+    hass.async_create_task = MagicMock(side_effect=tasks.append)
+
+    with patch(
+        "custom_components.garmin_connect.history.dt_util.now",
+        return_value=datetime(2026, 8, 3, 23, 59, tzinfo=UTC),
+    ):
+        await async_options_update_listener(hass, entry)
+    await tasks[0]
+
+    assert entry.data[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-08-03"
+    assert entry.data[CONF_ARCHIVE_PREVIOUSLY_ENABLED] is True
 
 
 async def test_real_config_entry_lifecycle_keeps_backfill_dormant_and_surfaces_visible(

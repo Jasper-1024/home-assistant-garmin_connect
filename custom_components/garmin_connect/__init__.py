@@ -26,7 +26,7 @@ from .coordinator import (
     NutritionCoordinator,
     TrainingCoordinator,
 )
-from .history import GarminHistoryArchive
+from .history import GarminHistoryArchive, _persist_archive_enablement_transition
 from .request_gate import GarminRequestGate
 from .services import async_setup_services, async_unload_services
 
@@ -228,6 +228,7 @@ async def async_options_update_listener(
     hass: HomeAssistant, entry: GarminConnectConfigEntry
 ) -> None:
     """Handle options update — reload to apply new scan_interval."""
+    _persist_archive_enablement_transition(hass, entry)
     hass.async_create_task(hass.config_entries.async_reload(entry.entry_id))
 
 
