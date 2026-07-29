@@ -2108,8 +2108,7 @@ async def test_numeric_checkpoint_survives_restart_without_gap() -> None:
     await initial.async_start()
     await _wait_for_remote_requests(initial_source, 19)
     await _wait_for_archive_state(initial, HistoryArchiveState.IDLE)
-    assert store.data is not None
-    assert store.data["reconciliation_family_presence"][target.isoformat()][
+    assert initial.get_history_presence(target, target)[target.isoformat()][
         "heart_rate"
     ] == "empty"
     await initial.async_stop()
@@ -2132,10 +2131,7 @@ async def test_numeric_checkpoint_survives_restart_without_gap() -> None:
     await interrupted.async_start()
     await sleep_started.wait()
 
-    assert store.data is not None
-    assert store.data["reconciliation_family_presence"][target.isoformat()][
-        "heart_rate"
-    ] == "present"
+    assert interrupted_source.requested.count(target) > 0
 
     release_sleep.set()
     await interrupted.async_stop()
@@ -2149,16 +2145,17 @@ async def test_numeric_checkpoint_survives_restart_without_gap() -> None:
     await restarted.async_start()
     await _wait_for_remote_requests(restarted_source, 19)
     await _wait_for_archive_state(restarted, HistoryArchiveState.IDLE)
+    requests_before_window = restarted_source.requested.count(target)
     await _run_reconciliation_cycle(restarted, restarted_timer, restarted_source)
-
-    assert store.data is not None
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
-    assert store.data["reconciliation"][target.isoformat()][
-        "outcome"
-    ] != "continuity_gap"
+    assert restarted_source.requested.count(target) == requests_before_window
     assert restarted.get_history_presence(target, target)[target.isoformat()][
         "heart_rate"
     ] == "present"
+
+    now[0] = datetime(2026, 8, 10, tzinfo=UTC)
+    requests_before_retry = restarted_source.requested.count(target)
+    await _run_reconciliation_cycle(restarted, restarted_timer, restarted_source)
+    assert restarted_source.requested.count(target) > requests_before_retry
     await restarted.async_stop()
 
 

@@ -1230,6 +1230,28 @@ class GarminHistoryArchive:
                 is_current_date=target == self._current_local_date(),
             )
 
+    async def _async_fetch_structured_family(
+        self,
+        fetch: Callable[..., Any] | None,
+        target: date,
+        target_key: str,
+        family: str,
+        accumulator: _FamilyObservationAccumulator,
+        checkpoint: _StructuredCheckpoint,
+    ) -> _FamilyObservation:
+        """Fetch one structured family and checkpoint its bounded observation."""
+        observation = await _async_observe_family(
+            fetch, target, family, accumulator
+        )
+        await self._async_checkpoint_observation(
+            target,
+            target_key,
+            accumulator,
+            checkpoint,
+            outcome="failed" if observation.presence == "failed" else "written",
+        )
+        return observation
+
     async def _async_expire_empty_reconciliation_dates(self, current: date) -> None:
         """Settle empty Open Archive Dates that reached the window boundary."""
         changed = False
@@ -1815,24 +1837,15 @@ class GarminHistoryArchive:
                 except AttributeError:
                     structured_descriptor = None
                 structured_fetch = getattr(source, "async_fetch_details", None)
-                sleep_observation = await _async_observe_family(
+                sleep_observation = await self._async_fetch_structured_family(
                     structured_fetch
                     if callable(structured_descriptor) and callable(structured_fetch)
                     else None,
                     target,
+                    target_key,
                     "sleep_sessions",
                     family_observations,
-                )
-                await self._async_checkpoint_observation(
-                    target,
-                    target_key,
-                    family_observations,
                     checkpoint,
-                    outcome=(
-                        "failed"
-                        if sleep_observation.presence == "failed"
-                        else "written"
-                    ),
                 )
                 sleep_details = sleep_observation.details
                 if sleep_observation.presence in (
@@ -2013,24 +2026,15 @@ class GarminHistoryArchive:
                     await self._async_checkpoint_observation(
                         target, target_key, family_observations, checkpoint
                     )
-                activity_observation = await _async_observe_family(
+                activity_observation = await self._async_fetch_structured_family(
                     structured_fetch
                     if callable(structured_descriptor) and callable(structured_fetch)
                     else None,
                     target,
+                    target_key,
                     "timed_activities",
                     family_observations,
-                )
-                await self._async_checkpoint_observation(
-                    target,
-                    target_key,
-                    family_observations,
                     checkpoint,
-                    outcome=(
-                        "failed"
-                        if activity_observation.presence == "failed"
-                        else "written"
-                    ),
                 )
                 activity_details = activity_observation.details
                 if activity_observation.presence == "failed":
