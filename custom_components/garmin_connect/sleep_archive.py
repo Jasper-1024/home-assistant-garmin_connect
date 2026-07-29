@@ -79,7 +79,13 @@ def _parse_time(value: Any) -> datetime:
 
 
 def _first(mapping: dict[str, Any], names: tuple[str, ...]) -> Any:
-    return next((mapping[name] for name in names if name in mapping), None)
+    for name in names:
+        if name not in mapping:
+            continue
+        value = mapping[name]
+        if value is not None:
+            return value
+    return None
 
 
 def _bounded_structured(value: Any, *, depth: int = 0) -> Any:
@@ -175,7 +181,9 @@ def _stream_descriptors(item: dict[str, Any], metric: str) -> dict[str, int] | N
 def _sleep_streams(item: dict[str, Any]) -> tuple[SleepStream, ...]:
     result: list[SleepStream] = []
     for metric, aliases in _STREAM_FIELDS.items():
-        key = next((alias for alias in aliases if alias in item), None)
+        key = next((alias for alias in aliases if alias in item and item[alias] is not None), None)
+        if key is None:
+            key = next((alias for alias in aliases if alias in item), None)
         if key is None:
             continue
         values = item[key]
@@ -194,7 +202,7 @@ def _sleep_streams(item: dict[str, Any]) -> tuple[SleepStream, ...]:
                 continue
             if isinstance(row, dict):
                 raw_time = next((row[name] for name in ("timestamp", "time", "startGMT", "readingTimeGMT") if name in row), _MISSING)
-                raw_value = next((row[name] for name in ("value", metric, "heartRate", "hrvValue", "stressLevel", "spO2", "spo2", "bodyBattery", "respirationValue", "movement", "activityLevel") if name in row), _MISSING)
+                raw_value = _first_non_null(row, ("value", metric, "heartRate", "hrvValue", "stressLevel", "spO2", "spo2", "bodyBattery", "respirationValue", "movement", "activityLevel"))
                 if raw_time is _MISSING or raw_value is _MISSING:
                     raise SleepSchemaError("sleep stream point lacks required fields")
             elif isinstance(row, list) and descriptors is not None:
@@ -214,6 +222,19 @@ def _sleep_streams(item: dict[str, Any]) -> tuple[SleepStream, ...]:
         points.extend(by_timestamp[key] for key in sorted(by_timestamp))
         result.append(SleepStream(metric, tuple(points)))
     return tuple(result)
+
+
+def _first_non_null(mapping: dict[str, Any], names: tuple[str, ...]) -> Any:
+    """Select the first available numeric alias whose value is not null."""
+    null_found = False
+    for name in names:
+        if name not in mapping:
+            continue
+        value = mapping[name]
+        if value is not None:
+            return value
+        null_found = True
+    return None if null_found else _MISSING
 
 
 def _score(payload: dict[str, Any]) -> dict[str, Any]:

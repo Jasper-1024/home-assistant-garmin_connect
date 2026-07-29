@@ -252,6 +252,39 @@ def test_sleep_stream_descriptors_reorder_columns_and_deduplicate_timestamps() -
         parse_sleep_sessions({**payload, "sleepHeartRate": [[60, "2026-07-25T00:00:00Z"]] * 4097}, date(2026, 7, 24))
 
 
+def test_sleep_stream_aliases_choose_first_non_null_field() -> None:
+    payload = {
+        "startTime": "2026-07-24T23:45:00Z", "endTime": "2026-07-25T07:15:00Z",
+        "sleepHeartRate": [{
+            "timestamp": "2026-07-25T00:00:00Z",
+            "heartRate": None,
+            "value": 60,
+        }],
+        "sleepHeartRateValues": [{
+            "timestamp": "2026-07-25T00:01:00Z",
+            "heartRate": 61,
+        }],
+    }
+
+    session = parse_sleep_sessions(payload, date(2026, 7, 24))[0]
+
+    assert [(point.timestamp.isoformat(), point.value) for point in session.streams[0].points] == [
+        ("2026-07-25T00:00:00+00:00", 60.0),
+    ]
+
+
+def test_sleep_stream_key_aliases_choose_first_non_null_array() -> None:
+    payload = {
+        "startTime": "2026-07-24T23:45:00Z", "endTime": "2026-07-25T07:15:00Z",
+        "sleepHeartRate": None,
+        "sleepHeartRateValues": [["2026-07-25T00:01:00Z", 61]],
+    }
+
+    session = parse_sleep_sessions(payload, date(2026, 7, 24))[0]
+
+    assert session.streams[0].points[0].value == 61.0
+
+
 def test_sleep_stream_numeric_epoch_timestamp_and_nested_descriptors() -> None:
     payload = {
         "sleepData": {

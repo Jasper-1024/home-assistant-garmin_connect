@@ -179,7 +179,11 @@ async def test_numeric_source_calendar_dates_are_durable_across_restart_and_upse
     hass = _hass()
     entry = _entry(data={"history_account_key": "opaque-account-key-123"})
     checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
-    store = FakeStore()
+    stores: dict[str, FakeStore] = {}
+
+    def store_factory(_hass, _version, path, **kwargs):
+        return stores.setdefault(path, FakeStore())
+
     recorder = MagicMock()
     recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(1))
 
@@ -211,23 +215,27 @@ async def test_numeric_source_calendar_dates_are_durable_across_restart_and_upse
         hass,
         entry,
         recorder_checker=checker,
-        store_factory=_store_factory(store),
+        store_factory=store_factory,
         source_factory=lambda client, gate: source,
         recorder_factory=lambda: recorder,
     )
     await archive.async_start()
     report = await archive.async_sync_range(target, target)
     assert report.outcome == "written"
-    dates = store.data["numeric_source_calendar_dates"]
-    assert len(dates) == 13
-    statistic_id = next(key for key in dates if key.endswith(":heart_rate"))
-    assert dates[statistic_id] == {"2026-07-24T23:30:00+00:00": "2026-07-24"}
+    catalog = stores["garmin_connect.entry-1.history_catalog"]
+    assert "numeric_source_calendar_dates" not in catalog.data
+    assert catalog.data["numeric_source_date_index"] == ["2026"]
+    numeric_store = stores["garmin_connect.entry-1.numeric_source_dates_2026"]
+    statistic_id = next(key for key in numeric_store.data["dates"] if key.endswith(":heart_rate"))
+    assert numeric_store.data["dates"][statistic_id] == {
+        "2026-07-24T23:30:00+00:00": "2026-07-24"
+    }
 
     restarted = GarminHistoryArchive(
         hass,
         entry,
         recorder_checker=checker,
-        store_factory=_store_factory(FakeStore(data=store.data)),
+        store_factory=store_factory,
         source_factory=lambda client, gate: source,
         recorder_factory=lambda: recorder,
     )
@@ -235,8 +243,7 @@ async def test_numeric_source_calendar_dates_are_durable_across_restart_and_upse
     source.source_date = date(2026, 7, 25)
     report = await restarted.async_sync_range(date(2026, 7, 25), date(2026, 7, 25))
     assert report.outcome == "written"
-    restarted_store = restarted._store
-    assert restarted_store.data["numeric_source_calendar_dates"][statistic_id] == {
+    assert numeric_store.data["dates"][statistic_id] == {
         "2026-07-24T23:30:00+00:00": "2026-07-25"
     }
 

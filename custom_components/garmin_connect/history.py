@@ -409,6 +409,9 @@ class GarminHistoryArchive:
         self._recorder_adapter: Any | None = None
         self._hrv_summaries: dict[str, dict[str, Any]] = {}
         self._numeric_source_calendar_dates: dict[str, dict[str, str]] = {}
+        self._numeric_source_date_stores: dict[str, Any] = {}
+        self._numeric_source_date_years: set[str] = set()
+        self._numeric_source_date_dirty_years: set[str] = set()
         self._sleep_sessions: dict[str, dict[str, dict[str, Any]]] = {}
         self._health_events: dict[str, dict[str, dict[str, Any]]] = {}
         self._activities: dict[str, dict[str, dict[str, Any]]] = {}
@@ -867,6 +870,8 @@ class GarminHistoryArchive:
                     elif isinstance(details, SegmentedData):
                         samples = details.readings
                         presence.setdefault(target_key, {})[metric] = details.presence
+                        for total_key, state in details.total_presence.items():
+                            presence.setdefault(target_key, {})[f"{metric}:{total_key}"] = state
                     elif isinstance(details, SourceSeries):
                         samples = details.readings
                         presence.setdefault(target_key, {})[metric] = details.presence
@@ -1042,6 +1047,7 @@ class GarminHistoryArchive:
                         fit_count += 1
                 processed.append(target)
                 completed_dates = self._completed_dates | {target_key}
+                await self._async_save_numeric_source_partitions()
                 await self._async_save_sleep_partitions(sleep_sessions, events_by_year, activities_by_year, self._fit_archives)
                 self._sleep_sessions = sleep_sessions
                 self._health_events = events_by_year
@@ -1105,10 +1111,7 @@ class GarminHistoryArchive:
             "account_key": self._account_key(),
             "completed_dates": sorted(completed_dates),
             "hrv_summaries": self._hrv_summaries,
-            "numeric_source_calendar_dates": {
-                statistic_id: dict(instants)
-                for statistic_id, instants in self._numeric_source_calendar_dates.items()
-            },
+            "numeric_source_date_index": sorted(self._numeric_source_date_years),
             "presence": presence,
             "sleep_index": {year: sorted(records) for year, records in sessions_by_year.items()},
             "event_index": {year: sorted(records) for year, records in events_by_year.items()},
@@ -1129,6 +1132,95 @@ class GarminHistoryArchive:
                 raise ValueError("numeric source calendar date is invalid")
             instant = sample.timestamp.astimezone(UTC).isoformat()
             dates[instant] = sample.request_date.isoformat()
+            year = str(sample.timestamp.astimezone(UTC).year)
+            self._numeric_source_date_years.add(year)
+            self._numeric_source_date_dirty_years.add(year)
+
+    async def _async_save_numeric_source_partitions(self) -> None:
+        """Persist source-date provenance in lazy annual private Stores."""
+        if not self._numeric_source_date_dirty_years:
+            return
+        store_factory = self._store_factory
+        if store_factory is None:
+            from homeassistant.helpers.storage import Store
+
+            store_factory = Store
+        for year in sorted(self._numeric_source_date_dirty_years):
+            if year not in self._numeric_source_date_stores:
+                self._numeric_source_date_stores[year] = store_factory(
+                    self._hass,
+                    HISTORY_STORE_VERSION,
+                    f"{DOMAIN}.{self._entry.entry_id}.numeric_source_dates_{year}",
+                    private=True,
+                    atomic_writes=True,
+                )
+            dates = {
+                statistic_id: {
+                    instant: source_date
+                    for instant, source_date in instants.items()
+                    if datetime.fromisoformat(instant).astimezone(UTC).year == int(year)
+                }
+                for statistic_id, instants in self._numeric_source_calendar_dates.items()
+            }
+            dates = {statistic_id: values for statistic_id, values in dates.items() if values}
+            await self._numeric_source_date_stores[year].async_save(
+                {
+                    "schema_version": HISTORY_STORE_VERSION,
+                    "account_key": self._account_key(),
+                    "year": year,
+                    "dates": dates,
+                }
+            )
+        self._numeric_source_date_dirty_years.clear()
+
+    async def _async_load_numeric_source_partitions(self, years: set[str]) -> None:
+        """Load only indexed annual source-date provenance partitions."""
+        store_factory = self._store_factory
+        if store_factory is None:
+            from homeassistant.helpers.storage import Store
+
+            store_factory = Store
+        for year in years:
+            if year not in self._numeric_source_date_stores:
+                self._numeric_source_date_stores[year] = store_factory(
+                    self._hass,
+                    HISTORY_STORE_VERSION,
+                    f"{DOMAIN}.{self._entry.entry_id}.numeric_source_dates_{year}",
+                    private=True,
+                    atomic_writes=True,
+                )
+            partition = await self._numeric_source_date_stores[year].async_load()
+            if partition is None:
+                continue
+            if (
+                not isinstance(partition, Mapping)
+                or partition.get("schema_version") != HISTORY_STORE_VERSION
+                or partition.get("account_key") != self._account_key()
+                or partition.get("year") != year
+                or not isinstance(partition.get("dates", {}), Mapping)
+            ):
+                raise ValueError("numeric source-date partition is invalid")
+            for statistic_id, instants in partition["dates"].items():
+                if not isinstance(statistic_id, str) or not statistic_id or not isinstance(instants, Mapping):
+                    raise ValueError("numeric source-date partition is invalid")
+                restored = self._numeric_source_calendar_dates.setdefault(statistic_id, {})
+                for instant, source_date in instants.items():
+                    if not isinstance(instant, str) or not isinstance(source_date, str):
+                        raise ValueError("numeric source-date partition is invalid")
+                    try:
+                        parsed_instant = datetime.fromisoformat(instant)
+                        parsed_date = date.fromisoformat(source_date)
+                    except ValueError as err:
+                        raise ValueError("numeric source-date partition is invalid") from err
+                    if (
+                        parsed_instant.tzinfo is None
+                        or parsed_instant.utcoffset() is None
+                        or parsed_instant.astimezone(UTC).isoformat() != instant
+                        or parsed_instant.astimezone(UTC).year != int(year)
+                        or parsed_date.isoformat() != source_date
+                    ):
+                        raise ValueError("numeric source-date partition is invalid")
+                    restored[instant] = source_date
 
     async def _async_save_sleep_partitions(
         self, sessions_by_year: Mapping[str, Mapping[str, dict[str, Any]]],
@@ -1420,7 +1512,7 @@ class GarminHistoryArchive:
                     "account_key": account_key,
                     "completed_dates": [],
                     "hrv_summaries": {},
-                    "numeric_source_calendar_dates": {},
+                    "numeric_source_date_index": [],
                     "presence": {},
                     "sleep_index": {},
                     "event_index": {},
@@ -1474,6 +1566,22 @@ class GarminHistoryArchive:
                 parsed_instants[instant] = source_date
             numeric_dates[statistic_id] = parsed_instants
         self._numeric_source_calendar_dates = numeric_dates
+        raw_numeric_years = catalog.get("numeric_source_date_index", [])
+        if not isinstance(raw_numeric_years, list) or any(
+            not isinstance(year, str) or len(year) != 4 or not year.isdecimal()
+            for year in raw_numeric_years
+        ):
+            raise ValueError("Store numeric source-date index is invalid")
+        self._numeric_source_date_years = set(raw_numeric_years)
+        self._numeric_source_date_years.update(
+            str(datetime.fromisoformat(instant).astimezone(UTC).year)
+            for instants in numeric_dates.values()
+            for instant in instants
+        )
+        if numeric_dates:
+            # Legacy catalogs are read once and rewritten into annual Stores
+            # on the next successful checkpoint.
+            self._numeric_source_date_dirty_years.update(self._numeric_source_date_years)
         raw_presence = catalog.get("presence", {})
         if not isinstance(raw_presence, Mapping):
             raise ValueError("Store presence catalog is invalid")
@@ -1527,6 +1635,7 @@ class GarminHistoryArchive:
             sleep_years.add(year)
         self._sleep_sessions = {}
         await self._async_load_sleep_partitions(sleep_years)
+        await self._async_load_numeric_source_partitions(self._numeric_source_date_years)
         missing_years = sleep_years - set(self._sleep_sessions)
         if missing_years:
             self._completed_dates = {

@@ -214,6 +214,41 @@ async def test_top_level_heart_rate_and_stress_lists_are_normalized(
     assert result.presence == "present"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metric", ["heart_rate", "stress"])
+async def test_null_and_unsupported_intraday_payloads_remain_source_series(metric: str) -> None:
+    client = MagicMock()
+    client._base_url = "https://garmin.example"
+    client.get_user_profile = AsyncMock(return_value=MagicMock(display_name="user"))
+    source = GarminHistorySource(client, _ImmediateGate())
+
+    for payload, expected_presence in ((None, "null"), ("unsupported", "unsupported")):
+        client._request = AsyncMock(return_value=payload)
+        result = await source.async_fetch_details(date(2026, 7, 24), metric)
+        assert isinstance(result, SourceSeries)
+        assert result.readings == ()
+        assert result.presence == expected_presence
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("metric", "payload"),
+    [
+        ("heart_rate", {"heartRateValues": "malformed"}),
+        ("stress", {"stressValuesArray": 42}),
+    ],
+)
+async def test_malformed_known_intraday_payload_fails_closed(metric: str, payload: dict) -> None:
+    client = MagicMock()
+    client._base_url = "https://garmin.example"
+    client.get_user_profile = AsyncMock(return_value=MagicMock(display_name="user"))
+    client._request = AsyncMock(return_value=payload)
+    source = GarminHistorySource(client, _ImmediateGate())
+
+    with pytest.raises(HistorySchemaError):
+        await source.async_fetch_details(date(2026, 7, 24), metric)
+
+
 def test_snapshot_aliases_prefer_non_null_values() -> None:
     target = date(2026, 7, 24)
 
@@ -228,6 +263,24 @@ def test_snapshot_aliases_prefer_non_null_values() -> None:
         "absent",
         None,
     )
+
+
+def test_numeric_activity_records_choose_first_non_null_alias() -> None:
+    activity = normalize_activities(
+        [{
+            "activityId": 1,
+            "activityType": "running",
+            "startTime": "2026-07-24T01:00:00Z",
+            "durationInSeconds": None,
+            "duration": 60,
+            "trainingEffect": None,
+            "aerobicTrainingEffect": 2.1,
+        }],
+        date(2026, 7, 24),
+    )[0]
+
+    assert activity.duration_seconds == 60.0
+    assert activity.training_effect == 2.1
 
 
 def test_mixed_null_object_series_preserve_respiration_and_spo2_samples() -> None:
@@ -350,6 +403,14 @@ def test_top_level_list_segmented_payloads_are_present_and_normalized() -> None:
     assert steps.presence == floors.presence == intensity.presence == "present"
 
 
+def test_segmented_object_records_choose_first_non_null_value_alias() -> None:
+    parsed = normalize_steps(
+        {"data": [{"timestamp": "2026-07-24T01:00:00Z", "steps": None, "value": 12}]},
+        date(2026, 7, 24),
+    )
+    assert [sample.value for sample in parsed.readings] == [12.0]
+
+
 @pytest.mark.asyncio
 async def test_top_level_list_body_battery_is_present() -> None:
     client = MagicMock()
@@ -396,6 +457,23 @@ def test_segmented_steps_descriptor_reordering_preserves_revisions_and_totals() 
     }, date(2026, 7, 24))
     assert [sample.value for sample in parsed.readings] == [0, 12]
     assert parsed.totals == {"totalSteps": 12.0}
+
+
+def test_segmented_rows_are_not_daily_totals_and_total_presence_is_distinct() -> None:
+    target = date(2026, 7, 24)
+    segmented = normalize_steps(
+        {"data": [{"timestamp": "2026-07-24T01:00:00Z", "steps": 12}]}, target
+    )
+    null_total = normalize_steps({"summary": {"totalSteps": None}}, target)
+    zero_total = normalize_steps({"summary": {"totalSteps": 0}}, target)
+
+    assert segmented.readings[0].value == 12.0
+    assert segmented.totals is None
+    assert segmented.total_presence == {"totalSteps": "absent"}
+    assert null_total.totals is None
+    assert null_total.total_presence == {"totalSteps": "null"}
+    assert zero_total.totals == {"totalSteps": 0.0}
+    assert zero_total.total_presence == {"totalSteps": "present"}
 
 
 def test_floors_and_intensity_keep_distinct_semantics() -> None:

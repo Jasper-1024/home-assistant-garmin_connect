@@ -320,9 +320,21 @@ async def test_list_shaped_numeric_payloads_write_samples_and_presence() -> None
     assert archive.get_history_presence(target, target)[target.isoformat()] == {
         "body_battery": "present",
         "steps": "present",
+        "steps:totalSteps": "absent",
         "floors": "present",
+        "floors:floorsAscended": "absent",
+        "floors:floorsDescended": "absent",
+        "floors:floorsAscendedInMeters": "absent",
+        "floors:floorsDescendedInMeters": "absent",
+        "floors:totalFloors": "absent",
         "intensity_moderate": "present",
+        "intensity_moderate:moderateIntensityMinutes": "absent",
+        "intensity_moderate:vigorousIntensityMinutes": "absent",
+        "intensity_moderate:totalIntensityMinutes": "absent",
         "intensity_vigorous": "present",
+        "intensity_vigorous:moderateIntensityMinutes": "absent",
+        "intensity_vigorous:vigorousIntensityMinutes": "absent",
+        "intensity_vigorous:totalIntensityMinutes": "absent",
     }
     written = {
         call.args[1].key: call.args[2][0].value
@@ -379,6 +391,33 @@ async def test_top_level_heart_rate_and_stress_lists_persist_samples_and_presenc
     }
     assert written["heart_rate"] == 61.0
     assert written["stress"] == 14.0
+
+
+@pytest.mark.asyncio
+async def test_null_intraday_payloads_checkpoint_presence_without_samples() -> None:
+    target = date(2026, 1, 1)
+    client = MagicMock()
+    client._base_url = "https://garmin.example"
+    client.get_user_profile = AsyncMock(return_value=SimpleNamespace(display_name="user"))
+    client._get_user_summary_raw = AsyncMock(return_value={})
+    client.get_training_status = AsyncMock(return_value={})
+    client._get_sleep_data_raw = AsyncMock(return_value=None)
+    client._get_hrv_data_raw = AsyncMock(return_value=None)
+    client.get_activities = AsyncMock(return_value=[])
+    client._request = AsyncMock(return_value=None)
+    source = GarminHistorySource(client, _ImmediateGate())
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    store = _Store()
+    archive = _sync_archive(source, recorder, store)
+    await archive.async_start()
+
+    report = await archive.async_sync_range(target, target)
+
+    assert report.outcome == "written"
+    assert archive.get_history_presence(target, target)[target.isoformat()]["heart_rate"] == "null"
+    assert archive.get_history_presence(target, target)[target.isoformat()]["stress"] == "null"
+    assert store.data["completed_dates"] == [target.isoformat()]
 
 
 @pytest.mark.asyncio
@@ -695,6 +734,36 @@ async def test_segmented_daily_totals_write_separate_statistic():
     statistic_ids = [call.args[0] for call in recorder.async_write.await_args_list]
     assert any(statistic_id.endswith(":steps") for statistic_id in statistic_ids)
     assert any(statistic_id.endswith(":steps_daily_total") for statistic_id in statistic_ids)
+
+
+@pytest.mark.asyncio
+async def test_segmented_total_presence_distinguishes_absent_null_and_zero() -> None:
+    dates = {
+        date(2026, 1, 1): normalize_steps({"summary": {}}, date(2026, 1, 1)),
+        date(2026, 1, 2): normalize_steps({"summary": {"totalSteps": None}}, date(2026, 1, 2)),
+        date(2026, 1, 3): normalize_steps({"summary": {"totalSteps": 0}}, date(2026, 1, 3)),
+    }
+
+    class Source:
+        async def async_fetch_details(self, target_date, metric):
+            if metric == "steps":
+                return dates[target_date]
+            return ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    store = _Store()
+    archive = _sync_archive(Source(), recorder, store)
+    await archive.async_start()
+
+    report = await archive.async_sync_range(date(2026, 1, 1), date(2026, 1, 3))
+
+    assert report.outcome == "written"
+    presence = archive.get_history_presence(date(2026, 1, 1), date(2026, 1, 3))
+    assert presence["2026-01-01"]["steps:totalSteps"] == "absent"
+    assert presence["2026-01-02"]["steps:totalSteps"] == "null"
+    assert presence["2026-01-03"]["steps:totalSteps"] == "present"
+    assert [call.args[1].key for call in recorder.async_write.await_args_list].count("steps_daily_total") == 1
 
 
 @pytest.mark.asyncio

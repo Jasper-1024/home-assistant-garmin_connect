@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -60,6 +60,7 @@ class SegmentedData:
     readings: tuple[NormalizedSample, ...]
     totals: dict[str, float] | None = None
     presence: str = "present"
+    total_presence: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,7 +154,9 @@ def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedAct
         start_raw = item.get("startTime", item.get("startTimeGMT", item.get("startTimeLocal")))
         activity_id = item.get("activityId", item.get("activityUUID"))
         end_raw = item.get("endTimeGMT", item.get("endTime"))
-        duration_raw = item.get("durationInSeconds", item.get("duration"))
+        duration_raw = _first_non_null(item, ("durationInSeconds", "duration"))
+        if duration_raw is _MISSING:
+            duration_raw = None
         if not isinstance(activity_type, str) or len(activity_type) > 64 or not isinstance(activity_id, (str, int)) or not isinstance(start_raw, (str, int, float)) or (end_raw is None and duration_raw is None):
             raise HistorySchemaError("activity identity has invalid type")
         start = _timestamp(start_raw)
@@ -161,7 +164,9 @@ def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedAct
             raise HistorySchemaError("activity timestamp is invalid")
         end = _timestamp(item.get("endTimeGMT", item.get("endTime"))) if item.get("endTimeGMT", item.get("endTime")) is not None else None
         def numeric(item_data: dict[str, Any], *names: str) -> float | None:
-            value = next((item_data[name] for name in names if name in item_data), None)
+            value = _first_non_null(item_data, names)
+            if value is _MISSING:
+                return None
             if value is None:
                 return None
             if isinstance(value, bool) or not isinstance(value, int | float):
@@ -468,7 +473,7 @@ def _object_series(
         if not isinstance(point, dict):
             raise HistorySchemaError("segmented point is not an object")
         raw_time = next((point[key] for key in ("timestamp", "time", "startTime", "start", "readingTime", "readingTimeGMT") if key in point), _MISSING)
-        raw_value = next((point[key] for key in value_keys if key in point), _MISSING)
+        raw_value = _first_non_null(point, value_keys)
         if raw_time is _MISSING or raw_value is _MISSING:
             raise HistorySchemaError("segmented point lacks required fields")
         if raw_time is None or raw_value is None:
@@ -505,6 +510,19 @@ def _nested_value(payload: Any, aliases: tuple[str, ...], depth: int = 0) -> tup
             if null_value is None and found is not None:
                 null_value = found
     return null_value
+
+
+def _first_non_null(mapping: Mapping[str, Any], aliases: tuple[str, ...]) -> Any:
+    """Select the first available alias whose value is not null."""
+    null_found = False
+    for alias in aliases:
+        if alias not in mapping:
+            continue
+        value = mapping[alias]
+        if value is not None:
+            return value
+        null_found = True
+    return None if null_found else _MISSING
 
 
 def _classify_source_array(payload: Any, aliases: tuple[str, ...]) -> tuple[str, Any, str | None]:
@@ -620,8 +638,11 @@ def normalize_spo2(payload: Any, target_date: date, variant: str) -> SourceSerie
     return _normalize_source_series(payload, target_date, *configs[variant], ("spO2ValueDescriptors", "spO2ValueDescriptorsDTOList"))
 
 
-def _totals(payload: Any, keys: tuple[str, ...]) -> dict[str, float] | None:
+def _total_values(
+    payload: Any, keys: tuple[str, ...]
+) -> tuple[dict[str, float], dict[str, str]]:
     result: dict[str, float] = {}
+    states = dict.fromkeys(keys, "absent")
     key_set = set(keys)
 
     def visit(value: Any, depth: int) -> None:
@@ -631,45 +652,64 @@ def _totals(payload: Any, keys: tuple[str, ...]) -> dict[str, float] | None:
             for name, item in value.items():
                 if name in key_set:
                     if item is None:
+                        if states[name] != "present":
+                            states[name] = "null"
                         continue
                     if isinstance(item, bool) or not isinstance(item, int | float):
                         raise HistorySchemaError("daily total has an invalid type")
                     result[name] = float(item)
-                elif name in {"report", "summary", "data", "daily", "totals", "metrics"}:
+                    states[name] = "present"
+                elif name in {"report", "summary", "data", "daily", "totals", "metrics"} and isinstance(item, dict):
+                    # Intraday point arrays are source readings, never daily totals.
                     visit(item, depth + 1)
-        elif isinstance(value, list):
-            for item in value[:32]:
-                visit(item, depth + 1)
 
     visit(payload, 0)
-    return result or None
+    return result, states
+
+
+def _totals(payload: Any, keys: tuple[str, ...]) -> dict[str, float] | None:
+    return _total_values(payload, keys)[0] or None
+
+
+def _total_presence(payload: Any, keys: tuple[str, ...]) -> dict[str, str]:
+    return _total_values(payload, keys)[1]
+
+
+def _segmented_totals(
+    payload: Any, keys: tuple[str, ...]
+) -> tuple[dict[str, float] | None, dict[str, str]]:
+    values, states = _total_values(payload, keys)
+    return values or None, states
 
 
 def normalize_steps(payload: Any, target_date: date) -> SegmentedData:
     presence = _array_presence(payload, ("stepsValues", "stepsValuesArray", "chartData", "data"))
+    totals, total_presence = _segmented_totals(payload, ("totalSteps",))
     if presence != "present":
-        return SegmentedData((), _totals(payload, ("totalSteps", "steps")), presence)
+        return SegmentedData((), totals, presence, total_presence)
     readings = _descriptor_segment(payload, target_date, ("stepsValues", "stepsValuesArray", "chartData", "data"), ("steps", "stepCount", "value"), ("stepsValueDescriptors", "stepsValueDescriptorsDTOList", "stepsValueDescriptorDTOList"))
-    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, ("steps", "stepCount", "value"), ("steps", "stepsValues", "stepsValuesArray", "chartData", "data")), _totals(payload, ("totalSteps", "steps")), presence)
+    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, ("steps", "stepCount", "value"), ("steps", "stepsValues", "stepsValuesArray", "chartData", "data")), totals, presence, total_presence)
 
 
 def normalize_floors(payload: Any, target_date: date) -> SegmentedData:
     presence = _array_presence(payload, ("floorsValues", "floorsValuesArray", "chartData", "data"))
+    totals, total_presence = _segmented_totals(payload, ("floorsAscended", "floorsDescended", "floorsAscendedInMeters", "floorsDescendedInMeters", "totalFloors"))
     if presence != "present":
-        return SegmentedData((), _totals(payload, ("floorsAscended", "floorsDescended", "floorsAscendedInMeters", "floorsDescendedInMeters", "totalFloors")), presence)
+        return SegmentedData((), totals, presence, total_presence)
     readings = _descriptor_segment(payload, target_date, ("floorsValues", "floorsValuesArray", "chartData", "data"), ("floors", "floorCount", "value"), ("floorsValueDescriptors", "floorsValueDescriptorsDTOList", "floorsValueDescriptorDTOList"))
-    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, ("floors", "floorCount", "value"), ("floors", "floorValues", "floorsValuesArray", "chartData", "data")), _totals(payload, ("floorsAscended", "floorsDescended", "floorsAscendedInMeters", "floorsDescendedInMeters", "totalFloors")), presence)
+    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, ("floors", "floorCount", "value"), ("floors", "floorValues", "floorsValuesArray", "chartData", "data")), totals, presence, total_presence)
 
 
 def normalize_intensity(payload: Any, target_date: date, kind: str) -> SegmentedData:
     if kind not in {"moderate", "vigorous"}:
         raise ValueError("unsupported intensity kind")
     presence = _array_presence(payload, ("intensityValues", "intensityValuesArray", "chartData", "data"))
+    totals, total_presence = _segmented_totals(payload, ("moderateIntensityMinutes", "vigorousIntensityMinutes", "totalIntensityMinutes"))
     if presence != "present":
-        return SegmentedData((), _totals(payload, ("moderateIntensityMinutes", "vigorousIntensityMinutes", "totalIntensityMinutes")), presence)
+        return SegmentedData((), totals, presence, total_presence)
     keys = (f"{kind}IntensityMinutes", f"{kind}Minutes", "value")
     readings = _descriptor_segment(payload, target_date, ("intensityValues", "intensityValuesArray", "chartData", "data"), keys, ("intensityValueDescriptors", "intensityValueDescriptorsDTOList", "intensityValueDescriptorDTOList"))
-    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, keys, (f"{kind}IntensityMinutes", f"{kind}Minutes", "intensityMinutes", "chartData", "data")), _totals(payload, ("moderateIntensityMinutes", "vigorousIntensityMinutes", "totalIntensityMinutes")), presence)
+    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, keys, (f"{kind}IntensityMinutes", f"{kind}Minutes", "intensityMinutes", "chartData", "data")), totals, presence, total_presence)
 
 
 def _descriptor_segment(payload: Any, target_date: date, values_keys: tuple[str, ...], value_keys: tuple[str, ...], descriptor_keys: tuple[str, ...]) -> tuple[NormalizedSample, ...] | None:
@@ -772,7 +812,7 @@ def parse_hrv_data(payload: Any, target_date: date) -> HRVData:
         if not isinstance(reading, dict):
             raise HistorySchemaError("HRV reading is not an object")
         raw_time = next((reading[key] for key in ("readingTimeGMT", "readingTimeGmt", "readingTime") if key in reading), _MISSING)
-        raw_value = next((reading[key] for key in ("hrvValue", "value") if key in reading), _MISSING)
+        raw_value = _first_non_null(reading, ("hrvValue", "value"))
         if raw_time is _MISSING or raw_value is _MISSING:
             raise HistorySchemaError("HRV reading lacks required fields")
         if raw_time is not None and not isinstance(raw_time, str | int | float):
@@ -936,9 +976,9 @@ class GarminHistorySource:
             return tuple(activity for activity in normalize_activities(payload, target_date) if activity.calendar_date == target_date)
         if metric in {"health_events_daily", "health_events_body_battery"}:
             return normalize_health_events(payload, target_date)
-        if not isinstance(payload, (dict, list)):
-            return ()
         if metric == "heart_rate":
+            if isinstance(payload, (int, float, bool)):
+                raise HistorySchemaError("heart-rate payload has invalid type")
             return _normalize_source_series(
                 payload,
                 target_date,
