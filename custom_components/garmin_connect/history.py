@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 import logging
+import os
 import secrets
 from collections.abc import Callable, Collection, Iterator, Mapping
 from dataclasses import dataclass, field, fields, is_dataclass, replace
@@ -1038,6 +1039,54 @@ class GarminHistoryArchive:
     def _fit_directory(self) -> Path:
         """Return this account's private FIT directory."""
         return self._fit_base_directory() / self._account_key()
+
+    def _fit_path_for_record(self, path_name: str) -> Path | None:
+        """Return an account-owned FIT, migrating an indexed legacy file once.
+
+        The old layout put files directly in the shared FIT root.  A file is
+        eligible for migration only when the caller has already validated a
+        FIT record from this account's annual partition.  Unindexed files are
+        deliberately left untouched because their account ownership cannot be
+        proven.
+        """
+        account_directory = ensure_private_fit_directory(
+            self._fit_directory(), create=False
+        )
+        if account_directory is not None:
+            account_path = account_directory / path_name
+            if os.path.lexists(account_path):
+                return account_path
+
+        legacy_directory = ensure_private_fit_directory(
+            self._fit_base_directory(), create=False
+        )
+        if legacy_directory is None:
+            return None
+        legacy_path = legacy_directory / path_name
+        validate_private_fit_file(legacy_path)
+
+        if account_directory is None:
+            account_directory = ensure_private_fit_directory(
+                self._fit_directory(), create=True
+            )
+        if account_directory is None:
+            return None
+        account_path = account_directory / path_name
+        if os.path.lexists(account_path):
+            validate_private_fit_file(account_path)
+            return account_path
+
+        os.replace(legacy_path, account_path)
+        validate_private_fit_file(account_path)
+        for directory in (legacy_directory, account_directory):
+            directory_fd = os.open(
+                directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        return account_path
 
     @property
     def hrv_summaries(self) -> Mapping[str, Mapping[str, Any]]:
@@ -2252,6 +2301,14 @@ class GarminHistoryArchive:
                         "end": activity.end.isoformat() if activity.end else None, "duration_seconds": activity.duration_seconds,
                         "training_effect": activity.training_effect, "load": activity.load, "recovery": activity.recovery,
                     }
+                    queued = self._fit_queue.get(activity.logical_id)
+                    if queued is not None:
+                        self._fit_queue[activity.logical_id] = _fit_queue_entry(
+                            activity.logical_id,
+                            activity.activity_id,
+                            year,
+                            activity.calendar_date,
+                        )
                     if (
                         callable(getattr(client, "download_activity", None))
                         and activity.activity_id.isdecimal()
@@ -3360,15 +3417,14 @@ class GarminHistoryArchive:
             invalid_fit_records["__schema__"] = repr(raw_fits)[:256]
             raw_fits = {}
         try:
-            directory = ensure_private_fit_directory(self._fit_directory(), create=False)
             for key, value in raw_fits.items():
                 try:
                     restored_fit = fit_record(value)
                     if restored_fit["logical_id"] != key or key not in activities:
                         raise FitArchiveError("FIT activity association is invalid")
-                    if directory is None:
+                    fit_path = self._fit_path_for_record(restored_fit["path"])
+                    if fit_path is None:
                         raise FitArchiveError("FIT account directory is unavailable")
-                    fit_path = directory / restored_fit["path"]
                     validate_private_fit_file(fit_path)
                     inspected = await asyncio.to_thread(inspect_fit, fit_path, 0o600)
                     parsed_fits[key] = fit_record(

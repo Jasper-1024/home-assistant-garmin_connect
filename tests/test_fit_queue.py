@@ -117,6 +117,23 @@ def _activity():
     )[0]
 
 
+def _activity_record(activity) -> dict:
+    return {
+        "logical_id": activity.logical_id,
+        "activity_id": activity.activity_id,
+        "revision": activity.revision,
+        "calendar_date": activity.calendar_date.isoformat(),
+        "activity_type": activity.activity_type,
+        "name": activity.name,
+        "start": activity.start.isoformat(),
+        "end": activity.end.isoformat() if activity.end else None,
+        "duration_seconds": activity.duration_seconds,
+        "training_effect": activity.training_effect,
+        "load": activity.load,
+        "recovery": activity.recovery,
+    }
+
+
 @pytest.mark.asyncio
 async def test_activity_discovery_deduplicates_durable_fit_work_without_download():
     activity = _activity()
@@ -139,15 +156,189 @@ async def test_activity_discovery_deduplicates_durable_fit_work_without_download
 
     assert first.outcome == "written"
     assert second.outcome == "written"
+    assert first.fit_count == 0
+    assert second.fit_count == 0
     client.download_activity.assert_not_awaited()
-    assert store.data["fit_queue"] == [
+
+
+@pytest.mark.asyncio
+async def test_legacy_shared_fit_is_migrated_only_for_indexed_account_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    activity = _activity()
+    account_key = "opaque-account-key-1234567890"
+    fit_root = tmp_path / "fit"
+    fit_root.mkdir(mode=0o700)
+    legacy_path = fit_root / fit_file_name(activity.logical_id)
+    legacy_path.write_bytes(b"legacy FIT")
+    legacy_path.chmod(0o600)
+    unowned_path = fit_root / fit_file_name("a" * 24)
+    unowned_path.write_bytes(b"unowned legacy FIT")
+    unowned_path.chmod(0o600)
+    summary = _fit_summary()
+    catalog = _Store(
         {
-            "logical_id": activity.logical_id,
-            "activity_id": activity.activity_id,
-            "year": "2026",
-            "calendar_date": "2026-08-01",
+            "schema_version": 1,
+            "account_key": account_key,
+            "completed_dates": [],
+            "sleep_index": {"2026": [activity.logical_id]},
+            "event_index": {},
+            "activity_index": {"2026": [activity.logical_id]},
+            "fit_queue": [],
+            "fit_queue_quarantine": [],
+            "fit_queue_error": None,
+            "fit_last_eligible_download": None,
         }
+    )
+    partition = _Store(
+        {
+            "schema_version": 1,
+            "sleep_schema_version": 1,
+            "account_key": account_key,
+            "year": "2026",
+            "sessions": {},
+            "events": {},
+            "activities": {activity.logical_id: _activity_record(activity)},
+            "fits": {
+                activity.logical_id: {
+                    "logical_id": activity.logical_id,
+                    "path": legacy_path.name,
+                    "summary": summary,
+                }
+            },
+        }
+    )
+    stores = {
+        "garmin_connect.entry-1.history_catalog": catalog,
+        "garmin_connect.entry-1.sleep_2026": partition,
+    }
+    monkeypatch.setattr(
+        history_module,
+        "inspect_fit",
+        lambda _path, _mode: {
+            **summary,
+            "file": {"integrity_ok": True, "decode_ok": True},
+        },
+    )
+    archive = _archive(
+        MagicMock(),
+        MagicMock(),
+        catalog,
+        account_key=account_key,
+        stores=stores,
+    )
+    archive._hass.config.path.return_value = str(fit_root)
+
+    await archive.async_start()
+
+    migrated_path = fit_root / account_key / legacy_path.name
+    assert migrated_path.is_file()
+    assert migrated_path.stat().st_mode & 0o777 == 0o600
+    assert not legacy_path.exists()
+    assert unowned_path.is_file()
+    events = await archive.async_get_calendar_events(
+        "activity", activity.calendar_date, activity.calendar_date
+    )
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_fit_follows_cross_year_source_calendar_correction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    first_activity = normalize_activities(
+        [
+            {
+                "activityId": 123,
+                "activityType": "running",
+                "startTime": "2026-12-31T23:00:00Z",
+                "startTimeLocal": "2026-12-31T23:00:00+00:00",
+                "durationInSeconds": 60,
+            }
+        ],
+        date(2026, 12, 31),
+    )[0]
+    corrected_activity = normalize_activities(
+        [
+            {
+                "activityId": 123,
+                "activityType": "running",
+                "startTime": "2026-12-31T23:00:00Z",
+                "startTimeLocal": "2027-01-01T00:00:00+01:00",
+                "durationInSeconds": 60,
+            }
+        ],
+        date(2027, 1, 1),
+    )[0]
+    assert first_activity.logical_id == corrected_activity.logical_id
+    assert first_activity.calendar_date != corrected_activity.calendar_date
+
+    class Source:
+        current = first_activity
+
+        async def async_fetch(self, _target, _metric):
+            return ()
+
+        async def async_fetch_details(self, _target, metric):
+            return (self.current,) if metric == "timed_activities" else ()
+
+    async def archive_fit(**kwargs):
+        if len(attempted_paths) == 0:
+            attempted_paths.append(Path(kwargs["directory"]))
+            raise FitArchiveError("temporary FIT failure")
+        attempted_paths.append(Path(kwargs["directory"]))
+        directory = Path(kwargs["directory"])
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / fit_file_name(kwargs["logical_id"])
+        path.write_bytes(b"corrected FIT")
+        path.chmod(0o600)
+        return {
+            "logical_id": kwargs["logical_id"],
+            "path": path.name,
+            "summary": _fit_summary(),
+        }
+
+    attempted_paths: list[Path] = []
+    monkeypatch.setattr(history_module, "async_archive_fit", archive_fit)
+    now = [datetime(2026, 12, 31, 23, 30, tzinfo=UTC)]
+    store = _Store()
+    archive = _archive(
+        Source(),
+        MagicMock(),
+        store,
+        clock=lambda: now[0],
+    )
+    archive._hass.config.path.return_value = str(tmp_path / "fit")
+    await archive.async_start()
+
+    first_report = await archive.async_sync_range(
+        first_activity.calendar_date, first_activity.calendar_date
+    )
+    assert first_report.fit_count == 0
+
+    Source.current = corrected_activity
+    now[0] += timedelta(hours=1)
+    corrected_report = await archive.async_sync_range(
+        corrected_activity.calendar_date, corrected_activity.calendar_date
+    )
+
+    assert corrected_report.fit_count == 1
+    assert attempted_paths == [
+        tmp_path / "fit" / "opaque-account-key-1234567890",
+        tmp_path / "fit" / "opaque-account-key-1234567890",
     ]
+    fit_path = (
+        tmp_path
+        / "fit"
+        / "opaque-account-key-1234567890"
+        / fit_file_name(corrected_activity.logical_id)
+    )
+    assert fit_path.is_file()
+    assert len(
+        await archive.async_get_calendar_events(
+            "activity", corrected_activity.calendar_date, corrected_activity.calendar_date
+        )
+    ) == 1
 
 
 @pytest.mark.asyncio
@@ -228,9 +419,18 @@ async def test_malformed_fit_queue_is_quarantined_without_touching_activity_cata
         "activity", activity.calendar_date, activity.calendar_date
     )
     assert len(events) == 1
-    assert store.data["fit_queue"] == [queue_item]
-    assert len(store.data["fit_queue_quarantine"]) == 3
-    assert store.data["fit_queue_error"] == "fit_queue_schema"
+    restarted = _archive(
+        MagicMock(),
+        MagicMock(),
+        store,
+        account_key=account_key,
+        stores=stores,
+    )
+    await restarted.async_start()
+    events_after_restart = await restarted.async_get_calendar_events(
+        "activity", activity.calendar_date, activity.calendar_date
+    )
+    assert len(events_after_restart) == 1
 
 
 @pytest.mark.asyncio
@@ -294,22 +494,30 @@ async def test_fit_queue_paces_downloads_and_recovers_pending_work_after_restart
     archive._hass.config.path.return_value = str(tmp_path / "fit")
     await archive.async_start()
 
-    await archive.async_sync_range(date(2026, 8, 1), date(2026, 8, 1))
+    first_report = await archive.async_sync_range(
+        date(2026, 8, 1), date(2026, 8, 1)
+    )
     assert archive_fit.await_count == 1
-    assert len(store.data["fit_queue"]) == 1
-    assert store.data["fit_last_eligible_download"] == "2026-08-01T13:00:00+00:00"
+    assert first_report.fit_count == 1
+    assert len(tuple((tmp_path / "fit" / "opaque-account-key-1234567890").glob("*.fit"))) == 1
 
-    await archive.async_sync_range(date(2026, 8, 1), date(2026, 8, 1))
+    second_report = await archive.async_sync_range(
+        date(2026, 8, 1), date(2026, 8, 1)
+    )
     assert archive_fit.await_count == 1
+    assert second_report.fit_count == 0
 
     restarted = _archive(Source(), client, store, clock=lambda: now[0], stores=stores)
     restarted._hass.config.path.return_value = str(tmp_path / "fit")
     await restarted.async_start()
     now[0] += timedelta(hours=1)
-    await restarted.async_sync_range(date(2026, 8, 1), date(2026, 8, 1))
+    restarted_report = await restarted.async_sync_range(
+        date(2026, 8, 1), date(2026, 8, 1)
+    )
 
     assert archive_fit.await_count == 2
-    assert store.data["fit_queue"] == []
+    assert restarted_report.fit_count == 1
+    assert len(tuple((tmp_path / "fit" / "opaque-account-key-1234567890").glob("*.fit"))) == 2
 
 
 @pytest.mark.asyncio
@@ -345,9 +553,11 @@ async def test_fit_failure_keeps_structured_activity_and_pending_work(
 
     assert report.outcome == "written", report
     assert archive.status.state.value == "disabled"
-    assert store.data["fit_queue"]
-    assert store.data["fit_queue_error"] == "fit_archive_failed"
-    assert store.data["activity_index"]["2026"] == [activity.logical_id]
+    assert report.fit_count == 0
+    events = await archive.async_get_calendar_events(
+        "activity", activity.calendar_date, activity.calendar_date
+    )
+    assert len(events) == 1
 
 
 @pytest.mark.asyncio
@@ -390,7 +600,10 @@ async def test_valid_local_fit_completes_queue_without_download(
     await archive.async_sync_range(activity.calendar_date, activity.calendar_date)
 
     client.download_activity.assert_not_awaited()
-    assert store.data["fit_queue"] == []
+    events = await archive.async_get_calendar_events(
+        "activity", activity.calendar_date, activity.calendar_date
+    )
+    assert len(events) == 1
 
 
 @pytest.mark.asyncio
@@ -460,23 +673,33 @@ async def test_manual_repair_processes_fit_when_archive_is_disabled(
     client = MagicMock()
     client.download_activity = AsyncMock()
     store = _Store()
-    archive_fit = AsyncMock(
-        return_value={
-            "logical_id": activity.logical_id,
-            "path": fit_file_name(activity.logical_id),
+    async def archive_one(**kwargs):
+        directory = Path(kwargs["directory"])
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / fit_file_name(kwargs["logical_id"])
+        path.write_bytes(b"manual FIT")
+        path.chmod(0o600)
+        return {
+            "logical_id": kwargs["logical_id"],
+            "path": path.name,
             "summary": _fit_summary(),
         }
-    )
+
+    archive_fit = AsyncMock(side_effect=archive_one)
     monkeypatch.setattr(history_module, "async_archive_fit", archive_fit)
     archive = _archive(Source(), client, store)
     await archive.async_start()
 
     report = await archive.async_sync_range(activity.calendar_date, activity.calendar_date)
 
-    archive_fit.assert_awaited_once()
     assert report.outcome == "written"
+    assert report.fit_count == 1
     assert archive.archive_enabled is False
-    assert store.data["fit_queue"] == []
+    assert (
+        Path(archive._hass.config.path.return_value)
+        / "opaque-account-key-1234567890"
+        / fit_file_name(activity.logical_id)
+    ).is_file()
 
 
 @pytest.mark.asyncio
@@ -500,19 +723,34 @@ async def test_cancelled_fit_attempt_persists_pacing_and_pending_work(
         "async_archive_fit",
         AsyncMock(side_effect=asyncio.CancelledError),
     )
+    now = [datetime(2026, 8, 1, 13, tzinfo=UTC)]
     archive = _archive(
         Source(),
         client,
         store,
-        clock=lambda: datetime(2026, 8, 1, 13, tzinfo=UTC),
+        clock=lambda: now[0],
     )
     await archive.async_start()
 
     with pytest.raises(asyncio.CancelledError):
         await archive.async_sync_range(activity.calendar_date, activity.calendar_date)
 
-    assert store.data["fit_queue"]
-    assert store.data["fit_last_eligible_download"] == "2026-08-01T13:00:00+00:00"
+    now[0] += timedelta(hours=1)
+    monkeypatch.setattr(
+        history_module,
+        "async_archive_fit",
+        AsyncMock(
+            return_value={
+                "logical_id": activity.logical_id,
+                "path": fit_file_name(activity.logical_id),
+                "summary": _fit_summary(),
+            }
+        ),
+    )
+    report = await archive.async_sync_range(
+        activity.calendar_date, activity.calendar_date
+    )
+    assert report.fit_count == 1
 
 
 @pytest.mark.asyncio
@@ -570,11 +808,15 @@ async def test_fit_queue_isolated_by_account_and_background_gate(
         archive._hass.config.path.return_value = str(tmp_path / "fit")
         await archive.async_start()
 
-    await archive_a.async_sync_range(activity.calendar_date, activity.calendar_date)
-    await archive_b.async_sync_range(activity.calendar_date, activity.calendar_date)
+    report_a = await archive_a.async_sync_range(
+        activity.calendar_date, activity.calendar_date
+    )
+    report_b = await archive_b.async_sync_range(
+        activity.calendar_date, activity.calendar_date
+    )
 
-    assert store_a.data["fit_queue"] == []
-    assert store_b.data["fit_queue"] == []
+    assert report_a.fit_count == 1
+    assert report_b.fit_count == 1
     assert gate_a.priorities == [history_module.GarminRequestPriority.BACKGROUND]
     assert gate_b.priorities == [history_module.GarminRequestPriority.BACKGROUND]
     assert (tmp_path / "fit" / "account-a-opaque-key-1234567890").is_dir()
