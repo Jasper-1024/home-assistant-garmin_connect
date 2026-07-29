@@ -18,6 +18,15 @@ class HistoryCalendarEvent:
     summary: str
 
 
+def _normalize_interval(
+    start: datetime, end: datetime
+) -> tuple[datetime, datetime] | None:
+    """Reject reversed intervals and project zero-length intervals positively."""
+    if end < start:
+        return None
+    return start, end if end > start else start + timedelta(seconds=1)
+
+
 def project_activity_interval(
     record: Mapping[str, Any],
 ) -> tuple[datetime, datetime] | None:
@@ -34,9 +43,9 @@ def project_activity_interval(
             and duration >= 0
         ):
             end = start + timedelta(seconds=max(duration, 1.0))
-    if end is None or end < start:
+    if end is None:
         return None
-    return start, end if end > start else start + timedelta(seconds=1)
+    return _normalize_interval(start, end)
 
 
 def project_health_interval(
@@ -59,9 +68,9 @@ def project_health_interval(
     else:
         start = start or occurrence or end
         end = end or occurrence or start
-    if start is None or end is None or end < start:
+    if start is None or end is None:
         return None
-    return start, end if end > start else start + timedelta(seconds=1)
+    return _normalize_interval(start, end)
 
 
 def add_structured_calendar_event(

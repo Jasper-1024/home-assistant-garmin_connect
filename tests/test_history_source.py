@@ -153,7 +153,7 @@ def test_activity_and_health_timestamp_aliases_keep_priority_and_timezone_rules(
     assert health.occurrence == datetime(2026, 7, 24, 2, 30, tzinfo=UTC)
 
 
-def test_timestamp_aliases_skip_unparseable_values_before_valid_aliases() -> None:
+def test_activity_timestamp_aliases_skip_unparseable_values_before_valid_aliases() -> None:
     activity = normalize_activities(
         [{
             "activityId": 2,
@@ -165,18 +165,21 @@ def test_timestamp_aliases_skip_unparseable_values_before_valid_aliases() -> Non
         }],
         date(2026, 7, 24),
     )[0]
-    health = normalize_health_events(
-        {"events": [{
-            "startTime": "not-a-timestamp",
-            "startTimeGMT": "2026-07-24T02:00:00.000",
-            "endTime": "also-not-a-timestamp",
-            "endTimeGMT": "2026-07-24T03:00:00.000",
-        }]},
-        date(2026, 7, 24),
-    )[0]
+    assert activity.start == datetime(2026, 7, 24, 2, tzinfo=UTC)
+    assert activity.end == datetime(2026, 7, 24, 3, tzinfo=UTC)
 
-    assert activity.start == health.start == datetime(2026, 7, 24, 2, tzinfo=UTC)
-    assert activity.end == health.end == datetime(2026, 7, 24, 3, tzinfo=UTC)
+
+@pytest.mark.parametrize("field", ["startTime", "endTime", "occurrenceTime"])
+def test_health_event_rejects_non_empty_malformed_timestamp(field: str) -> None:
+    with pytest.raises(HistorySchemaError):
+        normalize_health_events(
+            {"events": [{field: "not-a-timestamp"}]}, date(2026, 7, 24)
+        )
+
+
+@pytest.mark.parametrize("event", [{}, {"startTime": None}, {"startTime": ""}])
+def test_health_event_allows_missing_null_and_empty_timestamp(event: dict[str, object]) -> None:
+    assert normalize_health_events({"events": [event]}, date(2026, 7, 24)) == ()
 
 
 def test_activity_normalization_rejects_reversed_source_interval() -> None:

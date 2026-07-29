@@ -1105,13 +1105,16 @@ class GarminHistoryArchive:
                             invalid_sleep_streams.add((session.logical_id, stream.metric))
                             failed_families.add("sleep_stream")
                             failed_family_error = "sleep_stream_invalid"
+                invalid_sleep_sessions = {
+                    session_id for session_id, _metric in invalid_sleep_streams
+                }
                 for session in sleep_details:
+                    if session.logical_id in invalid_sleep_sessions:
+                        continue
                     year = str(session.start.year)
                     structured_dirty_years.add(year)
                     sleep_sessions.setdefault(year, {})[session.logical_id] = session_record(session)
                     for stream in session.streams:
-                        if (session.logical_id, stream.metric) in invalid_sleep_streams:
-                            continue
                         metadata_for_stream = _SLEEP_STREAM_METADATA.get(stream.metric)
                         if metadata_for_stream is None:
                             raise SleepSchemaError("sleep stream metric is unsupported")

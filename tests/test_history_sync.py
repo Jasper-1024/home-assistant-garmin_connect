@@ -873,6 +873,60 @@ async def test_negative_sleep_stream_value_fails_the_date_without_silent_filteri
 
 
 @pytest.mark.asyncio
+async def test_invalid_sleep_session_is_excluded_from_store_and_presence() -> None:
+    target = date(2026, 7, 24)
+    session = parse_sleep_sessions(
+        {
+            "startTime": "2026-07-24T23:45:00Z",
+            "endTime": "2026-07-25T07:15:00Z",
+            "sleepHeartRate": [["2026-07-25T00:00:00Z", -2]],
+            "sleepRespiration": [["2026-07-25T00:01:00Z", 14]],
+        },
+        target,
+    )[0]
+    health_event = normalize_health_events(
+        {
+            "events": [
+                {
+                    "type": "abnormalHeartRate",
+                    "category": "health",
+                    "occurrenceTime": "2026-07-24T01:00:00Z",
+                }
+            ]
+        },
+        target,
+    )[0]
+
+    class Source:
+        async def async_fetch_details(self, _target: date, metric: str) -> object:
+            if metric == "sleep_sessions":
+                return (session,)
+            if metric == "health_events_daily":
+                return (health_event,)
+            return ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    stores: dict[str, _NamedStore] = {}
+    archive = _partition_archive(Source(), recorder, stores)
+    await archive.async_start()
+
+    report = await archive.async_sync_range(target, target)
+
+    assert report.outcome == "failed"
+    assert report.error_type == "sleep_stream_invalid"
+    partition = stores["garmin_connect.e.sleep_2026"].data
+    assert partition["sessions"] == {}
+    assert health_event.logical_id in partition["events"]
+    assert not any(
+        key.startswith("sleep_stream:")
+        for key in stores["garmin_connect.e.history_catalog"].data["presence"][
+            target.isoformat()
+        ]
+    )
+
+
+@pytest.mark.asyncio
 async def test_many_sleep_sessions_keep_stream_presence_in_annual_partition() -> None:
     target = date(2026, 7, 24)
     sessions_payload = {

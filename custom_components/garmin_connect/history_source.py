@@ -258,13 +258,11 @@ def health_event_from_record(record: Mapping[str, Any]) -> NormalizedHealthEvent
     try:
         calendar_date = date.fromisoformat(record["calendar_date"])
         values = {
-            key: (_timestamp(record[key]) if record.get(key) is not None else None)
+            key: _timestamp_from_aliases(record, (key,), reject_malformed=True)[1]
             for key in ("start", "end", "occurrence")
         }
     except (KeyError, TypeError, ValueError) as err:
         raise HistorySchemaError("health event record is invalid") from err
-    if any(record.get(key) is not None and values[key] is None for key in values):
-        raise HistorySchemaError("health event record is invalid")
     expected_id, expected_revision = _health_identity_revision(event_type, source, category, values["start"], values["end"], values["occurrence"])
     if logical_id != expected_id or revision != expected_revision:
         raise HistorySchemaError("health event record is inconsistent")
@@ -316,11 +314,16 @@ def normalize_health_events(payload: Any, target_date: date) -> tuple[Normalized
         category = next((event[key] for key in ("category", "eventCategory") if key in event), None)
         if any(value is not None and (not isinstance(value, str) or len(value) > 64) for value in (source, event_type, category)):
             raise HistorySchemaError("health event identity has invalid type")
-        _, start = _timestamp_from_aliases(event, ("startTime", "startTimeGMT", "start"))
-        _, end = _timestamp_from_aliases(event, ("endTime", "endTimeGMT", "end"))
+        _, start = _timestamp_from_aliases(
+            event, ("startTime", "startTimeGMT", "start"), reject_malformed=True
+        )
+        _, end = _timestamp_from_aliases(
+            event, ("endTime", "endTimeGMT", "end"), reject_malformed=True
+        )
         _, occurrence = _timestamp_from_aliases(
             event,
             ("occurrenceTime", "occurrenceTimeGMT", "eventTime", "timestamp", "time"),
+            reject_malformed=True,
         )
         if all(value is None for value in (start, end, occurrence)):
             continue
@@ -425,13 +428,16 @@ def _timestamp_as_utc(value: Any) -> datetime | None:
 
 
 def _timestamp_from_aliases(
-    mapping: Mapping[str, Any], aliases: tuple[str, ...]
+    mapping: Mapping[str, Any],
+    aliases: tuple[str, ...],
+    *,
+    reject_malformed: bool = False,
 ) -> tuple[Any, datetime | None]:
-    """Select the first non-null timestamp alias that parses successfully."""
+    """Select a timestamp alias, optionally failing on non-empty bad values."""
     first_value: Any = _MISSING
     for alias in aliases:
         value = mapping.get(alias)
-        if value is None:
+        if value is None or (isinstance(value, str) and not value):
             continue
         if first_value is _MISSING:
             first_value = value
@@ -442,6 +448,8 @@ def _timestamp_from_aliases(
         )
         if parsed is not None:
             return value, parsed
+        if reject_malformed:
+            raise HistorySchemaError("health event timestamp is invalid")
     return first_value, None
 
 
