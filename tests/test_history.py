@@ -207,6 +207,38 @@ async def test_reenablement_replaces_activation_date_without_starting_backfill()
     assert archive.async_sync_range is not None
 
 
+@pytest.mark.parametrize(
+    "last_enabled",
+    [pytest.param(None, id="marker-missing"), pytest.param(False, id="marker-false")],
+)
+async def test_enablement_preserves_malformed_activation_date(
+    last_enabled: bool | None,
+) -> None:
+    """A malformed boundary is never replaced during a new enablement."""
+    hass = _hass()
+    data = {
+        "history_account_key": "opaque-account-key-1234567890",
+        CONF_ARCHIVE_ACTIVATION_DATE: "not-a-date",
+    }
+    if last_enabled is not None:
+        data[CONF_ARCHIVE_PREVIOUSLY_ENABLED] = last_enabled
+    entry = _entry(data=data)
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
+
+    with patch(
+        "custom_components.garmin_connect.history.dt_util.utcnow",
+        return_value=datetime(2026, 8, 3, 1, 30, tzinfo=UTC),
+    ):
+        archive = _archive(hass, entry, checker)
+        await archive.async_start()
+
+    persisted = hass.config_entries.async_update_entry.call_args.kwargs["data"]
+    assert persisted[CONF_ARCHIVE_ACTIVATION_DATE] == "not-a-date"
+    assert archive.status.state is HistoryArchiveState.FAILED
+    assert archive.status.error_type == "activation_date_invalid"
+
+
 @pytest.mark.parametrize("activation_date", [None, "not-a-date"])
 async def test_enabled_archive_fails_closed_for_invalid_persisted_activation_date(
     activation_date: str | None,

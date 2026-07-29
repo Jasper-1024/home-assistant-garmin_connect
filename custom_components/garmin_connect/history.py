@@ -183,6 +183,17 @@ class _InvalidArchiveActivationDateError(ValueError):
     """Raised when enabled archival has no trustworthy persisted boundary."""
 
 
+def _is_valid_archive_activation_date(value: object) -> bool:
+    """Return whether a persisted activation date is canonical ISO format."""
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.isoformat() == value
+
+
 def _persist_archive_enablement_transition(
     hass: HomeAssistant, entry: ConfigEntry
 ) -> dict[str, Any]:
@@ -197,7 +208,15 @@ def _persist_archive_enablement_transition(
     was_enabled = data.get(CONF_ARCHIVE_PREVIOUSLY_ENABLED) is True
 
     if enabled and not was_enabled:
-        data[CONF_ARCHIVE_ACTIVATION_DATE] = dt_util.as_local(dt_util.utcnow()).date().isoformat()
+        # A persisted boundary, even a malformed one, is evidence of prior
+        # state. Preserve it so the enabled path can fail closed below.
+        if (
+            CONF_ARCHIVE_ACTIVATION_DATE not in data
+            or _is_valid_archive_activation_date(data[CONF_ARCHIVE_ACTIVATION_DATE])
+        ):
+            data[CONF_ARCHIVE_ACTIVATION_DATE] = (
+                dt_util.as_local(dt_util.utcnow()).date().isoformat()
+            )
         data[CONF_ARCHIVE_PREVIOUSLY_ENABLED] = True
     elif not enabled and was_enabled:
         data[CONF_ARCHIVE_PREVIOUSLY_ENABLED] = False
