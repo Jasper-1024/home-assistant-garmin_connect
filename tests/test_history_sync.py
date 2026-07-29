@@ -1285,8 +1285,9 @@ async def test_runtime_missing_event_partition_invalidates_and_refetches():
 
 
 @pytest.mark.asyncio
-async def test_timed_activity_archive_and_calendar_excludes_open_interval():
-    activity = normalize_activities([{"activityId": 123, "activityType": "running", "activityName": "Morning Run", "startTime": "2026-07-24T23:30:00+02:00", "endTime": "2026-07-25T00:30:00+02:00", "durationInSeconds": 3600}], date(2026, 7, 24))[0]
+async def test_activity_calendar_derives_end_from_duration_without_changing_source_end():
+    activity = normalize_activities([{"activityId": 123, "activityType": "running", "activityName": "Morning Run", "startTime": "2026-07-24T23:30:00+02:00", "durationInSeconds": 3600}], date(2026, 7, 24))[0]
+    assert activity.end is None
 
     class Source:
         async def async_fetch(self, target, metric):
@@ -1303,7 +1304,56 @@ async def test_timed_activity_archive_and_calendar_excludes_open_interval():
     await archive.async_start()
     await archive.async_sync_range(date(2026, 7, 24), date(2026, 7, 24))
     events = await archive.async_get_calendar_events("activity", date(2026, 7, 24), date(2026, 7, 25))
-    assert len(events) == 1 and events[0].summary == "Morning Run"
+    assert [(event.summary, event.start, event.end) for event in events] == [
+        (
+            "Morning Run",
+            datetime(2026, 7, 24, 21, 30, tzinfo=UTC),
+            datetime(2026, 7, 24, 22, 30, tzinfo=UTC),
+        )
+    ]
+    assert stores["garmin_connect.e.sleep_2026"].data["activities"][activity.logical_id]["end"] is None
+
+
+@pytest.mark.asyncio
+async def test_activity_calendar_uses_persisted_source_calendar_date_across_utc_midnight():
+    activity = normalize_activities(
+        [{
+            "activityId": 124,
+            "activityType": "running",
+            "activityName": "New Year Run",
+            "startTimeLocal": "2026-01-01T00:30:00+02:00",
+            "endTime": "2025-12-31T22:45:00Z",
+        }],
+        date(2026, 1, 1),
+    )[0]
+    assert activity.calendar_date == date(2026, 1, 1)
+    assert activity.start == datetime(2025, 12, 31, 22, 30, tzinfo=UTC)
+
+    class Source:
+        async def async_fetch(self, target, metric):
+            return ()
+
+        async def async_fetch_details(self, target, metric):
+            return (activity,) if metric == "timed_activities" else ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    stores = {"garmin_connect.e.history_catalog": _NamedStore()}
+    archive = _partition_archive(Source(), recorder, stores)
+    await archive.async_start()
+    await archive.async_sync_range(date(2026, 1, 1), date(2026, 1, 1))
+
+    events = await archive.async_get_calendar_events(
+        "activity", date(2026, 1, 1), date(2026, 1, 1)
+    )
+
+    assert [(event.summary, event.start, event.end) for event in events] == [
+        (
+            "New Year Run",
+            datetime(2025, 12, 31, 22, 30, tzinfo=UTC),
+            datetime(2025, 12, 31, 22, 45, tzinfo=UTC),
+        )
+    ]
 
 
 def test_activity_fixture_preserves_training_fields_and_excludes_raw_route() -> None:

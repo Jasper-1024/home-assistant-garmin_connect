@@ -39,8 +39,14 @@ class GarminSleepCalendar(CalendarEntity):
         self, hass: HomeAssistant, start_date: datetime, end_date: datetime
     ) -> list[CalendarEvent]:
         """Return only bounded interval events in the requested date range."""
+        return await self._async_get_events("sleep", start_date, end_date)
+
+    async def _async_get_events(
+        self, calendar: str, start_date: datetime, end_date: datetime
+    ) -> list[CalendarEvent]:
+        """Return source-date candidates that overlap the exact requested interval."""
         events = await self._archive.async_get_calendar_events(
-            "sleep", start_date.date(), end_date.date()
+            calendar, start_date.date(), end_date.date()
         )
         return [
             CalendarEvent(
@@ -49,6 +55,7 @@ class GarminSleepCalendar(CalendarEntity):
                 end=event.end,
             )
             for event in events
+            if event.end > start_date and event.start < end_date
         ]
 
     @property
@@ -67,8 +74,7 @@ class GarminHealthEventsCalendar(GarminSleepCalendar):
         self._attr_unique_id = f"{entry_id}_health_events_calendar"
 
     async def async_get_events(self, hass: HomeAssistant, start_date: datetime, end_date: datetime) -> list[CalendarEvent]:
-        events = await self._archive.async_get_calendar_events("health", start_date.date(), end_date.date())
-        return [CalendarEvent(summary=event.summary, start=event.start, end=event.end) for event in events]
+        return await self._async_get_events("health", start_date, end_date)
 
 
 class GarminActivityCalendar(GarminSleepCalendar):
@@ -81,5 +87,4 @@ class GarminActivityCalendar(GarminSleepCalendar):
         self._attr_unique_id = f"{entry_id}_activity_calendar"
 
     async def async_get_events(self, hass: HomeAssistant, start_date: datetime, end_date: datetime) -> list[CalendarEvent]:
-        events = await self._archive.async_get_calendar_events("activity", start_date.date(), end_date.date())
-        return [CalendarEvent(summary=event.summary, start=event.start, end=event.end) for event in events]
+        return await self._async_get_events("activity", start_date, end_date)

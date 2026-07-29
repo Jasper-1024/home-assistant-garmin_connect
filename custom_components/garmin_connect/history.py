@@ -1746,7 +1746,25 @@ class GarminHistoryArchive:
                 for logical_id, record in records.items():
                     start = datetime.fromisoformat(record["start"])
                     end = datetime.fromisoformat(record["end"]) if record.get("end") else None
-                    if end is not None and start.date() <= end_date and end.date() >= start_date:
+                    if end is None:
+                        duration = record.get("duration_seconds")
+                        if isinstance(duration, int | float) and not isinstance(duration, bool):
+                            end = start + timedelta(seconds=duration)
+                    if end is None:
+                        continue
+                    raw_activity_source_date = record.get("calendar_date")
+                    activity_source_date = (
+                        date.fromisoformat(raw_activity_source_date)
+                        if isinstance(raw_activity_source_date, str)
+                        else None
+                    )
+                    overlaps_range = (
+                        start.date() <= end_date and end.date() >= start_date
+                    )
+                    if (
+                        activity_source_date is not None
+                        and start_date <= activity_source_date <= end_date
+                    ) or overlaps_range:
                         summary = str(record.get("name") or record.get("activity_type") or "Activity")[:64]
                         events[(logical_id, start, end, summary)] = HistoryCalendarEvent(start, end, summary)
             return tuple(sorted(events.values(), key=lambda event: event.start))
