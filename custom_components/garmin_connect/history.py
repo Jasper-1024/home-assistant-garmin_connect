@@ -854,6 +854,7 @@ class GarminHistoryArchive:
                         details = await source.async_fetch(target, metric)
                     if isinstance(details, HRVData):
                         samples = details.readings
+                        presence.setdefault(target_key, {})[metric] = details.presence
                         if details.summary is not None:
                             self._hrv_summaries[target_key] = {
                                 "status": details.summary.status,
@@ -864,6 +865,7 @@ class GarminHistoryArchive:
                             }
                     elif isinstance(details, SegmentedData):
                         samples = details.readings
+                        presence.setdefault(target_key, {})[metric] = details.presence
                     elif isinstance(details, SourceSeries):
                         samples = details.readings
                         presence.setdefault(target_key, {})[metric] = details.presence

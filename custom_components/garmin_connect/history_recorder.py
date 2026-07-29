@@ -7,7 +7,9 @@ import hashlib
 import inspect
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC
 from enum import StrEnum
+from math import isfinite
 from typing import Any, Protocol
 
 from .history_source import NormalizedSample
@@ -112,6 +114,20 @@ class GarminHistoryRecorder:
             return RecorderWriteOutcome(0, "incompatible", "recorder_symbols")
         if not statistic_id or not metric.key:
             return RecorderWriteOutcome(0, "invalid", "metric")
+        normalized_samples: list[NormalizedSample] = []
+        for sample in samples:
+            if sample.timestamp.tzinfo is None or sample.timestamp.utcoffset() is None:
+                return RecorderWriteOutcome(0, "invalid", "timestamp")
+            if isinstance(sample.value, bool) or not isinstance(sample.value, int | float) or not isfinite(float(sample.value)):
+                return RecorderWriteOutcome(0, "invalid", "value")
+            normalized_samples.append(
+                NormalizedSample(
+                    sample.timestamp.astimezone(UTC),
+                    sample.request_date,
+                    sample.raw_timestamp,
+                    float(sample.value),
+                )
+            )
         if tuple(inspect.signature(self._recorder.async_import_statistics).parameters) != (
             "metadata",
             "stats",
@@ -135,7 +151,7 @@ class GarminHistoryRecorder:
                     "min": sample.value,
                     "max": sample.value,
                 }
-                for sample in samples
+                for sample in normalized_samples
             ]
             self._recorder.async_import_statistics(metadata, stats, Statistics)
             loop = asyncio.get_running_loop()
@@ -147,7 +163,7 @@ class GarminHistoryRecorder:
         except AttributeError, ImportError, TypeError, ValueError, RuntimeError:
             return RecorderWriteOutcome(0, "failed", "recorder_unavailable")
         inserted = updated = skipped = 0
-        for sample in samples:
+        for sample in normalized_samples:
             identity = (statistic_id, sample.timestamp)
             previous = self._known_values.get(identity)
             if previous is None:

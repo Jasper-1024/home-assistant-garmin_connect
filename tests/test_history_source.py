@@ -354,6 +354,12 @@ def test_daily_summary_and_training_snapshot_presence_and_type_drift() -> None:
     assert training.fields["vo2_max"] == ("absent", None)
     with pytest.raises(HistorySchemaError):
         normalize_snapshot({"acuteLoad": "drift"}, date(2026, 7, 24), TRAINING_STATUS_FIELDS)
+    with pytest.raises(HistorySchemaError):
+        normalize_snapshot(
+            {"timestamp": "malformed", "acuteLoad": 1},
+            date(2026, 7, 24),
+            TRAINING_STATUS_FIELDS,
+        )
 
 
 def test_snapshot_normalization_uses_sanitized_fixture() -> None:

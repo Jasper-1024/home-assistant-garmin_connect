@@ -1,7 +1,7 @@
 """Tests for the Garmin Recorder statistics writer."""
 
 from dataclasses import replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta, timezone
 
 import pytest
 
@@ -65,6 +65,48 @@ async def test_writer_preserves_aware_timestamps_and_equal_values_without_state_
     assert [row["mean"] for row in rows] == [60.0, 60.0]
     assert table.__name__ == "Statistics"
     assert len(recorder.tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_writer_uses_absolute_source_instant_for_equivalent_offsets() -> None:
+    """Different offset spellings of one source instant share one statistics row."""
+    recorder = FakeRequester()
+    writer = GarminHistoryRecorder(recorder)
+    source_instant = datetime(2026, 7, 24, 8, 0, tzinfo=UTC)
+
+    result = await writer.async_write(
+        statistic_id_for("opaque-account-key-123", "heart_rate"),
+        HEART_RATE_METADATA,
+        (
+            NormalizedSample(
+                datetime(2026, 7, 24, 10, 0, tzinfo=timezone(timedelta(hours=2))),
+                date(2026, 7, 24),
+                "2026-07-24T10:00:00+02:00",
+                60.0,
+            ),
+        ),
+    )
+
+    assert result.accepted_count == 1
+    queued_timestamp = recorder.imports[0][1][0]["start"]
+    assert queued_timestamp == source_instant
+    assert queued_timestamp.tzinfo is UTC
+
+
+@pytest.mark.asyncio
+async def test_writer_rejects_naive_source_timestamps_before_history_write() -> None:
+    recorder = FakeRequester()
+    writer = GarminHistoryRecorder(recorder)
+
+    result = await writer.async_write(
+        statistic_id_for("opaque-account-key-123", "heart_rate"),
+        HEART_RATE_METADATA,
+        (NormalizedSample(datetime(2026, 7, 24, 8), date(2026, 7, 24), "naive", 60.0),),
+    )
+
+    assert result.outcome == "invalid"
+    assert result.error_type == "timestamp"
+    assert recorder.imports == []
 
 
 @pytest.mark.asyncio

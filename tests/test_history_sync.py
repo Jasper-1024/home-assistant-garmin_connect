@@ -39,6 +39,7 @@ from custom_components.garmin_connect.history_source import (
     SourceSeries,
     normalize_activities,
     normalize_health_events,
+    normalize_pair_series,
     normalize_snapshot,
 )
 from custom_components.garmin_connect.sleep_archive import (
@@ -223,6 +224,170 @@ async def test_source_series_unwraps_and_presence_survives_restart():
     assert restarted.get_history_presence(date(2026, 1, 1), date(2026, 1, 1)) == {
         "2026-01-01": {"respiration_raw": "present"}
     }
+
+
+@pytest.mark.asyncio
+async def test_numeric_family_presence_survives_archive_normalization():
+    """Every numeric family keeps source availability separate from samples."""
+
+    class Source:
+        async def async_fetch_details(self, target, metric):
+            if metric == "nightly_hrv":
+                return HRVData((), None, "null")
+            if metric in {
+                "steps",
+                "floors",
+                "intensity_moderate",
+                "intensity_vigorous",
+            }:
+                return SegmentedData((), None, "empty")
+            if metric in {"heart_rate", "stress", "body_battery"}:
+                return SourceSeries((), "missing")
+            if metric.startswith("respiration") or metric.startswith("spo2"):
+                return SourceSeries((), "returned-empty")
+            return ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = _sync_archive(Source(), recorder, _Store())
+    await archive.async_start()
+
+    report = await archive.async_sync_range(date(2026, 1, 1), date(2026, 1, 1))
+
+    assert report.outcome == "written"
+    assert archive.get_history_presence(date(2026, 1, 1), date(2026, 1, 1)) == {
+        "2026-01-01": {
+            "heart_rate": "missing",
+            "stress": "missing",
+            "body_battery": "missing",
+            "nightly_hrv": "null",
+            "steps": "empty",
+            "floors": "empty",
+            "intensity_moderate": "empty",
+            "intensity_vigorous": "empty",
+            "respiration_raw": "returned-empty",
+            "respiration_average": "returned-empty",
+            "spo2_single": "returned-empty",
+            "spo2_continuous": "returned-empty",
+            "spo2_hourly": "returned-empty",
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_archive_captures_every_numeric_catalog_family_without_thinning():
+    """All frozen numeric families reach distinct statistics identities."""
+    target = date(2026, 1, 1)
+    sample = NormalizedSample(
+        datetime(2026, 1, 2, 0, 15, tzinfo=UTC), target, "2026-01-01T16:15:00-08:00", 0.0
+    )
+    raw_metrics = {
+        "heart_rate",
+        "stress",
+        "body_battery",
+        "respiration_raw",
+        "respiration_average",
+        "spo2_single",
+        "spo2_continuous",
+        "spo2_hourly",
+    }
+    writes = []
+
+    class Source:
+        async def async_fetch_details(self, request_date, metric):
+            if metric in raw_metrics:
+                return SourceSeries((sample,), "present")
+            if metric == "nightly_hrv":
+                return HRVData((sample,), presence="present")
+            if metric in {"steps", "floors", "intensity_moderate", "intensity_vigorous"}:
+                return SegmentedData((sample,), presence="present")
+            if metric == "daily_summary":
+                return SnapshotData(
+                    {"abnormal_heart_rate_alerts": ("present", 0.0)},
+                    sample.timestamp,
+                    sample.raw_timestamp,
+                )
+            if metric == "training_status":
+                return SnapshotData(
+                    {
+                        field: ("present", float(index))
+                        for index, field in enumerate(TRAINING_STATUS_FIELDS)
+                    },
+                    sample.timestamp,
+                    sample.raw_timestamp,
+                )
+            return ()
+
+    recorder = MagicMock()
+
+    async def write(statistic_id, metadata, samples):
+        writes.append((statistic_id, metadata, tuple(samples)))
+        return RecorderWriteOutcome(len(samples), inserted_count=len(samples))
+
+    recorder.async_write = AsyncMock(side_effect=write)
+    archive = _sync_archive(Source(), recorder, _Store())
+    await archive.async_start()
+
+    report = await archive.async_sync_range(target, target)
+
+    assert report.outcome == "written"
+    assert {metadata.key for _, metadata, _ in writes} == {
+        "heart_rate",
+        "stress",
+        "body_battery",
+        "nightly_hrv",
+        "steps",
+        "floors",
+        "intensity_moderate",
+        "intensity_vigorous",
+        "respiration_raw",
+        "respiration_average",
+        "spo2_single",
+        "spo2_continuous",
+        "spo2_hourly",
+        "daily_abnormal_heart_rate_alerts",
+        "training_acute_load",
+        "training_chronic_load",
+        "training_load_balance",
+        "training_acwr",
+        "training_vo2_max",
+        "training_fitness_trend",
+        "training_recovery_time",
+    }
+    assert len(writes) == 21
+    assert all(samples[0].request_date == target for _, _, samples in writes)
+    assert all(len(samples) == 1 for _, _, samples in writes)
+    assert next(samples[0].value for _, metadata, samples in writes if metadata.key == "heart_rate") == 0.0
+
+
+@pytest.mark.asyncio
+async def test_malformed_numeric_record_fails_archive_date_observably():
+    """A malformed known numeric record fails its date; it is not a gap or zero."""
+
+    class Source:
+        async def async_fetch_details(self, target, metric):
+            if metric == "heart_rate":
+                return SourceSeries(
+                    normalize_pair_series(
+                        {"heartRateValues": ["malformed"]},
+                        values_key="heartRateValues",
+                        descriptor_keys=(),
+                        value_keys=("heartRate",),
+                    ),
+                    "present",
+                )
+            return ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = _sync_archive(Source(), recorder, _Store())
+    await archive.async_start()
+
+    report = await archive.async_sync_range(date(2026, 1, 1), date(2026, 1, 1))
+
+    assert report.outcome == "failed"
+    assert report.error_type == "sync_failed"
+    assert archive.status.state is HistoryArchiveState.FAILED
 
 
 @pytest.mark.asyncio

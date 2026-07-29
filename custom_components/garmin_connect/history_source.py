@@ -47,6 +47,7 @@ class HRVData:
 
     readings: tuple[NormalizedSample, ...]
     summary: HRVSummary | None = None
+    presence: str = "present"
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +56,7 @@ class SegmentedData:
 
     readings: tuple[NormalizedSample, ...]
     totals: dict[str, float] | None = None
+    presence: str = "present"
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,8 +307,11 @@ def normalize_snapshot(
         return SnapshotData(dict.fromkeys(field_aliases, ("null", None)), datetime.combine(target_date, datetime.min.time(), tzinfo=UTC), target_date.isoformat())
     if not isinstance(payload, dict):
         raise HistorySchemaError("snapshot payload is not an object")
-    timestamp_value = next((payload[key] for key in ("timestamp", "startTime", "calendarDate") if key in payload), target_date.isoformat())
-    timestamp = _timestamp(timestamp_value) or datetime.combine(target_date, datetime.min.time(), tzinfo=UTC)
+    timestamp_key = next((key for key in ("timestamp", "startTime", "calendarDate") if key in payload), None)
+    timestamp_value = payload[timestamp_key] if timestamp_key is not None else target_date.isoformat()
+    timestamp = _timestamp(timestamp_value)
+    if timestamp is None:
+        raise HistorySchemaError("snapshot timestamp is invalid")
     fields: dict[str, tuple[str, float | None]] = {}
     for name, aliases in field_aliases.items():
         found = _nested_value(payload, aliases)
@@ -396,14 +401,12 @@ def normalize_pair_series(
     effective_date = request_date
     latest: dict[datetime, NormalizedSample] = {}
     for point in raw_points:
-        if (
-            not isinstance(point, (list, tuple))
-        ):
+        if point is None:
             continue
+        if not isinstance(point, (list, tuple)):
+            raise HistorySchemaError(f"{values_key} point has an invalid type")
         if timestamp_index >= len(point) or value_index >= len(point):
-            if descriptor_present:
-                raise HistorySchemaError(f"{values_key} point is narrower than its descriptors")
-            continue
+            raise HistorySchemaError(f"{values_key} point is narrower than its descriptors")
         raw_time, raw_value = point[timestamp_index], point[value_index]
         if raw_time is not None and not isinstance(raw_time, str | int | float):
             raise HistorySchemaError("timestamp has an invalid type")
@@ -505,6 +508,28 @@ def _normalize_source_series(payload: Any, target_date: date, array_aliases: tup
     return SourceSeries(readings, "present")
 
 
+def _array_presence(payload: Any, aliases: tuple[str, ...]) -> str:
+    """Classify one source array without turning absence into an empty sample set."""
+    if payload is None:
+        return "null"
+    if not isinstance(payload, dict):
+        return "unsupported"
+    marker = _nested_value(payload, ("presence", "state", "status", "availability"))
+    if marker is not None and isinstance(marker[0], str) and marker[0].lower() == "returned-empty":
+        return "returned-empty"
+    found = _nested_value(payload, aliases)
+    if found is None:
+        return "missing"
+    values = found[0]
+    if values is None:
+        return "null"
+    if values == []:
+        return "empty"
+    if not isinstance(values, list):
+        raise HistorySchemaError(f"{found[1]} is not an array")
+    return "present"
+
+
 def normalize_respiration(payload: Any, target_date: date, averages: bool = False) -> SourceSeries:
     aliases = ("respirationAveragesValuesArray",) if averages else ("respirationValuesArray",)
     return _normalize_source_series(payload, target_date, aliases, ("respiration", "respirationValue", "value"), ("respirationValueDescriptors", "respirationValueDescriptorsDTOList"))
@@ -548,12 +573,12 @@ def _totals(payload: Any, keys: tuple[str, ...]) -> dict[str, float] | None:
 
 def normalize_steps(payload: Any, target_date: date) -> SegmentedData:
     readings = _descriptor_segment(payload, target_date, ("stepsValues", "stepsValuesArray", "chartData", "data"), ("steps", "stepCount", "value"), ("stepsValueDescriptors", "stepsValueDescriptorsDTOList", "stepsValueDescriptorDTOList"))
-    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, ("steps", "stepCount", "value"), ("steps", "stepsValues", "stepsValuesArray", "chartData", "data")), _totals(payload, ("totalSteps", "steps")))
+    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, ("steps", "stepCount", "value"), ("steps", "stepsValues", "stepsValuesArray", "chartData", "data")), _totals(payload, ("totalSteps", "steps")), _array_presence(payload, ("stepsValues", "stepsValuesArray", "chartData", "data")))
 
 
 def normalize_floors(payload: Any, target_date: date) -> SegmentedData:
     readings = _descriptor_segment(payload, target_date, ("floorsValues", "floorsValuesArray", "chartData", "data"), ("floors", "floorCount", "value"), ("floorsValueDescriptors", "floorsValueDescriptorsDTOList", "floorsValueDescriptorDTOList"))
-    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, ("floors", "floorCount", "value"), ("floors", "floorValues", "floorsValuesArray", "chartData", "data")), _totals(payload, ("floorsAscended", "floorsDescended", "floorsAscendedInMeters", "floorsDescendedInMeters", "totalFloors")))
+    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, ("floors", "floorCount", "value"), ("floors", "floorValues", "floorsValuesArray", "chartData", "data")), _totals(payload, ("floorsAscended", "floorsDescended", "floorsAscendedInMeters", "floorsDescendedInMeters", "totalFloors")), _array_presence(payload, ("floorsValues", "floorsValuesArray", "chartData", "data")))
 
 
 def normalize_intensity(payload: Any, target_date: date, kind: str) -> SegmentedData:
@@ -561,7 +586,7 @@ def normalize_intensity(payload: Any, target_date: date, kind: str) -> Segmented
         raise ValueError("unsupported intensity kind")
     keys = (f"{kind}IntensityMinutes", f"{kind}Minutes", "value")
     readings = _descriptor_segment(payload, target_date, ("intensityValues", "intensityValuesArray", "chartData", "data"), keys, ("intensityValueDescriptors", "intensityValueDescriptorsDTOList", "intensityValueDescriptorDTOList"))
-    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, keys, (f"{kind}IntensityMinutes", f"{kind}Minutes", "intensityMinutes", "chartData", "data")), _totals(payload, ("moderateIntensityMinutes", "vigorousIntensityMinutes", "totalIntensityMinutes")))
+    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, keys, (f"{kind}IntensityMinutes", f"{kind}Minutes", "intensityMinutes", "chartData", "data")), _totals(payload, ("moderateIntensityMinutes", "vigorousIntensityMinutes", "totalIntensityMinutes")), _array_presence(payload, ("intensityValues", "intensityValuesArray", "chartData", "data")))
 
 
 def _descriptor_segment(payload: Any, target_date: date, values_keys: tuple[str, ...], value_keys: tuple[str, ...], descriptor_keys: tuple[str, ...]) -> tuple[NormalizedSample, ...] | None:
@@ -615,12 +640,42 @@ def normalize_body_battery(payload: Any, target_date: date) -> tuple[NormalizedS
     )
 
 
+def _body_battery_presence(payload: Any, target_date: date) -> str:
+    """Classify the selected Body Battery report before numeric normalization."""
+    if payload is None:
+        return "null"
+    if payload == []:
+        return "empty"
+    if not isinstance(payload, dict):
+        return "unsupported"
+    for key in ("bodyBatteryReports", "reports", "dailyReports"):
+        if key not in payload:
+            continue
+        reports = payload[key]
+        if reports is None:
+            return "null"
+        if reports == []:
+            return "empty"
+        break
+    return _array_presence(_select_daily_report(payload, target_date), ("bodyBatteryValuesArray",))
+
+
 def parse_hrv_data(payload: Any, target_date: date) -> HRVData:
     """Parse HRV readings while tolerating absent summary fields."""
-    if payload is None or payload == []:
-        return HRVData(())
+    if payload is None:
+        return HRVData((), presence="null")
+    if payload == []:
+        return HRVData((), presence="empty")
     if not isinstance(payload, dict):
         raise HistorySchemaError("HRV payload is not an object")
+    if "hrvReadings" not in payload:
+        presence = "missing"
+    elif payload["hrvReadings"] is None:
+        presence = "null"
+    elif payload["hrvReadings"] == []:
+        presence = "empty"
+    else:
+        presence = "present"
     raw_readings = payload.get("hrvReadings", [])
     if raw_readings is None:
         raw_readings = []
@@ -671,7 +726,7 @@ def parse_hrv_data(payload: Any, target_date: date) -> HRVData:
     if isinstance(status, str):
         status = status[:64]
     summary = HRVSummary(status, numeric("lastNightAvg"), numeric("lastNight5MinHigh"), numeric("weeklyAvg"), baseline) if summary_data else None
-    return HRVData(tuple(latest[key] for key in sorted(latest)), summary)
+    return HRVData(tuple(latest[key] for key in sorted(latest)), summary, presence)
 
 
 class GarminHistorySource:
@@ -764,7 +819,10 @@ class GarminHistorySource:
 
         payload = await self.request_gate.async_request(GarminRequestPriority.BACKGROUND, request)
         if metric == "body_battery":
-            return normalize_body_battery(payload, target_date)
+            return SourceSeries(
+                normalize_body_battery(payload, target_date),
+                _body_battery_presence(payload, target_date),
+            )
         if metric == "nightly_hrv":
             return parse_hrv_data(payload, target_date)
         if metric == "steps":
@@ -792,20 +850,26 @@ class GarminHistorySource:
         if not isinstance(payload, dict):
             return ()
         if metric == "heart_rate":
-            return normalize_pair_series(
-                payload,
-                values_key="heartRateValues",
-                descriptor_keys=("heartRateValueDescriptors",),
-                value_keys=("heartRate",),
-                request_date=target_date,
+            return SourceSeries(
+                normalize_pair_series(
+                    payload,
+                    values_key="heartRateValues",
+                    descriptor_keys=("heartRateValueDescriptors",),
+                    value_keys=("heartRate",),
+                    request_date=target_date,
+                ),
+                _array_presence(payload, ("heartRateValues",)),
             )
-        return normalize_pair_series(
-            payload,
-            values_key="stressValuesArray",
-            descriptor_keys=("stressValueDescriptorsDTOList", "stressValueDescriptorsDtoList"),
-            value_keys=("stressLevel",),
-            exclude_negative=True,
-            request_date=target_date,
+        return SourceSeries(
+            normalize_pair_series(
+                payload,
+                values_key="stressValuesArray",
+                descriptor_keys=("stressValueDescriptorsDTOList", "stressValueDescriptorsDtoList"),
+                value_keys=("stressLevel",),
+                exclude_negative=True,
+                request_date=target_date,
+            ),
+            _array_presence(payload, ("stressValuesArray",)),
         )
 
 
