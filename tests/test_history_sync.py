@@ -75,7 +75,7 @@ class _NamedStore(_Store):
 
 def _sync_archive(source, recorder, store, *, options=None):
     entry = MagicMock(data={"history_account_key": "opaque-account-key-1234567890"}, entry_id="e")
-    entry.options = {CONF_ARCHIVE_ENABLED: True} if options is None else options
+    entry.options = {CONF_ARCHIVE_ENABLED: False} if options is None else options
     entry.runtime_data = SimpleNamespace(core=SimpleNamespace(client=object()), request_gate=object())
     archive = GarminHistoryArchive(
         MagicMock(), entry,
@@ -83,17 +83,16 @@ def _sync_archive(source, recorder, store, *, options=None):
         store_factory=lambda *args, **kwargs: store,
         source_factory=lambda *args: source,
         recorder_factory=lambda: recorder,
-        run_first_sync=False,
     )
     return archive
 
 
-def _partition_archive(source, recorder, stores, *, options=None, data=None, run_first_sync=False):
+def _partition_archive(source, recorder, stores, *, options=None, data=None):
     entry = MagicMock(
         data=data or {"history_account_key": "opaque-account-key-1234567890"},
         entry_id="e",
     )
-    entry.options = {CONF_ARCHIVE_ENABLED: True} if options is None else options
+    entry.options = {CONF_ARCHIVE_ENABLED: False} if options is None else options
     entry.runtime_data = SimpleNamespace(core=SimpleNamespace(client=object()), request_gate=object())
     return GarminHistoryArchive(
         MagicMock(), entry,
@@ -101,7 +100,6 @@ def _partition_archive(source, recorder, stores, *, options=None, data=None, run
         store_factory=lambda _hass, _version, path, **kwargs: stores.setdefault(path, _NamedStore()),
         source_factory=lambda *args: source,
         recorder_factory=lambda: recorder,
-        run_first_sync=run_first_sync,
     )
 
 
@@ -117,7 +115,6 @@ async def test_invalid_range_does_not_fetch_or_write():
         store_factory=lambda *args, **kwargs: _Store(),
         source_factory=lambda *args: source,
         recorder_factory=lambda: recorder,
-        run_first_sync=False,
     )
     await archive.async_start()
 
@@ -144,7 +141,6 @@ async def test_sync_fetches_only_supported_metrics_and_writes_each_day():
         store_factory=lambda *args, **kwargs: _Store(),
         source_factory=lambda *args: source,
         recorder_factory=lambda: recorder,
-        run_first_sync=False,
     )
     await archive.async_start()
 
@@ -447,7 +443,7 @@ async def test_hrv_summary_persists_only_with_date_checkpoint():
     store = _Store()
     entry = MagicMock(data={"history_account_key": "opaque-account-key-1234567890"}, entry_id="e")
     entry.runtime_data = SimpleNamespace(core=SimpleNamespace(client=object()), request_gate=object())
-    archive = GarminHistoryArchive(MagicMock(), entry, recorder_checker=SimpleNamespace(async_check=AsyncMock(return_value=RecorderCompatibilityResult.compatible_result())), store_factory=lambda *args, **kwargs: store, source_factory=lambda *args: source, recorder_factory=lambda: recorder, run_first_sync=False)
+    archive = GarminHistoryArchive(MagicMock(), entry, recorder_checker=SimpleNamespace(async_check=AsyncMock(return_value=RecorderCompatibilityResult.compatible_result())), store_factory=lambda *args, **kwargs: store, source_factory=lambda *args: source, recorder_factory=lambda: recorder)
     await archive.async_start()
     await archive.async_sync_range(date(2026, 1, 1), date(2026, 1, 1))
     assert store.data["hrv_summaries"]["2026-01-01"]["status"] == "balanced"
@@ -920,6 +916,7 @@ async def test_first_sync_downloads_at_most_one_fit_without_dropping_activity_re
         [
             {"activityId": 1200, "activityType": "running", "startTime": "2026-08-04T10:00:00Z", "durationInSeconds": 60},
             {"activityId": 1201, "activityType": "cycling", "startTime": "2026-08-04T12:00:00Z", "durationInSeconds": 60},
+            {"activityId": 1199, "activityType": "walking", "startTime": "2026-08-03T12:00:00Z", "durationInSeconds": 60},
         ],
         date(2026, 8, 4),
     )
@@ -955,7 +952,7 @@ async def test_first_sync_downloads_at_most_one_fit_without_dropping_activity_re
     stores = {"garmin_connect.e.history_catalog": _NamedStore()}
     recorder = MagicMock()
     recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
-    archive = _partition_archive(Source(), recorder, stores, run_first_sync=True)
+    archive = _partition_archive(Source(), recorder, stores, options={CONF_ARCHIVE_ENABLED: True})
     archive._entry.runtime_data.core.client = client
     archive._hass.config.path.return_value = str(tmp_path)
 
@@ -964,11 +961,16 @@ async def test_first_sync_downloads_at_most_one_fit_without_dropping_activity_re
         return_value=datetime(2026, 8, 4, tzinfo=UTC),
     ):
         await archive.async_start()
+        first_sync_task = archive._first_sync_task
+        assert first_sync_task is not None
+        await first_sync_task
 
     assert archive.status.state is HistoryArchiveState.IDLE
     assert history_module.async_archive_fit.await_count == 1
     assert set(stores["garmin_connect.e.history_catalog"].data["activity_index"]["2026"]) == {
-        activity.logical_id for activity in activities
+        activity.logical_id
+        for activity in activities
+        if activity.calendar_date == date(2026, 8, 4)
     }
 
 

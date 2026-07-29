@@ -358,7 +358,6 @@ class GarminHistoryArchive:
         store_factory: Callable[..., Any] | None = None,
         source_factory: Callable[..., GarminHistorySource] | None = None,
         recorder_factory: Callable[..., GarminHistoryRecorder] | None = None,
-        run_first_sync: bool = True,
     ) -> None:
         """Initialize an archive without doing I/O or creating tasks."""
         self._hass = hass
@@ -367,7 +366,6 @@ class GarminHistoryArchive:
         self._store_factory = store_factory
         self._source_factory = source_factory
         self._recorder_factory = recorder_factory
-        self._run_first_sync = run_first_sync
         self._store: Any | None = None
         self._started = False
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -517,21 +515,27 @@ class GarminHistoryArchive:
             **self._backfill_status_fields(),
         )
 
-        if self._archive_enabled and self._run_first_sync:
-            self._first_sync_task = asyncio.current_task()
-            try:
-                await self._async_run_first_sync()
-            except asyncio.CancelledError:
-                self._started = False
-                await self.async_stop()
-                raise
-            except Exception:
-                self._set_failed("first_sync")
-                _LOGGER.warning(
-                    "Garmin history archive first synchronization failed for entry %s",
-                    self._entry.entry_id,
-                )
-            finally:
+        if self._archive_enabled:
+            first_sync = self._async_run_first_sync_in_background()
+            if isinstance(self._hass, HomeAssistant):
+                self._first_sync_task = self._hass.async_create_task(first_sync)
+            else:
+                self._first_sync_task = asyncio.create_task(first_sync)
+
+    async def _async_run_first_sync_in_background(self) -> None:
+        """Run first synchronization without delaying current-value setup."""
+        try:
+            await self._async_run_first_sync()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._set_failed("first_sync")
+            _LOGGER.warning(
+                "Garmin history archive first synchronization failed for entry %s",
+                self._entry.entry_id,
+            )
+        finally:
+            if self._first_sync_task is asyncio.current_task():
                 self._first_sync_task = None
 
     async def _async_run_first_sync(self) -> None:
@@ -551,6 +555,7 @@ class GarminHistoryArchive:
                 target_date,
                 fit_limit=_FIRST_SYNC_FIT_LIMIT,
                 fail_on_fit_limit=False,
+                force_date=target_date,
             )
         if report.outcome != "written" and self._status.state is not HistoryArchiveState.FAILED:
             self._set_failed(report.error_type or "first_sync")
@@ -633,8 +638,13 @@ class GarminHistoryArchive:
         fit_limit: int | None = None,
         include_training_status: bool = True,
         fail_on_fit_limit: bool = True,
+        force_date: date | None = None,
     ) -> HistorySyncReport:
-        """Run one serialized, checkpointed manual sync."""
+        """Run one serialized, checkpointed sync.
+
+        ``force_date`` is reserved for the enabled first current-day sync so
+        a Manual Repair checkpoint cannot suppress that enablement request.
+        """
 
         runtime_data = getattr(self._entry, "runtime_data", None)
         client = getattr(getattr(runtime_data, "core", None), "client", None)
@@ -668,7 +678,7 @@ class GarminHistoryArchive:
         for offset in range((end_date - start_date).days + 1):
             target = start_date.fromordinal(start_date.toordinal() + offset)
             target_key = target.isoformat()
-            if target_key in self._completed_dates:
+            if target_key in self._completed_dates and target != force_date:
                 skipped += 1
                 processed.append(target)
                 self._status = HistoryStatus(HistoryArchiveState.SYNCING, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
@@ -852,6 +862,8 @@ class GarminHistoryArchive:
                 fit_count = 0
                 fit_deferred = False
                 for activity in activity_details:
+                    if activity.calendar_date != target:
+                        continue
                     year = str(activity.calendar_date.year)
                     activities_by_year.setdefault(year, {})[activity.logical_id] = {
                         "logical_id": activity.logical_id, "activity_id": activity.activity_id, "revision": activity.revision, "calendar_date": activity.calendar_date.isoformat(),

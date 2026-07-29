@@ -240,13 +240,13 @@ async def async_options_update_listener(
 
 async def async_unload_entry(hass: HomeAssistant, entry: GarminConnectConfigEntry) -> bool:
     """Unload a config entry."""
-    request_gate = getattr(entry.runtime_data, "request_gate", None)
-    if isinstance(request_gate, GarminRequestGate):
-        await request_gate.async_close()
-
     history_archive = getattr(entry.runtime_data, "history_archive", None)
     if isinstance(history_archive, GarminHistoryArchive):
         await history_archive.async_stop()
+
+    request_gate = getattr(entry.runtime_data, "request_gate", None)
+    if isinstance(request_gate, GarminRequestGate):
+        await request_gate.async_close()
 
     unload_ok = cast(bool, await hass.config_entries.async_unload_platforms(entry, PLATFORMS))
 

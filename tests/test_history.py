@@ -94,7 +94,6 @@ def _archive(
         entry,
         recorder_checker=checker,
         store_factory=_store_factory(store),
-        run_first_sync=False,
     )
 
 
@@ -213,6 +212,9 @@ async def test_enabled_start_syncs_only_the_current_local_date() -> None:
         ZoneInfo("Asia/Taipei"),
     ):
         await archive.async_start()
+        first_sync_task = archive._first_sync_task
+        assert first_sync_task is not None
+        await first_sync_task
 
     assert archive.status.state is HistoryArchiveState.IDLE
     assert source.async_fetch.await_count == 15
@@ -220,6 +222,65 @@ async def test_enabled_start_syncs_only_the_current_local_date() -> None:
         date(2026, 8, 4)
     }
     assert recorder.async_write.await_args_list[0].args[2][0].value == 72.0
+
+
+async def test_first_sync_requests_completed_current_local_date() -> None:
+    """Enablement retries today even when a prior repair checkpoint exists."""
+    hass = _hass()
+    target_date = date(2026, 8, 4)
+    entry = _entry(
+        data={
+            "history_account_key": "opaque-account-key-1234567890",
+            CONF_ARCHIVE_PREVIOUSLY_ENABLED: False,
+        }
+    )
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=object()
+    )
+    source = MagicMock()
+    requested_dates: list[date] = []
+
+    async def fetch(target: date, _metric: str):
+        requested_dates.append(target)
+        return ()
+
+    source.async_fetch = AsyncMock(side_effect=fetch)
+    source.async_fetch_details = None
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    store = FakeStore(
+        {
+            "account_key": "opaque-account-key-1234567890",
+            "schema_version": 1,
+            "completed_dates": [target_date.isoformat()],
+            "hrv_summaries": {},
+            "presence": {},
+            "sleep_index": {},
+            "event_index": {},
+            "activity_index": {},
+        }
+    )
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=_store_factory(store),
+        source_factory=lambda *args: source,
+        recorder_factory=lambda: recorder,
+    )
+
+    with patch(
+        "custom_components.garmin_connect.history.dt_util.utcnow",
+        return_value=datetime(2026, 8, 4, tzinfo=UTC),
+    ):
+        await archive.async_start()
+        first_sync_task = archive._first_sync_task
+        assert first_sync_task is not None
+        await first_sync_task
+
+    assert requested_dates
+    assert set(requested_dates) == {target_date}
 
 
 async def test_disabled_start_does_not_request_an_archive_date() -> None:
@@ -289,13 +350,16 @@ async def test_failed_first_sync_fails_closed_without_background_work() -> None:
         return_value=datetime(2026, 8, 4, tzinfo=UTC),
     ):
         await archive.async_start()
+        first_sync_task = archive._first_sync_task
+        assert first_sync_task is not None
+        await first_sync_task
 
     assert archive.status.state is HistoryArchiveState.FAILED
     assert archive.status.error_type == "recorder_write"
 
 
 async def test_stop_cancels_an_in_flight_first_sync() -> None:
-    """Unload can cancel the bounded first request without leaving it running."""
+    """Startup returns while unload can cancel the bounded first request."""
     hass = _hass()
     entry = _entry(
         data={
@@ -325,12 +389,9 @@ async def test_stop_cancels_an_in_flight_first_sync() -> None:
         source_factory=lambda *args: source,
     )
 
-    start_task = asyncio.create_task(archive.async_start())
+    await asyncio.wait_for(archive.async_start(), timeout=0.1)
     await started.wait()
     await archive.async_stop()
-
-    with pytest.raises(asyncio.CancelledError):
-        await start_task
 
 
 async def test_enablement_uses_configured_local_date_across_utc_midnight() -> None:

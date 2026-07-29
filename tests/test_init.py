@@ -387,6 +387,63 @@ async def test_setup_entry_success() -> None:
     assert entry.runtime_data is not None
 
 
+async def test_enabled_first_sync_does_not_delay_platform_forwarding() -> None:
+    """Platform setup completes while the enabled first archive request waits."""
+    entry = MagicMock(entry_id="entry-1", title="Garmin account")
+    entry.data = {
+        **ENTRY_DATA,
+        "history_account_key": "opaque-account-key-1234567890",
+        CONF_ARCHIVE_PREVIOUSLY_ENABLED: True,
+        CONF_ARCHIVE_ACTIVATION_DATE: "2026-08-04",
+    }
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    hass = MagicMock()
+    hass.config.country = "US"
+    hass.services.has_service = MagicMock(return_value=True)
+    hass.config_entries.async_forward_entry_setups = AsyncMock()
+    coord = _coord_mock()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class Source:
+        async def async_fetch(self, _target, _metric):
+            started.set()
+            await release.wait()
+            return ()
+
+    store = MagicMock()
+    store.async_load = AsyncMock(return_value=None)
+    store.async_save = AsyncMock()
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=MagicMock(
+            async_check=AsyncMock(return_value=RecorderCompatibilityResult.compatible_result())
+        ),
+        store_factory=lambda *args, **kwargs: store,
+        source_factory=lambda *args: Source(),
+        recorder_factory=lambda: recorder,
+    )
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("custom_components.garmin_connect.GarminAuth"))
+        stack.enter_context(patch("custom_components.garmin_connect.GarminClient"))
+        _stack_coordinators(stack, coord)
+        stack.enter_context(
+            patch("custom_components.garmin_connect.GarminHistoryArchive", return_value=archive)
+        )
+
+        setup_task = asyncio.create_task(async_setup_entry(hass, entry))
+        await asyncio.wait_for(setup_task, timeout=0.1)
+
+    assert setup_task.result() is True
+    hass.config_entries.async_forward_entry_setups.assert_awaited_once()
+    await started.wait()
+    await archive.async_stop()
+
+
 async def test_setup_entry_stores_all_coordinators() -> None:
     """runtime_data must be a GarminConnectCoordinators with all 9 fields."""
     from custom_components.garmin_connect.coordinator import GarminConnectCoordinators
