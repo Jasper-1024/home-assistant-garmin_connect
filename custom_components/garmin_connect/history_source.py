@@ -1239,7 +1239,6 @@ class GarminHistorySource:
             ("stressValuesArray",),
             ("stressLevel", "stress", "value"),
             ("stressValueDescriptorsDTOList", "stressValueDescriptorsDtoList"),
-            exclude_negative=True,
         )
 
 

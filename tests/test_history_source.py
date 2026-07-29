@@ -78,29 +78,31 @@ def test_measurement_timestamp_without_offset_fails_closed() -> None:
         )
 
 
-def test_normalize_stress_excludes_negative_quality_codes_but_keeps_zero_and_null() -> None:
-    """Negative stress codes are quality values, not measurements."""
+@pytest.mark.asyncio
+async def test_fetch_stress_retains_negative_numeric_samples() -> None:
+    """Ordinary intraday stress retains every valid numeric source record."""
     payload = {
         "stressValueDescriptorsDTOList": [
             {"key": "timestamp", "index": 0},
             {"key": "stressLevel", "index": 1},
         ],
         "stressValuesArray": [
-            [1_784_852_400_000, -1],
+            [1_784_852_400_000, -2],
             [1_784_852_460_000, 0],
             [1_784_852_520_000, None],
         ],
     }
 
-    samples = normalize_pair_series(
-        payload,
-        values_key="stressValuesArray",
-        descriptor_keys=("stressValueDescriptorsDTOList",),
-        value_keys=("stressLevel",),
-        exclude_negative=True,
+    client = MagicMock()
+    client._base_url = "https://garmin.example"
+    client._request = AsyncMock(return_value=payload)
+    result = await GarminHistorySource(client, _ImmediateGate()).async_fetch_details(
+        date(2026, 7, 24), "stress"
     )
-    assert len(samples) == 1
-    assert samples[0].value == 0
+
+    assert isinstance(result, SourceSeries)
+    assert result.presence == "present"
+    assert [sample.value for sample in result.readings] == [-2.0, 0.0]
 
 
 def test_normalize_health_events_preserves_explicit_fields_only() -> None:

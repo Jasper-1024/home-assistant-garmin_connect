@@ -85,6 +85,16 @@ class _ImmediateGate:
         return await request()
 
 
+_SPARSE_SLEEP_STREAM_PRESENCE = {
+    "sleep_stream:heart_rate": "null",
+    "sleep_stream:hrv": "empty",
+    "sleep_stream:body_battery": "missing",
+    "sleep_stream:stress": "all-null",
+    "sleep_stream:respiration": "present",
+    "sleep_stream:spo2": "missing",
+    "sleep_stream:movement": "missing",
+}
+
 def _sync_archive(source, recorder, store, *, options=None):
     entry = MagicMock(data={"history_account_key": "opaque-account-key-1234567890"}, entry_id="e")
     entry.options = {CONF_ARCHIVE_ENABLED: False} if options is None else options
@@ -637,11 +647,9 @@ async def test_sleep_numeric_stream_presence_is_sparse_and_valid_points_are_writ
 
     assert report.outcome == "written"
     presence = archive.get_history_presence(target, target)[target.isoformat()]
-    assert presence[f"sleep_heart_rate:{session.logical_id}"] == "null"
-    assert presence[f"sleep_hrv:{session.logical_id}"] == "empty"
-    assert presence[f"sleep_stress:{session.logical_id}"] == "all-null"
-    assert presence[f"sleep_respiration:{session.logical_id}"] == "present"
-    assert presence[f"sleep_body_battery:{session.logical_id}"] == "missing"
+    assert {
+        key: value for key, value in presence.items() if key.startswith("sleep_stream:")
+    } == _SPARSE_SLEEP_STREAM_PRESENCE
     respiration_write = next(
         call for call in recorder.async_write.await_args_list if call.args[1].key == "sleep_respiration"
     )
@@ -755,10 +763,23 @@ async def test_many_sleep_sessions_keep_stream_presence_in_annual_partition() ->
     await restarted.async_start()
     assert restarted.status.state is HistoryArchiveState.DISABLED
     restored_presence = restarted.get_history_presence(target, target)[target.isoformat()]
-    assert sum(key.startswith("sleep_heart_rate:") for key in restored_presence) == len(sessions)
-    assert all(
-        restored_presence[f"sleep_heart_rate:{session.logical_id}"] == "null"
-        for session in sessions
+    sleep_presence = {
+        key: value for key, value in restored_presence.items() if key.startswith("sleep_stream:")
+    }
+    assert sleep_presence == _SPARSE_SLEEP_STREAM_PRESENCE
+    assert not any(
+        key.startswith(
+            (
+                "sleep_heart_rate:",
+                "sleep_hrv:",
+                "sleep_body_battery:",
+                "sleep_stress:",
+                "sleep_respiration:",
+                "sleep_spo2:",
+                "sleep_movement:",
+            )
+        )
+        for key in restored_presence
     )
 
 

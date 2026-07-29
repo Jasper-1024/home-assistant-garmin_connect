@@ -533,21 +533,6 @@ class GarminHistoryArchive:
             for key, value in self._presence.items()
             if start_date <= date.fromisoformat(key) <= end_date
         }
-        for records in self._sleep_sessions.values():
-            for record in records.values():
-                try:
-                    session_date = date.fromisoformat(record["calendar_date"])
-                    logical_id = record["logical_id"]
-                    stream_presence = record.get("stream_presence", {})
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if not start_date <= session_date <= end_date or not isinstance(stream_presence, Mapping):
-                    continue
-                target_presence = result.setdefault(session_date.isoformat(), {})
-                for metric, state in stream_presence.items():
-                    metadata = _SLEEP_STREAM_METADATA.get(metric)
-                    if metadata is not None and state in _PRESENCE_STATES:
-                        target_presence[f"{metadata.key}:{logical_id}"] = state
         return result
 
     async def async_start(self) -> None:
