@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from homeassistant.components.sensor import SensorEntity
@@ -30,6 +31,21 @@ class GarminHistoryStatusSensor(SensorEntity):
             manufacturer="Garmin",
             entry_type=DeviceEntryType.SERVICE,
         )
+        self._remove_status_listener: Callable[[], None] | None = None
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to archive lifecycle changes without polling."""
+        await super().async_added_to_hass()
+        self._remove_status_listener = self._archive.add_status_listener(
+            self.async_write_ha_state
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop receiving archive lifecycle changes after removal."""
+        if self._remove_status_listener is not None:
+            self._remove_status_listener()
+            self._remove_status_listener = None
+        await super().async_will_remove_from_hass()
 
     @property
     def native_value(self) -> str:

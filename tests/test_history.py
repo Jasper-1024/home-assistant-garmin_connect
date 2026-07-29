@@ -4168,22 +4168,29 @@ async def test_status_sensor_exposes_only_privacy_safe_placeholders() -> None:
     sensor = GarminHistoryStatusSensor(archive, "entry-1")
 
     assert sensor.native_value == "failed"
-    assert set(sensor.extra_state_attributes) == {
-        "recorder_target",
-        "archive_state",
-        "activation_date",
-        "current_date",
-        "processed_dates",
-        "record_count",
-        "error_type",
-        "queued_count",
-        "completed_count",
-        "next_eligible_run",
-        "last_success",
-        "backoff_until",
-        "safe_error_class",
+    assert sensor.extra_state_attributes == {
+        "archive_state": "failed",
+        "safe_error_class": "missing_recorder_api",
     }
     assert "history_account_key" not in sensor.extra_state_attributes
+
+
+async def test_status_sensor_receives_active_archive_notifications() -> None:
+    """The status entity is notified when the archive lifecycle changes."""
+    hass = _hass()
+    checker = FakeRecorderChecker(
+        RecorderCompatibilityResult.incompatible_result("missing_recorder_api")
+    )
+    archive = _archive(hass, _entry(), checker)
+    sensor = GarminHistoryStatusSensor(archive, "entry-1")
+    writes = MagicMock()
+    sensor.async_write_ha_state = writes
+    remove = archive.add_status_listener(sensor.async_write_ha_state)
+
+    await archive.async_start()
+
+    writes.assert_called_once_with()
+    remove()
 
 
 async def test_stop_is_idempotent() -> None:

@@ -637,22 +637,17 @@ class HistoryStatus:
     activation_date: str | None = None
 
     def as_attributes(self) -> dict[str, Any]:
-        """Return the bounded status attributes exposed by the sensor."""
-        return {
-            "recorder_target": self.recorder_target,
-            "archive_state": self.state.value,
-            "activation_date": self.activation_date,
-            "current_date": self.current_date,
-            "processed_dates": self.processed_dates,
-            "record_count": self.record_count,
-            "error_type": self.error_type,
-            "queued_count": self.queued_count,
-            "completed_count": self.completed_count,
-            "next_eligible_run": self.next_eligible_run,
-            "last_success": self.last_success,
-            "backoff_until": self.backoff_until,
-            "safe_error_class": self.safe_error_class,
-        }
+        """Return only the minimal lifecycle contract exposed by the sensor."""
+        attributes: dict[str, Any] = {"archive_state": self.state.value}
+        for key, value in (
+            ("activation_date", self.activation_date),
+            ("last_success", self.last_success),
+            ("next_eligible_run", self.next_eligible_run),
+            ("safe_error_class", self.safe_error_class or self.error_type),
+        ):
+            if value is not None:
+                attributes[key] = value
+        return attributes
 
 
 @dataclass(frozen=True, slots=True)
@@ -964,6 +959,7 @@ class GarminHistoryArchive:
             else _noop_history_timer_factory
         )
         self._store: Any | None = None
+        self._status_listeners: set[Callable[[], None]] = set()
         self._started = False
         self._tasks: set[asyncio.Task[Any]] = set()
         self._first_sync_task: asyncio.Task[Any] | None = None
@@ -1011,6 +1007,31 @@ class GarminHistoryArchive:
     def status(self) -> HistoryStatus:
         """Return the immutable, privacy-safe current status."""
         return self._status
+
+    @property
+    def _status(self) -> HistoryStatus:
+        return self._status_value
+
+    @_status.setter
+    def _status(self, value: HistoryStatus) -> None:
+        previous = getattr(self, "_status_value", None)
+        self._status_value = value
+        if previous is None or previous == value:
+            return
+        for listener in tuple(self._status_listeners):
+            try:
+                listener()
+            except Exception:  # pragma: no cover - defensive entity boundary
+                _LOGGER.warning("Garmin history status listener failed", exc_info=True)
+
+    def add_status_listener(self, listener: Callable[[], None]) -> Callable[[], None]:
+        """Register a synchronous callback for public status changes."""
+        self._status_listeners.add(listener)
+
+        def remove() -> None:
+            self._status_listeners.discard(listener)
+
+        return remove
 
     @property
     def archive_enabled(self) -> bool:
