@@ -124,8 +124,8 @@ class HistoryArchiveState(StrEnum):
 
     IDLE = "idle"
     DISABLED = "disabled"
-    RUNNING = "running"
-    COMPATIBILITY_DISABLED = "compatibility-disabled"
+    SYNCING = "syncing"
+    BACKOFF = "backoff"
     FAILED = "failed"
 
 
@@ -447,7 +447,7 @@ class GarminHistoryArchive:
 
         if not compatibility.compatible:
             self._status = HistoryStatus(
-                HistoryArchiveState.COMPATIBILITY_DISABLED,
+                HistoryArchiveState.FAILED,
                 **self._backfill_status_fields(),
                 error_type=compatibility.error_type or "recorder_incompatible",
             )
@@ -559,16 +559,16 @@ class GarminHistoryArchive:
         health_events: list[NormalizedHealthEvent] = []
         presence = {key: dict(value) for key, value in self._presence.items()}
         sleep_sessions = {year: dict(records) for year, records in self._sleep_sessions.items()}
-        self._status = HistoryStatus(HistoryArchiveState.RUNNING, **self._backfill_status_fields())
+        self._status = HistoryStatus(HistoryArchiveState.SYNCING, **self._backfill_status_fields())
         for offset in range((end_date - start_date).days + 1):
             target = start_date.fromordinal(start_date.toordinal() + offset)
             target_key = target.isoformat()
             if target_key in self._completed_dates:
                 skipped += 1
                 processed.append(target)
-                self._status = HistoryStatus(HistoryArchiveState.RUNNING, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
+                self._status = HistoryStatus(HistoryArchiveState.SYNCING, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
                 continue
-            self._status = HistoryStatus(HistoryArchiveState.RUNNING, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
+            self._status = HistoryStatus(HistoryArchiveState.SYNCING, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
             try:
                 metrics: tuple[tuple[str, Any], ...] = (
                     ("heart_rate", HEART_RATE_METADATA),

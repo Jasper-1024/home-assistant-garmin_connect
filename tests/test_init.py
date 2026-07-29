@@ -2,9 +2,13 @@
 
 import asyncio
 from contextlib import ExitStack
+from datetime import UTC, date, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from homeassistant import loader
+from homeassistant.config_entries import SOURCE_USER, ConfigEntries, ConfigEntry, ConfigEntryState
+from homeassistant.core import HomeAssistant
 
 from custom_components.garmin_connect import (
     _migrate_entity_unique_ids,
@@ -14,9 +18,11 @@ from custom_components.garmin_connect import (
     async_unload_entry,
 )
 from custom_components.garmin_connect.const import (
+    CONF_ARCHIVE_ENABLED,
     CONF_CLIENT_ID,
     CONF_REFRESH_TOKEN,
     CONF_TOKEN,
+    DOMAIN,
 )
 from custom_components.garmin_connect.history import GarminHistoryArchive
 from custom_components.garmin_connect.request_gate import (
@@ -70,6 +76,91 @@ async def test_options_update_listener_reloads_config_entry() -> None:
     await tasks[0]
 
     reload.assert_awaited_once_with("entry-1")
+
+
+async def test_real_config_entry_lifecycle_keeps_backfill_dormant_and_surfaces_visible(
+    tmp_path,
+) -> None:
+    """Normal HA lifecycle paths cannot reach Historical Backfill."""
+    hass = HomeAssistant(str(tmp_path))
+    hass.config_entries = ConfigEntries(hass, {})
+    loader.async_setup(hass)
+    entry = ConfigEntry(
+        version=2,
+        minor_version=1,
+        domain=DOMAIN,
+        title="Garmin account",
+        data=dict(ENTRY_DATA),
+        options={CONF_ARCHIVE_ENABLED: False},
+        source=SOURCE_USER,
+        unique_id="garmin-account",
+        discovery_keys={},
+        subentries_data=None,
+        entry_id="entry-1",
+    )
+    coordinator = _coord_mock()
+
+    async def assert_disabled_surfaces() -> None:
+        archive = entry.runtime_data.history_archive
+        assert archive.archive_enabled is False
+        assert archive.status.state.value == "disabled"
+        assert callable(archive.async_sync_range)
+        assert archive.get_history_presence(date(2026, 7, 1), date(2026, 7, 1)) == {}
+        assert (
+            await archive.async_get_calendar_events("sleep", date(2026, 7, 1), date(2026, 7, 1))
+            == ()
+        )
+        assert hass.services.has_service(DOMAIN, "sync_history")
+
+    try:
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("custom_components.garmin_connect.GarminAuth", return_value=MagicMock())
+            )
+            stack.enter_context(
+                patch("custom_components.garmin_connect.GarminClient", return_value=MagicMock())
+            )
+            stack.enter_context(
+                patch(
+                    "custom_components.garmin_connect.history.HomeAssistantRecorderCompatibility.async_check",
+                    new=AsyncMock(return_value=MagicMock(compatible=True, error_type=None)),
+                )
+            )
+            backfill = stack.enter_context(
+                patch("custom_components.garmin_connect.history.BackfillScheduler")
+            )
+            _stack_coordinators(stack, coordinator)
+            hass.config_entries.async_forward_entry_setups = AsyncMock()
+            hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
+
+            await hass.config_entries.async_add(entry)
+            await assert_disabled_surfaces()
+            account_key = entry.data["history_account_key"]
+
+            assert await hass.config_entries.async_reload(entry.entry_id)
+            await assert_disabled_surfaces()
+            assert entry.data["history_account_key"] == account_key
+
+            assert await hass.config_entries.async_unload(entry.entry_id)
+            assert entry.state is ConfigEntryState.NOT_LOADED
+            assert await hass.config_entries.async_setup(entry.entry_id)
+            await assert_disabled_surfaces()
+            assert entry.data["history_account_key"] == account_key
+
+            with patch(
+                "custom_components.garmin_connect.history.dt_util.now",
+                return_value=datetime(2026, 8, 10, tzinfo=UTC),
+            ):
+                hass.config_entries.async_update_entry(entry, options={CONF_ARCHIVE_ENABLED: True})
+                await hass.async_block_till_done()
+
+            assert entry.runtime_data.history_archive.archive_enabled is True
+            assert entry.runtime_data.history_archive.status.state.value == "idle"
+            assert entry.runtime_data.history_archive.activation_date == date(2026, 8, 10)
+            assert backfill.call_count == 0
+    finally:
+        hass.config_entries._store._async_cleanup_delay_listener()
+        await hass.async_stop(force=True)
 
 
 async def test_setup_entry_success() -> None:

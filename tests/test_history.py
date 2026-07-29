@@ -13,6 +13,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.recorder import async_initialize_recorder
 from homeassistant.setup import async_setup_component
 
+import custom_components.garmin_connect.const as const
 from custom_components.garmin_connect.const import (
     CONF_ARCHIVE_ACTIVATION_DATE,
     CONF_ARCHIVE_ENABLED,
@@ -126,6 +127,19 @@ async def test_start_keeps_historical_backfill_dormant() -> None:
         await archive.async_start()
 
     backfill.assert_not_called()
+
+
+def test_history_status_and_archive_metadata_use_one_public_contract() -> None:
+    """Public archive states and persisted metadata names stay bounded."""
+    assert {state.value for state in HistoryArchiveState} == {
+        "disabled",
+        "idle",
+        "syncing",
+        "backoff",
+        "failed",
+    }
+    assert const.CONF_ARCHIVE_PREVIOUSLY_ENABLED == "archive_last_enabled"
+    assert not hasattr(const, "CONF_ARCHIVE_LAST_ENABLED")
 
 
 async def test_enablement_persists_local_activation_date() -> None:
@@ -296,7 +310,7 @@ async def test_recorder_incompatibility_disables_history_without_writes() -> Non
 
     await archive.async_start()
 
-    assert archive.status.state is HistoryArchiveState.COMPATIBILITY_DISABLED
+    assert archive.status.state is HistoryArchiveState.FAILED
     assert archive.status.error_type == "recorder_signature"
     assert checker.check.await_count == 1
     assert store.saved
@@ -335,7 +349,7 @@ async def test_status_sensor_exposes_only_privacy_safe_placeholders() -> None:
 
     sensor = GarminHistoryStatusSensor(archive, "entry-1")
 
-    assert sensor.native_value == "compatibility-disabled"
+    assert sensor.native_value == "failed"
     assert set(sensor.extra_state_attributes) == {
         "recorder_target",
         "archive_state",
