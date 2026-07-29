@@ -479,24 +479,43 @@ def _nested_value(payload: Any, aliases: tuple[str, ...], depth: int = 0) -> tup
     return None
 
 
-def _normalize_source_series(payload: Any, target_date: date, array_aliases: tuple[str, ...], value_keys: tuple[str, ...], descriptor_aliases: tuple[str, ...]) -> SourceSeries:
+def _classify_source_array(payload: Any, aliases: tuple[str, ...]) -> tuple[str, Any, str | None]:
+    """Classify a source array and return its values when present."""
     if payload is None:
-        return SourceSeries((), "null")
+        return "null", None, None
+    if isinstance(payload, list):
+        return ("empty" if not payload else "present"), payload, None
     if not isinstance(payload, dict):
-        return SourceSeries((), "unsupported")
+        return "unsupported", None, None
     marker = _nested_value(payload, ("presence", "state", "status", "availability"))
     if marker is not None and isinstance(marker[0], str) and marker[0].lower() == "returned-empty":
-        return SourceSeries((), "returned-empty")
-    found = _nested_value(payload, array_aliases)
-    if found is None:
-        return SourceSeries((), "missing")
-    values, array_key = found
+        return "returned-empty", None, None
+    found_values = [
+        found
+        for alias in aliases
+        if (found := _nested_value(payload, (alias,))) is not None
+    ]
+    if not found_values:
+        return "missing", None, None
+    values, array_key = next(
+        (found for found in found_values if found[0] not in (None, [])),
+        found_values[0],
+    )
     if values is None:
-        return SourceSeries((), "null")
+        return "null", None, array_key
     if values == []:
-        return SourceSeries((), "empty")
+        return "empty", values, array_key
     if not isinstance(values, list):
         raise HistorySchemaError(f"{array_key} is not an array")
+    return "present", values, array_key
+
+
+def _normalize_source_series(payload: Any, target_date: date, array_aliases: tuple[str, ...], value_keys: tuple[str, ...], descriptor_aliases: tuple[str, ...]) -> SourceSeries:
+    presence, values, array_key = _classify_source_array(payload, array_aliases)
+    if presence != "present":
+        return SourceSeries((), presence)
+    if array_key is None:
+        return SourceSeries(_object_series(payload, target_date, value_keys, ("data",)), "present")
     descriptor_found = _nested_value(payload, descriptor_aliases)
     series_payload = {array_key: values}
     if descriptor_found is not None:
@@ -510,24 +529,7 @@ def _normalize_source_series(payload: Any, target_date: date, array_aliases: tup
 
 def _array_presence(payload: Any, aliases: tuple[str, ...]) -> str:
     """Classify one source array without turning absence into an empty sample set."""
-    if payload is None:
-        return "null"
-    if not isinstance(payload, dict):
-        return "unsupported"
-    marker = _nested_value(payload, ("presence", "state", "status", "availability"))
-    if marker is not None and isinstance(marker[0], str) and marker[0].lower() == "returned-empty":
-        return "returned-empty"
-    found = _nested_value(payload, aliases)
-    if found is None:
-        return "missing"
-    values = found[0]
-    if values is None:
-        return "null"
-    if values == []:
-        return "empty"
-    if not isinstance(values, list):
-        raise HistorySchemaError(f"{found[1]} is not an array")
-    return "present"
+    return _classify_source_array(payload, aliases)[0]
 
 
 def normalize_respiration(payload: Any, target_date: date, averages: bool = False) -> SourceSeries:
@@ -572,21 +574,30 @@ def _totals(payload: Any, keys: tuple[str, ...]) -> dict[str, float] | None:
 
 
 def normalize_steps(payload: Any, target_date: date) -> SegmentedData:
+    presence = _array_presence(payload, ("stepsValues", "stepsValuesArray", "chartData", "data"))
+    if presence != "present":
+        return SegmentedData((), _totals(payload, ("totalSteps", "steps")), presence)
     readings = _descriptor_segment(payload, target_date, ("stepsValues", "stepsValuesArray", "chartData", "data"), ("steps", "stepCount", "value"), ("stepsValueDescriptors", "stepsValueDescriptorsDTOList", "stepsValueDescriptorDTOList"))
-    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, ("steps", "stepCount", "value"), ("steps", "stepsValues", "stepsValuesArray", "chartData", "data")), _totals(payload, ("totalSteps", "steps")), _array_presence(payload, ("stepsValues", "stepsValuesArray", "chartData", "data")))
+    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, ("steps", "stepCount", "value"), ("steps", "stepsValues", "stepsValuesArray", "chartData", "data")), _totals(payload, ("totalSteps", "steps")), presence)
 
 
 def normalize_floors(payload: Any, target_date: date) -> SegmentedData:
+    presence = _array_presence(payload, ("floorsValues", "floorsValuesArray", "chartData", "data"))
+    if presence != "present":
+        return SegmentedData((), _totals(payload, ("floorsAscended", "floorsDescended", "floorsAscendedInMeters", "floorsDescendedInMeters", "totalFloors")), presence)
     readings = _descriptor_segment(payload, target_date, ("floorsValues", "floorsValuesArray", "chartData", "data"), ("floors", "floorCount", "value"), ("floorsValueDescriptors", "floorsValueDescriptorsDTOList", "floorsValueDescriptorDTOList"))
-    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, ("floors", "floorCount", "value"), ("floors", "floorValues", "floorsValuesArray", "chartData", "data")), _totals(payload, ("floorsAscended", "floorsDescended", "floorsAscendedInMeters", "floorsDescendedInMeters", "totalFloors")), _array_presence(payload, ("floorsValues", "floorsValuesArray", "chartData", "data")))
+    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, ("floors", "floorCount", "value"), ("floors", "floorValues", "floorsValuesArray", "chartData", "data")), _totals(payload, ("floorsAscended", "floorsDescended", "floorsAscendedInMeters", "floorsDescendedInMeters", "totalFloors")), presence)
 
 
 def normalize_intensity(payload: Any, target_date: date, kind: str) -> SegmentedData:
     if kind not in {"moderate", "vigorous"}:
         raise ValueError("unsupported intensity kind")
+    presence = _array_presence(payload, ("intensityValues", "intensityValuesArray", "chartData", "data"))
+    if presence != "present":
+        return SegmentedData((), _totals(payload, ("moderateIntensityMinutes", "vigorousIntensityMinutes", "totalIntensityMinutes")), presence)
     keys = (f"{kind}IntensityMinutes", f"{kind}Minutes", "value")
     readings = _descriptor_segment(payload, target_date, ("intensityValues", "intensityValuesArray", "chartData", "data"), keys, ("intensityValueDescriptors", "intensityValueDescriptorsDTOList", "intensityValueDescriptorDTOList"))
-    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, keys, (f"{kind}IntensityMinutes", f"{kind}Minutes", "intensityMinutes", "chartData", "data")), _totals(payload, ("moderateIntensityMinutes", "vigorousIntensityMinutes", "totalIntensityMinutes")), _array_presence(payload, ("intensityValues", "intensityValuesArray", "chartData", "data")))
+    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, keys, (f"{kind}IntensityMinutes", f"{kind}Minutes", "intensityMinutes", "chartData", "data")), _totals(payload, ("moderateIntensityMinutes", "vigorousIntensityMinutes", "totalIntensityMinutes")), presence)
 
 
 def _descriptor_segment(payload: Any, target_date: date, values_keys: tuple[str, ...], value_keys: tuple[str, ...], descriptor_keys: tuple[str, ...]) -> tuple[NormalizedSample, ...] | None:
@@ -646,17 +657,18 @@ def _body_battery_presence(payload: Any, target_date: date) -> str:
         return "null"
     if payload == []:
         return "empty"
-    if not isinstance(payload, dict):
-        return "unsupported"
-    for key in ("bodyBatteryReports", "reports", "dailyReports"):
-        if key not in payload:
-            continue
-        reports = payload[key]
-        if reports is None:
-            return "null"
-        if reports == []:
-            return "empty"
-        break
+    if isinstance(payload, dict):
+        for key in ("bodyBatteryReports", "reports", "dailyReports"):
+            if key not in payload:
+                continue
+            reports = payload[key]
+            if reports is None:
+                return "null"
+            if reports == []:
+                return "empty"
+            break
+    elif not isinstance(payload, list):
+        return _array_presence(payload, ("bodyBatteryValuesArray",))
     return _array_presence(_select_daily_report(payload, target_date), ("bodyBatteryValuesArray",))
 
 
@@ -819,9 +831,10 @@ class GarminHistorySource:
 
         payload = await self.request_gate.async_request(GarminRequestPriority.BACKGROUND, request)
         if metric == "body_battery":
+            presence = _body_battery_presence(payload, target_date)
             return SourceSeries(
-                normalize_body_battery(payload, target_date),
-                _body_battery_presence(payload, target_date),
+                normalize_body_battery(payload, target_date) if presence == "present" else (),
+                presence,
             )
         if metric == "nightly_hrv":
             return parse_hrv_data(payload, target_date)

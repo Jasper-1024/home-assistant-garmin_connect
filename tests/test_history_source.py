@@ -12,6 +12,7 @@ from custom_components.garmin_connect.history_source import (
     TRAINING_STATUS_FIELDS,
     GarminHistorySource,
     HistorySchemaError,
+    SourceSeries,
     health_event_from_record,
     health_event_record,
     normalize_activities,
@@ -223,6 +224,56 @@ def test_body_battery_singular_descriptor_is_supported() -> None:
     assert samples[0].value == 0
 
 
+def test_top_level_list_segmented_payloads_are_present_and_normalized() -> None:
+    target = date(2026, 7, 24)
+    steps = normalize_steps([
+        {"timestamp": "2026-07-24T01:00:00Z", "steps": 0},
+        {"timestamp": "2026-07-24T01:15:00Z", "steps": 12},
+    ], target)
+    floors = normalize_floors([
+        {"time": "2026-07-24T01:00:00Z", "floors": 2},
+    ], target)
+    intensity = normalize_intensity([
+        {"start": "2026-07-24T01:00:00Z", "moderateIntensityMinutes": 1},
+    ], target, "moderate")
+
+    assert [sample.value for sample in steps.readings] == [0, 12]
+    assert [sample.value for sample in floors.readings] == [2]
+    assert [sample.value for sample in intensity.readings] == [1]
+    assert steps.presence == floors.presence == intensity.presence == "present"
+
+
+@pytest.mark.asyncio
+async def test_top_level_list_body_battery_is_present() -> None:
+    client = MagicMock()
+    client._base_url = "https://garmin.example"
+    client._request = AsyncMock(return_value=[{
+        "calendarDate": "2026-07-24",
+        "bodyBatteryValuesArray": [["2026-07-24T01:00:00Z", 42]],
+    }])
+    source = GarminHistorySource(client, _ImmediateGate())
+
+    result = await source.async_fetch_details(date(2026, 7, 24), "body_battery")
+
+    assert isinstance(result, SourceSeries)
+    assert [sample.value for sample in result.readings] == [42]
+    assert result.presence == "present"
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_presence"),
+    [
+        (None, "null"),
+        ([], "empty"),
+        ({}, "missing"),
+        ({"status": "returned-empty"}, "returned-empty"),
+        ("unsupported", "unsupported"),
+    ],
+)
+def test_segmented_payload_presence_states_are_bounded(payload, expected_presence) -> None:
+    assert normalize_steps(payload, date(2026, 7, 24)).presence == expected_presence
+
+
 def test_known_type_drift_is_rejected_but_null_is_missing() -> None:
     with pytest.raises(HistorySchemaError):
         normalize_pair_series({"heartRateValues": [["bad", 60]]}, values_key="heartRateValues", descriptor_keys=(), value_keys=("heartRate",))
@@ -313,7 +364,8 @@ def test_respiration_and_spo2_fixture_variants_preserve_revisions_and_sparse_ser
     assert normalize_respiration({"respirationValuesArray": None}, date(2026, 7, 24)).presence == "null"
     assert normalize_respiration({"respirationValuesArray": []}, date(2026, 7, 24)).presence == "empty"
     assert normalize_respiration({}, date(2026, 7, 24)).presence == "missing"
-    assert normalize_respiration([], date(2026, 7, 24)).presence == "unsupported"
+    assert normalize_respiration([], date(2026, 7, 24)).presence == "empty"
+    assert normalize_respiration("unsupported", date(2026, 7, 24)).presence == "unsupported"
     assert normalize_respiration({"status": "returned-empty"}, date(2026, 7, 24)).presence == "returned-empty"
 
 

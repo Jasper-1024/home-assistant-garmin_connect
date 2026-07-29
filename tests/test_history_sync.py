@@ -38,9 +38,13 @@ from custom_components.garmin_connect.history_source import (
     SnapshotData,
     SourceSeries,
     normalize_activities,
+    normalize_body_battery,
+    normalize_floors,
     normalize_health_events,
+    normalize_intensity,
     normalize_pair_series,
     normalize_snapshot,
+    normalize_steps,
 )
 from custom_components.garmin_connect.sleep_archive import (
     SleepSession,
@@ -271,6 +275,60 @@ async def test_numeric_family_presence_survives_archive_normalization():
             "spo2_continuous": "returned-empty",
             "spo2_hourly": "returned-empty",
         }
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_shaped_numeric_payloads_write_samples_and_presence() -> None:
+    target = date(2026, 1, 1)
+    body_battery = SourceSeries(
+        tuple(normalize_body_battery([
+            {"calendarDate": target.isoformat(), "bodyBatteryValuesArray": [["2026-01-01T01:00:00Z", 42]]},
+        ], target)),
+        "present",
+    )
+
+    class Source:
+        async def async_fetch_details(self, request_date, metric):
+            if metric == "body_battery":
+                return body_battery
+            if metric == "steps":
+                return normalize_steps([{"timestamp": "2026-01-01T01:00:00Z", "steps": 12}], request_date)
+            if metric == "floors":
+                return normalize_floors([{"time": "2026-01-01T01:00:00Z", "floors": 2}], request_date)
+            if metric == "intensity_moderate":
+                return normalize_intensity([{"start": "2026-01-01T01:00:00Z", "moderateIntensityMinutes": 1}], request_date, "moderate")
+            if metric == "intensity_vigorous":
+                return normalize_intensity([{"start": "2026-01-01T01:00:00Z", "vigorousIntensityMinutes": 3}], request_date, "vigorous")
+            return ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(1, inserted_count=1))
+    store = _Store()
+    archive = _sync_archive(Source(), recorder, store)
+    await archive.async_start()
+
+    report = await archive.async_sync_range(target, target)
+
+    assert report.outcome == "written"
+    assert archive.get_history_presence(target, target)[target.isoformat()] == {
+        "body_battery": "present",
+        "steps": "present",
+        "floors": "present",
+        "intensity_moderate": "present",
+        "intensity_vigorous": "present",
+    }
+    written = {
+        call.args[1].key: call.args[2][0].value
+        for call in recorder.async_write.await_args_list
+        if call.args[2]
+    }
+    assert {key: written[key] for key in ("body_battery", "steps", "floors", "intensity_moderate", "intensity_vigorous")} == {
+        "body_battery": 42.0,
+        "steps": 12.0,
+        "floors": 2.0,
+        "intensity_moderate": 1.0,
+        "intensity_vigorous": 3.0,
     }
 
 
