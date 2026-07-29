@@ -15,6 +15,7 @@ from typing import Any, Protocol
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 from .backfill import (
     BackfillScheduler,
@@ -23,6 +24,9 @@ from .backfill import (
     count_uncompleted_dates,
 )
 from .const import (
+    CONF_ARCHIVE_ACTIVATION_DATE,
+    CONF_ARCHIVE_ENABLED,
+    CONF_ARCHIVE_LAST_ENABLED,
     CONF_HISTORY_ACCOUNT_KEY,
     DOMAIN,
     HISTORY_STORE_VERSION,
@@ -326,6 +330,9 @@ class GarminHistoryArchive:
         self._fit_archives: dict[str, dict[str, dict[str, Any]]] = {}
         self._sleep_partition_stores: dict[str, Any] = {}
         self._presence: dict[str, dict[str, str]] = {}
+        self._archive_enabled = False
+        self._activation_date: date | None = None
+        self._account_key_value: str | None = None
         self._backfill: BackfillScheduler | None = None
         self._backfill_task: asyncio.Task[Any] | None = None
 
@@ -333,6 +340,16 @@ class GarminHistoryArchive:
     def status(self) -> HistoryStatus:
         """Return the immutable, privacy-safe current status."""
         return self._status
+
+    @property
+    def archive_enabled(self) -> bool:
+        """Return whether prospective automatic archival is enabled."""
+        return self._archive_enabled
+
+    @property
+    def activation_date(self) -> date | None:
+        """Return the persisted Archive Activation Date, if established."""
+        return self._activation_date
 
     def _backfill_status_fields(self) -> dict[str, Any]:
         return {
@@ -383,6 +400,7 @@ class GarminHistoryArchive:
 
         try:
             account_key = self._async_ensure_account_key()
+            self._async_update_enablement_state()
         except asyncio.CancelledError:
             self._started = False
             await self.async_stop()
@@ -436,14 +454,6 @@ class GarminHistoryArchive:
             return
 
         self._status = HistoryStatus(HistoryArchiveState.IDLE)
-        self._backfill = BackfillScheduler(
-            load_state=self._async_load_backfill_state,
-            save_state=self._async_save_backfill_state,
-            sync_date=lambda target: self.async_sync_range(target, target, fit_limit=1, include_training_status=False),
-            reauth=self._async_backfill_reauth,
-        )
-        if isinstance(self._hass, HomeAssistant):
-            self._backfill_task = self._hass.async_create_task(self._backfill.async_run())
 
     async def async_stop(self) -> None:
         """Stop archive tasks and leave no background work behind."""
@@ -1033,12 +1043,47 @@ class GarminHistoryArchive:
         """Load or create the opaque identity persisted in the config entry."""
         current = self._entry.data.get(CONF_HISTORY_ACCOUNT_KEY)
         if isinstance(current, str) and _is_valid_account_key(current):
+            self._account_key_value = current
             return current
 
         account_key = secrets.token_urlsafe(24)
         data = {**self._entry.data, CONF_HISTORY_ACCOUNT_KEY: account_key}
         self._hass.config_entries.async_update_entry(self._entry, data=data)
+        self._account_key_value = account_key
         return account_key
+
+    def _async_update_enablement_state(self) -> None:
+        """Persist Archive Enablement transitions without starting sync work."""
+        options = getattr(self._entry, "options", None)
+        enabled = isinstance(options, Mapping) and bool(
+            options.get(CONF_ARCHIVE_ENABLED, False)
+        )
+        raw_data = getattr(self._entry, "data", {})
+        data = dict(raw_data) if isinstance(raw_data, Mapping) else {}
+        original = dict(data)
+        was_enabled = data.get(CONF_ARCHIVE_LAST_ENABLED) is True
+
+        if enabled and not was_enabled:
+            data[CONF_ARCHIVE_ACTIVATION_DATE] = dt_util.now().date().isoformat()
+            data[CONF_ARCHIVE_LAST_ENABLED] = True
+        elif not enabled and was_enabled:
+            data[CONF_ARCHIVE_LAST_ENABLED] = False
+
+        if data != original:
+            if self._account_key_value is not None:
+                data[CONF_HISTORY_ACCOUNT_KEY] = self._account_key_value
+            self._hass.config_entries.async_update_entry(self._entry, data=data)
+
+        self._archive_enabled = enabled
+        raw_activation_date = data.get(CONF_ARCHIVE_ACTIVATION_DATE)
+        try:
+            self._activation_date = (
+                date.fromisoformat(raw_activation_date)
+                if isinstance(raw_activation_date, str)
+                else None
+            )
+        except ValueError:
+            self._activation_date = None
 
     async def _async_initialize_store(self, account_key: str) -> None:
         """Create and validate the per-account Store catalog."""

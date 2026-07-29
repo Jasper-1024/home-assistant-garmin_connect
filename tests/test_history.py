@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import tempfile
+from datetime import UTC, date, datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from homeassistant import loader
 from homeassistant.config_entries import ConfigEntries
@@ -12,6 +13,11 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.recorder import async_initialize_recorder
 from homeassistant.setup import async_setup_component
 
+from custom_components.garmin_connect.const import (
+    CONF_ARCHIVE_ACTIVATION_DATE,
+    CONF_ARCHIVE_ENABLED,
+    CONF_ARCHIVE_LAST_ENABLED,
+)
 from custom_components.garmin_connect.history import (
     GarminHistoryArchive,
     HistoryArchiveState,
@@ -52,6 +58,7 @@ def _entry(*, entry_id: str = "entry-1", data: dict | None = None) -> MagicMock:
     entry.entry_id = entry_id
     entry.title = "Garmin account"
     entry.data = data or {}
+    entry.options = {}
     return entry
 
 
@@ -107,6 +114,79 @@ async def test_start_persists_opaque_account_key_and_reuses_it() -> None:
 
     assert second.status.state is HistoryArchiveState.IDLE
     assert hass.config_entries.async_update_entry.call_count == 1
+
+
+async def test_start_keeps_historical_backfill_dormant() -> None:
+    """Normal archive setup must not construct the legacy backfill scheduler."""
+    hass = _hass()
+    checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
+    archive = _archive(hass, _entry(), checker)
+
+    with patch("custom_components.garmin_connect.history.BackfillScheduler") as backfill:
+        await archive.async_start()
+
+    backfill.assert_not_called()
+
+
+async def test_enablement_persists_local_activation_date() -> None:
+    """Enabling archival records the current Home Assistant local date."""
+    hass = _hass()
+    entry = _entry(data={CONF_ARCHIVE_LAST_ENABLED: False})
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
+    now = datetime(2026, 8, 3, 1, 30, tzinfo=UTC)
+
+    with patch("custom_components.garmin_connect.history.dt_util.now", return_value=now):
+        await _archive(hass, entry, checker).async_start()
+
+    persisted = hass.config_entries.async_update_entry.call_args.kwargs["data"]
+    assert persisted[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-08-03"
+    assert persisted[CONF_ARCHIVE_LAST_ENABLED] is True
+
+
+async def test_reenablement_replaces_activation_date_without_starting_backfill() -> None:
+    """Re-enabling starts a new prospective boundary and preserves old data."""
+    hass = _hass()
+    entry = _entry(
+        data={
+            CONF_ARCHIVE_ACTIVATION_DATE: "2026-07-01",
+            CONF_ARCHIVE_LAST_ENABLED: False,
+        }
+    )
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
+    now = datetime(2026, 8, 3, 1, 30, tzinfo=UTC)
+
+    with patch("custom_components.garmin_connect.history.dt_util.now", return_value=now):
+        archive = _archive(hass, entry, checker)
+        await archive.async_start()
+
+    persisted = hass.config_entries.async_update_entry.call_args.kwargs["data"]
+    assert persisted[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-08-03"
+    assert persisted[CONF_ARCHIVE_LAST_ENABLED] is True
+    assert archive.async_sync_range is not None
+
+
+async def test_disablement_preserves_activation_date_and_manual_repair() -> None:
+    """Disabling stops automatic work but leaves archive queries and repair intact."""
+    hass = _hass()
+    entry = _entry(
+        data={
+            CONF_ARCHIVE_ACTIVATION_DATE: "2026-07-01",
+            CONF_ARCHIVE_LAST_ENABLED: True,
+        }
+    )
+    entry.options = {CONF_ARCHIVE_ENABLED: False}
+    checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
+
+    archive = _archive(hass, entry, checker)
+    await archive.async_start()
+
+    persisted = hass.config_entries.async_update_entry.call_args.kwargs["data"]
+    assert persisted[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-07-01"
+    assert persisted[CONF_ARCHIVE_LAST_ENABLED] is False
+    assert archive.archive_enabled is False
+    assert archive.activation_date == date(2026, 7, 1)
 
 
 async def test_different_entries_get_different_account_keys() -> None:

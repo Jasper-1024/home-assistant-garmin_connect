@@ -70,11 +70,13 @@
       "init": {
         "data": {
           "scan_interval": "Update interval (seconds)",
-          "is_cn": "Use Garmin Connect China (cn.garmin.com)"
+          "is_cn": "Use Garmin Connect China (cn.garmin.com)",
+          "archive_enabled": "Enable prospective archive"
         },
         "data_description": {
           "scan_interval": "How often to fetch data from Garmin Connect (60–3600 seconds)",
-          "is_cn": "Enable for accounts registered on the Chinese Garmin Connect platform"
+          "is_cn": "Enable for accounts registered on the Chinese Garmin Connect platform",
+          "archive_enabled": "Start collecting a durable Garmin history from the enablement date"
         },
         "description": "Configure your Garmin Connect integration settings.",
         "title": "Garmin Connect Options"

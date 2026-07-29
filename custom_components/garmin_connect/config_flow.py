@@ -26,11 +26,13 @@ from homeassistant.config_entries import (
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 
 from .const import (
+    CONF_ARCHIVE_ENABLED,
     CONF_CLIENT_ID,
     CONF_IS_CN,
     CONF_REFRESH_TOKEN,
     CONF_SCAN_INTERVAL,
     CONF_TOKEN,
+    DEFAULT_ARCHIVE_ENABLED,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     MAX_SCAN_INTERVAL,
@@ -136,7 +138,10 @@ class GarminConnectConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_create_entry(
             title=username,
             data=self._token_data(),
-            options={CONF_IS_CN: self._is_cn},
+            options={
+                CONF_IS_CN: self._is_cn,
+                CONF_ARCHIVE_ENABLED: DEFAULT_ARCHIVE_ENABLED,
+            },
         )
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
@@ -296,13 +301,27 @@ class GarminConnectOptionsFlow(OptionsFlow):
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Manage the options."""
-        if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
-
         current_scan_interval = self.config_entry.options.get(
             CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
         )
         current_is_cn = self.config_entry.options.get(CONF_IS_CN, False)
+        current_archive_enabled = self.config_entry.options.get(
+            CONF_ARCHIVE_ENABLED, DEFAULT_ARCHIVE_ENABLED
+        )
+
+        if user_input is not None:
+            return self.async_create_entry(
+                title="",
+                data={
+                    CONF_SCAN_INTERVAL: user_input.get(
+                        CONF_SCAN_INTERVAL, current_scan_interval
+                    ),
+                    CONF_IS_CN: user_input.get(CONF_IS_CN, current_is_cn),
+                    CONF_ARCHIVE_ENABLED: user_input.get(
+                        CONF_ARCHIVE_ENABLED, current_archive_enabled
+                    ),
+                },
+            )
 
         return self.async_show_form(
             step_id="init",
@@ -316,6 +335,10 @@ class GarminConnectOptionsFlow(OptionsFlow):
                         vol.Range(min=MIN_SCAN_INTERVAL, max=MAX_SCAN_INTERVAL),
                     ),
                     vol.Optional(CONF_IS_CN, default=current_is_cn): bool,
+                    vol.Optional(
+                        CONF_ARCHIVE_ENABLED,
+                        default=current_archive_enabled,
+                    ): bool,
                 }
             ),
         )

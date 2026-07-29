@@ -70,11 +70,13 @@
       "init": {
         "data": {
           "scan_interval": "更新间隔(秒)",
-          "is_cn": "使用 Garmin Connect 中国版 (cn.garmin.com)"
+          "is_cn": "使用 Garmin Connect 中国版 (cn.garmin.com)",
+          "archive_enabled": "启用前瞻性存档"
         },
         "data_description": {
           "scan_interval": "从 Garmin Connect 获取数据的频率(60–3600 秒)",
-          "is_cn": "为在中国 Garmin Connect 平台注册的账户启用"
+          "is_cn": "为在中国 Garmin Connect 平台注册的账户启用",
+          "archive_enabled": "从启用日期开始持久保存 Garmin 数据"
         },
         "description": "配置您的 Garmin Connect 集成。",
         "title": "Garmin Connect 选项"

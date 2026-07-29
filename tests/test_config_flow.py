@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from ha_garmin import GarminAuthError, GarminConnectError, GarminMFARequired, GarminRateLimitError
 
 from custom_components.garmin_connect.const import (
+    CONF_ARCHIVE_ENABLED,
     CONF_SCAN_INTERVAL,
     DEFAULT_SCAN_INTERVAL,
 )
@@ -273,6 +274,35 @@ async def test_options_flow_saves_new_interval() -> None:
 
     assert result["type"] == "create_entry"
     assert result["data"][CONF_SCAN_INTERVAL] == 120
+
+
+async def test_options_flow_exposes_archive_enablement_default_off() -> None:
+    """Archive enablement is an explicit persistent option and defaults off."""
+    flow = _make_options_flow({})
+
+    result = await flow.async_step_init(None)
+
+    schema = result["data_schema"]
+    assert schema({})[CONF_ARCHIVE_ENABLED] is False
+
+
+async def test_options_flow_accepts_archive_enablement() -> None:
+    """Operators can explicitly enable the prospective archive."""
+    flow = _make_options_flow({})
+
+    result = await flow.async_step_init({CONF_ARCHIVE_ENABLED: True})
+
+    assert result["type"] == "create_entry"
+    assert result["data"][CONF_ARCHIVE_ENABLED] is True
+
+
+async def test_options_flow_submission_keeps_archive_disabled_by_default() -> None:
+    """Submitting unrelated options keeps archival explicitly disabled."""
+    flow = _make_options_flow({})
+
+    result = await flow.async_step_init({CONF_SCAN_INTERVAL: 120})
+
+    assert result["data"][CONF_ARCHIVE_ENABLED] is False
 
 
 async def test_options_flow_uses_default_when_options_empty() -> None:
