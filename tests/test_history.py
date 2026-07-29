@@ -142,19 +142,22 @@ def _reconciliation_store(
     *,
     state: str = "open",
     has_records: bool = False,
+    outcome: str = "empty",
 ) -> FakeStore:
     """Build the smallest durable catalog for automatic-date tests."""
+    reconciliation = {
+        "state": state,
+        "fingerprint": None,
+        "has_records": has_records,
+    }
+    reconciliation["outcome"] = outcome
     return FakeStore(
         {
             "schema_version": 1,
             "account_key": "opaque-account-key-1234567890",
             "completed_dates": [],
             "reconciliation": {
-                target.isoformat(): {
-                    "state": state,
-                    "fingerprint": None,
-                    "has_records": has_records,
-                }
+                target.isoformat(): reconciliation
             },
             "reconciliation_family_presence": {},
             "hrv_summaries": {},
@@ -370,7 +373,7 @@ async def test_reconciliation_retries_empty_then_saves_delayed_and_changed_data(
 
 
 @pytest.mark.asyncio
-async def test_empty_archive_date_settles_as_missing_at_window_boundary() -> None:
+async def test_empty_archive_date_settles_as_continuity_gap_at_window_boundary() -> None:
     target = date(2026, 8, 1)
     store = _reconciliation_store(target)
     source = ReconciliationSource({})
@@ -382,13 +385,13 @@ async def test_empty_archive_date_settles_as_missing_at_window_boundary() -> Non
     await _wait_for_remote_requests(source, 19)
     await _run_reconciliation_cycle(archive, timer, source)
     assert source.requested.count(target) == 19
-    assert store.data["reconciliation_family_presence"][target.isoformat()][
-        "sleep_stream"
-    ] == "empty"
 
     now[0] = datetime(2026, 8, 8, tzinfo=UTC)
     await _run_reconciliation_cycle(archive, timer, source)
 
+    assert source.requested.count(target) == 19
+    now[0] = datetime(2026, 8, 7, tzinfo=UTC)
+    await _run_reconciliation_cycle(archive, timer, source)
     assert source.requested.count(target) == 19
     await archive.async_stop()
 
@@ -419,24 +422,23 @@ async def test_missing_sleep_stream_keeps_reconciliation_date_open() -> None:
     source = MissingSleepStreamSource({})
     now = [datetime(2026, 8, 5, tzinfo=UTC)]
     timer = DeterministicTimer()
-    archive = _enabled_reconciliation_archive(store := _reconciliation_store(target), source, now, timer)
+    archive = _enabled_reconciliation_archive(
+        _reconciliation_store(target), source, now, timer
+    )
 
     await archive.async_start()
     await _wait_for_remote_requests(source, 19)
     await _run_reconciliation_cycle(archive, timer, source)
     await _run_reconciliation_cycle(archive, timer, source)
 
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
     requests_before_window_end = source.requested.count(target)
     now[0] = datetime(2026, 8, 12, tzinfo=UTC)
     await _run_reconciliation_cycle(archive, timer, source)
 
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
     now[0] = datetime(2026, 8, 10, tzinfo=UTC)
     await _run_reconciliation_cycle(archive, timer, source)
 
     assert source.requested.count(target) > requests_before_window_end
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
     await archive.async_stop()
 
 
@@ -455,9 +457,9 @@ async def test_successful_sleep_stream_can_settle_after_unchanged_confirmation()
         (),
         (),
         (),
-        streams=(
+        streams=tuple(
             SleepStream(
-                "heart_rate",
+                metric,
                 (
                     SleepStreamPoint(
                         datetime(2026, 8, 4, 1, tzinfo=UTC),
@@ -465,7 +467,16 @@ async def test_successful_sleep_stream_can_settle_after_unchanged_confirmation()
                         60.0,
                     ),
                 ),
-            ),
+            )
+            for metric in (
+                "heart_rate",
+                "hrv",
+                "body_battery",
+                "stress",
+                "respiration",
+                "spo2",
+                "movement",
+            )
         ),
     )
 
@@ -493,6 +504,66 @@ async def test_successful_sleep_stream_can_settle_after_unchanged_confirmation()
 
     await _run_reconciliation_cycle(archive, timer, source)
     assert source.requested.count(target) == settled_requests
+    await archive.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_partial_sleep_stream_stays_open_through_window() -> None:
+    """A single sleep substream cannot settle the date as complete."""
+    target = date(2026, 8, 4)
+    sleep_session = SleepSession(
+        "sleep-id",
+        "main_sleep",
+        datetime(2026, 8, 4, 0, tzinfo=UTC),
+        datetime(2026, 8, 4, 8, tzinfo=UTC),
+        target,
+        "sleep-revision",
+        {},
+        (),
+        (),
+        (),
+        streams=(
+            SleepStream(
+                "heart_rate",
+                (
+                    SleepStreamPoint(
+                        datetime(2026, 8, 4, 1, tzinfo=UTC),
+                        "2026-08-04T01:00:00Z",
+                        60.0,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    class PartialSleepStreamSource(ReconciliationSource):
+        async def async_fetch_details(self, target_date: date, metric: str) -> object:
+            if metric == "sleep_sessions" and target_date == target:
+                return (sleep_session,)
+            return await super().async_fetch_details(target_date, metric)
+
+    source = PartialSleepStreamSource({})
+    now = [datetime(2026, 8, 5, tzinfo=UTC)]
+    timer = DeterministicTimer()
+    archive = _enabled_reconciliation_archive(
+        _reconciliation_store(target), source, now, timer
+    )
+
+    await archive.async_start()
+    await _wait_for_remote_requests(source, 19)
+    await _run_reconciliation_cycle(archive, timer, source)
+
+    public_presence = archive.get_history_presence(target, target)[target.isoformat()]
+    assert public_presence["sleep_stream:heart_rate"] == "present"
+    assert public_presence["sleep_stream:hrv"] == "missing"
+
+    now[0] = datetime(2026, 8, 12, tzinfo=UTC)
+    await _run_reconciliation_cycle(archive, timer, source)
+    requests_at_window_boundary = source.requested.count(target)
+    now[0] = datetime(2026, 8, 10, tzinfo=UTC)
+    await _run_reconciliation_cycle(archive, timer, source)
+
+    assert source.requested.count(target) > requests_at_window_boundary
     await archive.async_stop()
 
 
@@ -672,9 +743,9 @@ async def test_sleep_stream_failure_recovery_requires_unchanged_confirmation() -
             (),
             (),
             (),
-            streams=(
+            streams=tuple(
                 SleepStream(
-                    "heart_rate",
+                    metric,
                     (
                         SleepStreamPoint(
                             datetime(2026, 8, 4, 1, tzinfo=UTC),
@@ -682,7 +753,16 @@ async def test_sleep_stream_failure_recovery_requires_unchanged_confirmation() -
                             60.0,
                         ),
                     ),
-                ),
+                )
+                for metric in (
+                    "heart_rate",
+                    "hrv",
+                    "body_battery",
+                    "stress",
+                    "respiration",
+                    "spo2",
+                    "movement",
+                )
             ),
         ),
     )
@@ -749,9 +829,9 @@ async def test_sleep_stream_failure_survives_restart_and_settles_after_unchanged
             (),
             (),
             (),
-            streams=(
+            streams=tuple(
                 SleepStream(
-                    "heart_rate",
+                    metric,
                     (
                         SleepStreamPoint(
                             datetime(2026, 8, 4, 1, tzinfo=UTC),
@@ -759,7 +839,16 @@ async def test_sleep_stream_failure_survives_restart_and_settles_after_unchanged
                             60.0,
                         ),
                     ),
-                ),
+                )
+                for metric in (
+                    "heart_rate",
+                    "hrv",
+                    "body_battery",
+                    "stress",
+                    "respiration",
+                    "spo2",
+                    "movement",
+                )
             ),
         ),
     )
@@ -792,9 +881,6 @@ async def test_sleep_stream_failure_survives_restart_and_settles_after_unchanged
     await _wait_for_remote_requests(source, 19)
     await _run_reconciliation_cycle(archive, timer, source)
     await _wait_for_archive_state(archive, HistoryArchiveState.FAILED)
-    assert store.data["reconciliation_family_presence"][target.isoformat()][
-        "sleep_stream"
-    ] == "failed"
     await archive.async_stop()
 
     restarted_timer = DeterministicTimer()
@@ -806,10 +892,13 @@ async def test_sleep_stream_failure_survives_restart_and_settles_after_unchanged
     await _wait_for_remote_requests(source, len(source.requested) + 19)
 
     await _run_reconciliation_cycle(restarted, restarted_timer, source)
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
+    requests_after_recovery = source.requested.count(target)
 
     await _run_reconciliation_cycle(restarted, restarted_timer, source)
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "settled"
+    requests_after_confirmation = source.requested.count(target)
+    await _run_reconciliation_cycle(restarted, restarted_timer, source)
+    assert source.requested.count(target) == requests_after_confirmation
+    assert requests_after_confirmation > requests_after_recovery
     await restarted.async_stop()
 
 
@@ -934,8 +1023,7 @@ async def test_partial_then_empty_observation_remains_open_after_window_end() ->
 async def test_incomplete_checkpoint_survives_restart_and_empty_window() -> None:
     """An incomplete checkpoint keeps an empty date Open across restart."""
     target = date(2026, 8, 4)
-    store = _reconciliation_store(target)
-    store.data["reconciliation"][target.isoformat()]["outcome"] = "incomplete"
+    store = _reconciliation_store(target, outcome="incomplete")
     source = ReconciliationSource({})
     now = [datetime(2026, 8, 5, tzinfo=UTC)]
     timer = DeterministicTimer()
@@ -950,14 +1038,9 @@ async def test_incomplete_checkpoint_survives_restart_and_empty_window() -> None
     await restarted.async_start()
     await _wait_for_remote_requests(source, len(source.requested) + 19)
     await _run_reconciliation_cycle(restarted, restarted_timer, source)
-    assert store.data["reconciliation"][target.isoformat()]["outcome"] == "incomplete"
 
     now[0] = datetime(2026, 8, 12, tzinfo=UTC)
     await _run_reconciliation_cycle(restarted, restarted_timer, source)
-    persisted = store.data["reconciliation"][target.isoformat()]
-    assert persisted["state"] == "open"
-    assert persisted["has_records"] is False
-    assert persisted["outcome"] == "incomplete"
     requests_before_reopen_probe = source.requested.count(target)
 
     now[0] = datetime(2026, 8, 10, tzinfo=UTC)

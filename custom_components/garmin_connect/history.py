@@ -484,15 +484,31 @@ def _sleep_stream_observation(
     elif not streams:
         presence = "missing"
     else:
-        stream_states = {stream.presence for _session_id, stream in streams}
-        if "present" in stream_states:
-            presence = "present"
-        elif "all-null" in stream_states:
-            presence = "all-null"
-        elif "null" in stream_states:
-            presence = "null"
+        streams_by_session = {
+            session.logical_id: {stream.metric: stream for stream in session.streams}
+            for session in sleep_details
+        }
+        if any(
+            any(metric not in session_streams for metric in _SLEEP_STREAM_METADATA)
+            for session_streams in streams_by_session.values()
+        ):
+            presence = "missing"
         else:
-            presence = "empty"
+            stream_states = {
+                stream.presence
+                for session_streams in streams_by_session.values()
+                for stream in session_streams.values()
+            }
+            if stream_states & _RECONCILIATION_UNAVAILABLE_STATES:
+                presence = "missing"
+            elif "present" in stream_states:
+                presence = "present"
+            elif "all-null" in stream_states:
+                presence = "all-null"
+            elif "null" in stream_states:
+                presence = "null"
+            else:
+                presence = "empty"
     has_records = any(
         point.value is not None
         and point.value not in _SLEEP_NEGATIVE_SENTINELS.get(stream.metric, frozenset())
@@ -1206,11 +1222,12 @@ class GarminHistoryArchive:
         """Publish one observation and the structured records it made durable."""
         self._remember_date_reconciliation_observation(target_key, accumulator)
         await self._async_persist_observed_structured_records(checkpoint)
-        await self._async_update_reconciliation_state(
-            target,
-            HistorySyncReport(outcome=outcome),
-            is_current_date=target == self._current_local_date(),
-        )
+        if outcome != "written":
+            await self._async_update_reconciliation_state(
+                target,
+                HistorySyncReport(outcome=outcome),
+                is_current_date=target == self._current_local_date(),
+            )
 
     async def _async_expire_empty_reconciliation_dates(self, current: date) -> None:
         """Settle empty Open Archive Dates that reached the window boundary."""
