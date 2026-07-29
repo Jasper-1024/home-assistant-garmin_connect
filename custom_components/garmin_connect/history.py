@@ -1803,6 +1803,14 @@ class GarminHistoryArchive:
             return HistorySyncReport(outcome="failed", error_type="store_unavailable")
         processed: list[date] = []
         date_results: list[tuple[date, HistorySyncReport]] = []
+
+        def build_failed_date_result(
+            target_date: date, error_type: str
+        ) -> tuple[date, HistorySyncReport]:
+            return target_date, HistorySyncReport(
+                outcome="failed", error_type=error_type
+            )
+
         skipped = 0
         inserted = 0
         updated = 0
@@ -2222,12 +2230,7 @@ class GarminHistoryArchive:
                         **self._backfill_status_fields(),
                     )
                     date_results.append(
-                        (
-                            target,
-                            HistorySyncReport(
-                                outcome="failed", error_type=failed_family_error
-                            ),
-                        )
+                        build_failed_date_result(target, failed_family_error)
                     )
                     return HistorySyncReport(
                         tuple(processed), inserted, updated, skipped,
@@ -2274,12 +2277,7 @@ class GarminHistoryArchive:
                         self._runtime_sync_failure = True
                         self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, error_type="fit_limit_pending", **self._backfill_status_fields())
                         date_results.append(
-                            (
-                                target,
-                                HistorySyncReport(
-                                    outcome="failed", error_type="fit_limit_pending"
-                                ),
-                            )
+                            build_failed_date_result(target, "fit_limit_pending")
                         )
                         return HistorySyncReport(
                             tuple(processed),
@@ -2406,10 +2404,7 @@ class GarminHistoryArchive:
                 )
                 self._runtime_sync_failure = True
                 date_results.append(
-                    (
-                        target,
-                        HistorySyncReport(outcome="failed", error_type=error.error_type),
-                    )
+                    build_failed_date_result(target, error.error_type)
                 )
                 self._status = HistoryStatus(
                     HistoryArchiveState.FAILED,
@@ -2450,12 +2445,7 @@ class GarminHistoryArchive:
                     )
                 self._runtime_sync_failure = True
                 error_type = "garmin_client_error" if isinstance(error, GarminConnectError) else "sync_failed"
-                date_results.append(
-                    (
-                        target,
-                        HistorySyncReport(outcome="failed", error_type=error_type),
-                    )
-                )
+                date_results.append(build_failed_date_result(target, error_type))
                 self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type=error_type, **self._backfill_status_fields())
                 return HistorySyncReport(
                     tuple(processed),
