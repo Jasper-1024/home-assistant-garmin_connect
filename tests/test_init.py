@@ -643,6 +643,13 @@ async def test_runtime_archive_prioritizes_foreground_work_through_shared_gate(t
             assert await asyncio.wait_for(current_task, timeout=0.1) == "current-value"
 
             current_index = client.events.index("current")
+            for _ in range(100):
+                if any(
+                    index > current_index and event.startswith("archive-")
+                    for index, event in enumerate(client.events)
+                ):
+                    break
+                await asyncio.sleep(0.01)
             next_archive_index = next(
                 index
                 for index, event in enumerate(client.events)

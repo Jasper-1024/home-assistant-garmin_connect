@@ -13,6 +13,7 @@ from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal, Protocol, cast
 
 from ha_garmin.exceptions import GarminConnectError
@@ -37,6 +38,7 @@ from .const import (
 from .fit_archive import (
     FitArchiveError,
     async_archive_fit,
+    fit_file_name,
     fit_record,
     inspect_fit,
     validated_fit_summary,
@@ -102,6 +104,7 @@ from .history_source import (
     health_event_from_record,
     health_event_record,
 )
+from .request_gate import GarminRequestPriority
 from .sleep_archive import SleepSchemaError, SleepSession, session_from_record, session_record
 
 _LOGGER = logging.getLogger(__name__)
@@ -118,7 +121,8 @@ _HISTORY_MAX_DAYS = 31
 _FIRST_SYNC_FIT_LIMIT = 1
 _PROSPECTIVE_CYCLE_INTERVAL = timedelta(minutes=15)
 _RECONCILIATION_WINDOW = timedelta(days=7)
-_PROSPECTIVE_CYCLE_FIT_LIMIT = 0
+_FIT_PACING_INTERVAL = timedelta(hours=1)
+_PROSPECTIVE_CYCLE_FIT_LIMIT = 1
 _DATE_SUMMARY_BUCKET_TIME_ZONE = timezone(timedelta(hours=8))
 _PRESENCE_STATES = frozenset({"null", "empty", "all-null", "missing", "unsupported", "returned-empty", "present", "absent", "failed", "mixed", "unknown", "partial", "incomplete"})
 # The frozen numeric catalog currently produces 33 base presence keys: 13
@@ -696,6 +700,21 @@ class _StructuredCheckpoint:
     dirty_years: set[str]
 
 
+def _fit_queue_entry(
+    logical_id: str,
+    activity_id: str,
+    year: str,
+    calendar_date: date,
+) -> dict[str, str]:
+    """Return one bounded, account-local pending FIT record."""
+    return {
+        "logical_id": logical_id,
+        "activity_id": activity_id,
+        "year": year,
+        "calendar_date": calendar_date.isoformat(),
+    }
+
+
 HistoryArchiveClock = Callable[[], datetime]
 HistoryArchiveTimerFactory = Callable[
     [timedelta, Callable[[], None]], Callable[[], None]
@@ -924,6 +943,8 @@ class GarminHistoryArchive:
         self._health_events: dict[str, dict[str, dict[str, Any]]] = {}
         self._activities: dict[str, dict[str, dict[str, Any]]] = {}
         self._fit_archives: dict[str, dict[str, dict[str, Any]]] = {}
+        self._fit_queue: dict[str, dict[str, str]] = {}
+        self._fit_last_eligible_download: datetime | None = None
         self._sleep_partition_stores: dict[str, Any] = {}
         self._presence: dict[str, dict[str, str]] = {}
         self._reconciliation_family_presence: dict[str, dict[str, str]] = {}
@@ -963,6 +984,14 @@ class GarminHistoryArchive:
             "backoff_until": self._status.backoff_until,
             "safe_error_class": self._status.safe_error_class,
         }
+
+    def _fit_base_directory(self) -> Path:
+        """Return the shared FIT root without mixing account files."""
+        return Path(self._hass.config.path("garmin_connect", "fit"))
+
+    def _fit_directory(self) -> Path:
+        """Return this account's private FIT directory."""
+        return self._fit_base_directory() / self._account_key()
 
     @property
     def hrv_summaries(self) -> Mapping[str, Mapping[str, Any]]:
@@ -1105,8 +1134,8 @@ class GarminHistoryArchive:
                 target_date,
                 target_date,
                 fit_limit=_FIRST_SYNC_FIT_LIMIT,
-                fail_on_fit_limit=False,
                 force_date=target_date,
+                process_fit=True,
             )
             await self._async_update_reconciliation_state(
                 target_date, report, is_current_date=True
@@ -1431,8 +1460,8 @@ class GarminHistoryArchive:
                     target_date,
                     target_date,
                     fit_limit=_PROSPECTIVE_CYCLE_FIT_LIMIT,
-                    fail_on_fit_limit=False,
                     force_date=target_date,
+                    process_fit=True,
                 )
                 await self._async_update_reconciliation_state(
                     target_date, current_report, is_current_date=True
@@ -1456,8 +1485,8 @@ class GarminHistoryArchive:
                         reconciliation_date,
                         reconciliation_date,
                         fit_limit=_PROSPECTIVE_CYCLE_FIT_LIMIT,
-                        fail_on_fit_limit=False,
                         force_date=reconciliation_date,
+                        process_fit=True,
                     )
                     await self._async_update_reconciliation_state(
                         reconciliation_date,
@@ -1572,6 +1601,7 @@ class GarminHistoryArchive:
                 fit_limit=fit_limit,
                 include_training_status=include_training_status,
                 force_dates=frozenset(forced_dates),
+                process_fit=self._archive_enabled,
             )
             for target, target_report in report.date_results:
                 # One Manual Repair observation must not settle a date without
@@ -1769,9 +1799,9 @@ class GarminHistoryArchive:
         *,
         fit_limit: int | None = None,
         include_training_status: bool = True,
-        fail_on_fit_limit: bool = True,
         force_date: date | None = None,
         force_dates: Collection[date] = (),
+        process_fit: bool = False,
     ) -> HistorySyncReport:
         """Run one serialized, checkpointed sync.
 
@@ -1814,6 +1844,7 @@ class GarminHistoryArchive:
         skipped = 0
         inserted = 0
         updated = 0
+        fit_archived_count = 0
         health_events: list[NormalizedHealthEvent] = []
         checkpoint = _StructuredCheckpoint(
             presence={key: dict(value) for key, value in self._presence.items()},
@@ -2156,8 +2187,6 @@ class GarminHistoryArchive:
                         checkpoint,
                         outcome="failed",
                     )
-                fit_count = 0
-                fit_deferred = False
                 for activity in activity_details:
                     if activity.calendar_date != target:
                         continue
@@ -2174,23 +2203,17 @@ class GarminHistoryArchive:
                         "end": activity.end.isoformat() if activity.end else None, "duration_seconds": activity.duration_seconds,
                         "training_effect": activity.training_effect, "load": activity.load, "recovery": activity.recovery,
                     }
-                    download_activity = getattr(client, "download_activity", None)
-                    if callable(download_activity):
-                        if activity.logical_id in self._fit_archives.get(year, {}):
-                            continue
-                        if fit_limit is not None and fit_count >= fit_limit:
-                            fit_deferred = True
-                            continue
-                        fit_directory = Path(self._hass.config.path("garmin_connect", "fit"))
-                        fit_result = await async_archive_fit(
-                            client=client,
-                            activity_id=activity.activity_id,
-                            logical_id=activity.logical_id,
-                            directory=fit_directory,
-                            inspect=inspect_fit,
-                        )
-                        self._fit_archives.setdefault(year, {})[activity.logical_id] = fit_result
-                        fit_count += 1
+                    if callable(getattr(client, "download_activity", None)):
+                        if (
+                            activity.logical_id not in self._fit_archives.get(year, {})
+                            and activity.logical_id not in self._fit_queue
+                        ):
+                            self._fit_queue[activity.logical_id] = _fit_queue_entry(
+                                activity.logical_id,
+                                activity.activity_id,
+                                year,
+                                activity.calendar_date,
+                            )
                 await self._async_checkpoint_observation(
                     target,
                     target_key,
@@ -2260,36 +2283,6 @@ class GarminHistoryArchive:
                 self._sleep_sessions = sleep_sessions
                 self._health_events = events_by_year
                 self._activities = activities_by_year
-                if fit_deferred:
-                    # The annual partitions are durable, but the date is not:
-                    # publish their indexes so a restart can restore the
-                    # already archived FIT and continue the deferred batch.
-                    await store.async_save(
-                        self._catalog_record(
-                            completed_dates=self._completed_dates,
-                            presence=presence,
-                            sessions_by_year=sleep_sessions,
-                            events_by_year=events_by_year,
-                            activities_by_year=activities_by_year,
-                        )
-                    )
-                    if fail_on_fit_limit:
-                        self._runtime_sync_failure = True
-                        self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, error_type="fit_limit_pending", **self._backfill_status_fields())
-                        date_results.append(
-                            build_failed_date_result(target, "fit_limit_pending")
-                        )
-                        return HistorySyncReport(
-                            tuple(processed),
-                            inserted,
-                            updated,
-                            skipped,
-                            outcome="failed",
-                            error_type="fit_limit_pending",
-                            date_results=tuple(date_results),
-                        )
-                    self._presence = presence
-                    continue
                 # Publish the catalog checkpoint only after every affected annual
                 # partition is durable. A failed partition save must be replayed.
                 committed_dates_by_year: dict[str, set[str]] = {}
@@ -2368,7 +2361,19 @@ class GarminHistoryArchive:
                 self._completed_dates = completed_dates
                 self._presence = presence
                 self._remember_date_reconciliation_observation(target_key, family_observations)
-                date_results.append((target, HistorySyncReport(outcome="written")))
+                if process_fit:
+                    fit_archived_count += await self._async_process_fit_queue(
+                        client,
+                        limit=fit_limit,
+                    )
+                date_results.append(
+                    (
+                        target,
+                        HistorySyncReport(
+                            outcome="written", fit_count=fit_archived_count
+                        ),
+                    )
+                )
             except asyncio.CancelledError:
                 self._remember_date_reconciliation_observation(
                     target_key, family_observations
@@ -2463,9 +2468,173 @@ class GarminHistoryArchive:
             inserted,
             updated,
             skipped,
+            fit_archived_count,
             outcome="written",
             date_results=tuple(date_results),
         )
+
+    def _fit_queue_records(
+        self, queue: Mapping[str, Mapping[str, str]] | None = None
+    ) -> list[dict[str, str]]:
+        """Serialize pending FIT work in deterministic order."""
+        selected = self._fit_queue if queue is None else queue
+        return [dict(selected[key]) for key in sorted(selected)]
+
+    def _fit_last_eligible_record(self) -> str | None:
+        """Serialize the durable pacing checkpoint."""
+        if self._fit_last_eligible_download is None:
+            return None
+        return self._fit_last_eligible_download.astimezone(UTC).isoformat()
+
+    async def _async_save_fit_state(
+        self,
+        *,
+        queue: Mapping[str, Mapping[str, str]] | None = None,
+        last_eligible_download: datetime | None | object = ...,
+    ) -> None:
+        """Persist queue and pacing without changing public archive status."""
+        if self._store is None:
+            raise FitArchiveError("FIT queue Store unavailable")
+        if last_eligible_download is not ...:
+            self._fit_last_eligible_download = cast(
+                datetime | None, last_eligible_download
+            )
+        catalog = await self._store.async_load()
+        if not isinstance(catalog, Mapping):
+            raise FitArchiveError("FIT queue catalog unavailable")
+        updated = dict(catalog)
+        updated["fit_queue"] = self._fit_queue_records(queue)
+        updated["fit_last_eligible_download"] = self._fit_last_eligible_record()
+        await self._store.async_save(updated)
+
+    async def _async_existing_fit_record(
+        self, logical_id: str
+    ) -> dict[str, Any] | None:
+        """Validate an already-owned local FIT without spending pacing budget."""
+        path = self._fit_directory() / fit_file_name(logical_id)
+        if not path.is_file():
+            return None
+        try:
+            inspected = await asyncio.to_thread(inspect_fit, path, 0o600)
+            safe_summary = validated_fit_summary(inspected)
+        except (OSError, RuntimeError, TypeError, ValueError, FitArchiveError):
+            return None
+        return {
+            "logical_id": logical_id,
+            "path": path.name,
+            "summary": safe_summary,
+        }
+
+    async def _async_process_fit_queue(
+        self, client: Any, *, limit: int | None
+    ) -> int:
+        """Archive eligible pending FIT work while isolating every FIT error."""
+        download_activity = getattr(client, "download_activity", None)
+        if not callable(download_activity):
+            return 0
+        max_downloads = 1 if limit is None else max(0, limit)
+        downloaded = 0
+        request_gate = getattr(
+            getattr(self._entry, "runtime_data", None), "request_gate", None
+        )
+
+        async def gated_download(activity_id: int, file_format: str) -> bytes:
+            async def request() -> bytes:
+                return await download_activity(activity_id, file_format)
+
+            if request_gate is None or not callable(
+                getattr(request_gate, "async_request", None)
+            ):
+                return await request()
+            return await request_gate.async_request(
+                GarminRequestPriority.BACKGROUND, request
+            )
+
+        fit_client = SimpleNamespace(download_activity=gated_download)
+        for logical_id, queued in sorted(self._fit_queue.items()):
+            year = queued["year"]
+            try:
+                await self._async_load_sleep_partitions({year})
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _LOGGER.warning("Garmin FIT partition load failed")
+                return downloaded
+            existing = self._fit_archives.get(year, {}).get(logical_id)
+            if existing is None:
+                existing = await self._async_existing_fit_record(logical_id)
+            if existing is not None:
+                try:
+                    await self._async_save_fit_partition_and_queue(
+                        queued, existing, client_sessions=self._sleep_sessions,
+                        client_events=self._health_events,
+                        client_activities=self._activities,
+                    )
+                except Exception:
+                    _LOGGER.warning("Garmin FIT completion checkpoint failed")
+                    return downloaded
+                continue
+            if downloaded >= max_downloads:
+                break
+            now = self._utc_now().astimezone(UTC)
+            if (
+                self._fit_last_eligible_download is not None
+                and now < self._fit_last_eligible_download + _FIT_PACING_INTERVAL
+            ):
+                break
+            try:
+                await asyncio.shield(
+                    self._async_save_fit_state(last_eligible_download=now)
+                )
+                fit_result = await async_archive_fit(
+                    client=fit_client,
+                    activity_id=queued["activity_id"],
+                    logical_id=logical_id,
+                    directory=self._fit_directory(),
+                    inspect=inspect_fit,
+                )
+                await self._async_save_fit_partition_and_queue(
+                    queued, fit_result, client_sessions=self._sleep_sessions,
+                    client_events=self._health_events,
+                    client_activities=self._activities,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _LOGGER.warning("Garmin FIT archive attempt failed")
+                return downloaded
+            downloaded += 1
+        return downloaded
+
+    async def _async_save_fit_partition_and_queue(
+        self,
+        queued: Mapping[str, str],
+        fit_result: Mapping[str, Any],
+        *,
+        client_sessions: Mapping[str, Mapping[str, dict[str, Any]]],
+        client_events: Mapping[str, Mapping[str, dict[str, Any]]],
+        client_activities: Mapping[str, Mapping[str, dict[str, Any]]],
+    ) -> None:
+        """Checkpoint one accepted FIT and remove only that queue item."""
+        logical_id = queued["logical_id"]
+        year = queued["year"]
+        activities = client_activities.get(year, {})
+        if logical_id not in activities:
+            raise FitArchiveError("FIT activity record is unavailable")
+        parsed_fit = fit_record(fit_result)
+        self._fit_archives.setdefault(year, {})[logical_id] = parsed_fit
+        await self._async_save_sleep_partitions(
+            client_sessions,
+            client_events,
+            client_activities,
+            self._fit_archives,
+            years={year},
+        )
+        remaining = {
+            key: value for key, value in self._fit_queue.items() if key != logical_id
+        }
+        await self._async_save_fit_state(queue=remaining)
+        self._fit_queue.pop(logical_id, None)
 
     def _catalog_record(
         self,
@@ -2479,6 +2648,8 @@ class GarminHistoryArchive:
         numeric_source_date_outbox: Mapping[str, Mapping[str, Mapping[str, str]]] | None = None,
         numeric_source_date_confirmed: Mapping[str, Mapping[str, Mapping[str, str]]] | None = None,
         reconciliation: Mapping[str, _ReconciliationEntry] | None = None,
+        fit_queue: Mapping[str, Mapping[str, str]] | None = None,
+        fit_last_eligible_download: datetime | None | object = ...,
     ) -> dict[str, Any]:
         """Build a bounded catalog record after partitions are durable."""
         return {
@@ -2543,6 +2714,16 @@ class GarminHistoryArchive:
             "sleep_index": {year: sorted(records) for year, records in sessions_by_year.items()},
             "event_index": {year: sorted(records) for year, records in events_by_year.items()},
             "activity_index": {year: sorted(records) for year, records in activities_by_year.items()},
+            "fit_queue": self._fit_queue_records(fit_queue),
+            "fit_last_eligible_download": (
+                self._fit_last_eligible_record()
+                if fit_last_eligible_download is ...
+                else (
+                    fit_last_eligible_download.astimezone(UTC).isoformat()
+                    if isinstance(fit_last_eligible_download, datetime)
+                    else None
+                )
+            ),
         }
 
     def _remember_numeric_source_dates(
@@ -3058,9 +3239,16 @@ class GarminHistoryArchive:
                         if restored_fit["logical_id"] != key or key not in parsed_activities:
                             invalid_fit_keys.add(key)
                             continue
-                        fit_directory = Path(self._hass.config.path("garmin_connect", "fit")).resolve()
+                        fit_directory = self._fit_directory().resolve()
                         fit_path = (fit_directory / restored_fit["path"]).resolve()
+                        legacy_directory = self._fit_base_directory().resolve()
+                        legacy_path = (legacy_directory / restored_fit["path"]).resolve()
                         if fit_path.parent != fit_directory or not fit_path.is_file():
+                            if legacy_path.parent != legacy_directory or not legacy_path.is_file():
+                                invalid_fit_keys.add(key)
+                                continue
+                            fit_path = legacy_path
+                        if not fit_path.is_file():
                             invalid_fit_keys.add(key)
                             continue
                         inspected = await asyncio.to_thread(inspect_fit, fit_path, 0o600)
@@ -3195,6 +3383,8 @@ class GarminHistoryArchive:
                     "sleep_index": {},
                     "event_index": {},
                     "activity_index": {},
+                    "fit_queue": [],
+                    "fit_last_eligible_download": None,
                 }
             )
             return
@@ -3460,6 +3650,48 @@ class GarminHistoryArchive:
                 bounded_families[family] = state
             parsed_reconciliation_presence[key] = bounded_families
         self._reconciliation_family_presence = parsed_reconciliation_presence
+        raw_fit_queue = catalog.get("fit_queue", [])
+        if not isinstance(raw_fit_queue, list):
+            raise ValueError("FIT queue is invalid")
+        for item in raw_fit_queue:
+            if not isinstance(item, Mapping):
+                raise ValueError("FIT queue is invalid")
+            logical_id = item.get("logical_id")
+            activity_id = item.get("activity_id")
+            year = item.get("year")
+            calendar_date = item.get("calendar_date")
+            if (
+                not isinstance(logical_id, str)
+                or not logical_id
+                or any(character not in "0123456789abcdef" for character in logical_id)
+                or not isinstance(activity_id, str)
+                or not activity_id
+                or not isinstance(year, str)
+                or len(year) != 4
+                or not year.isdecimal()
+                or not isinstance(calendar_date, str)
+            ):
+                raise ValueError("FIT queue is invalid")
+            try:
+                parsed_calendar_date = date.fromisoformat(calendar_date)
+            except ValueError as err:
+                raise ValueError("FIT queue is invalid") from err
+            if parsed_calendar_date.isoformat() != calendar_date or str(parsed_calendar_date.year) != year:
+                raise ValueError("FIT queue is invalid")
+            self._fit_queue[logical_id] = _fit_queue_entry(
+                logical_id, activity_id, year, parsed_calendar_date
+            )
+        raw_fit_last = catalog.get("fit_last_eligible_download")
+        if raw_fit_last is not None:
+            if not isinstance(raw_fit_last, str):
+                raise ValueError("FIT pacing state is invalid")
+            try:
+                parsed_fit_last = datetime.fromisoformat(raw_fit_last)
+            except ValueError as err:
+                raise ValueError("FIT pacing state is invalid") from err
+            if parsed_fit_last.tzinfo is None or parsed_fit_last.utcoffset() is None:
+                raise ValueError("FIT pacing state is invalid")
+            self._fit_last_eligible_download = parsed_fit_last.astimezone(UTC)
         raw_sleep = catalog.get("sleep_index", catalog.get("sleep_sessions", {}))
         raw_events = catalog.get("event_index", {})
         raw_activities = catalog.get("activity_index", {})

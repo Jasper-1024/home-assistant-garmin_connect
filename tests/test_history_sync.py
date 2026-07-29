@@ -2190,19 +2190,21 @@ async def test_background_fit_limit_defers_then_converges_across_restart(tmp_pat
     archive._entry.runtime_data.core.client = client
     archive._hass.config.path.return_value = str(tmp_path)
     await archive.async_start()
+    archive._archive_enabled = True
     first = await archive.async_sync_range(date(2026, 1, 1), date(2026, 1, 1), fit_limit=1, include_training_status=False)
-    assert first.error_type == "fit_limit_pending"
-    assert "2026-01-01" not in stores["garmin_connect.e.history_catalog"].data["completed_dates"]
-    assert len(stores["garmin_connect.e.sleep_2026"].data["fits"]) == 1
-    restarted = _partition_archive(Source(), recorder, stores)
-    restarted._entry.runtime_data.core.client = client
-    restarted._hass.config.path.return_value = str(tmp_path)
-    await restarted.async_start()
-    assert set(restarted._fit_archives["2026"]) == {activities[0].logical_id}
-    second = await restarted.async_sync_range(date(2026, 1, 1), date(2026, 1, 1), fit_limit=1, include_training_status=False)
-    assert second.outcome == "written"
+    assert first.outcome == "written"
+    assert first.fit_count == 1
     assert "2026-01-01" in stores["garmin_connect.e.history_catalog"].data["completed_dates"]
-    assert client.download_activity.await_count == 2
+    assert len(stores["garmin_connect.e.sleep_2026"].data["fits"]) == 1
+    assert stores["garmin_connect.e.history_catalog"].data["fit_queue"] == [
+        {
+            "logical_id": activities[1].logical_id,
+            "activity_id": activities[1].activity_id,
+            "year": "2026",
+            "calendar_date": "2026-01-01",
+        }
+    ]
+    assert client.download_activity.await_count == 1
 
 
 @pytest.mark.asyncio
