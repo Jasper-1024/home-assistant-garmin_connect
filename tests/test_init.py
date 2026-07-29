@@ -353,6 +353,8 @@ async def test_real_config_entry_lifecycle_keeps_backfill_dormant_and_surfaces_v
             assert entry.runtime_data.history_archive.status.state.value == "idle"
             assert entry.runtime_data.history_archive.activation_date == date(2026, 8, 10)
             assert backfill.call_count == 0
+            assert await hass.config_entries.async_unload(entry.entry_id)
+            assert entry.state is ConfigEntryState.NOT_LOADED
     finally:
         hass.config_entries._store._async_cleanup_delay_listener()
         await hass.async_stop(force=True)

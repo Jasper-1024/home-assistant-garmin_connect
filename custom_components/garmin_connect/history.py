@@ -8,7 +8,7 @@ import logging
 import secrets
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, replace
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
@@ -107,6 +107,8 @@ _RECORDER_BARRIER_TIMEOUT = 10
 _HISTORY_MIN_DATE = date(2026, 1, 1)
 _HISTORY_MAX_DAYS = 31
 _FIRST_SYNC_FIT_LIMIT = 1
+_PROSPECTIVE_CYCLE_INTERVAL = timedelta(minutes=15)
+_PROSPECTIVE_CYCLE_FIT_LIMIT = 0
 _PRESENCE_STATES = frozenset({"null", "empty", "missing", "unsupported", "returned-empty", "present", "absent"})
 _SLEEP_SCHEMA_VERSION = 1
 _SLEEP_STREAM_METADATA = {
@@ -182,6 +184,28 @@ class HistorySyncReport:
 
 class _InvalidArchiveActivationDateError(ValueError):
     """Raised when enabled archival has no trustworthy persisted boundary."""
+
+
+HistoryArchiveClock = Callable[[], datetime]
+HistoryArchiveTimerFactory = Callable[
+    [timedelta, Callable[[], None]], Callable[[], None]
+]
+
+
+def _default_history_timer_factory(
+    delay: timedelta, callback: Callable[[], None]
+) -> Callable[[], None]:
+    """Schedule one archive wakeup on the active Home Assistant loop."""
+    handle = asyncio.get_running_loop().call_later(delay.total_seconds(), callback)
+    return handle.cancel
+
+
+def _noop_history_timer_factory(
+    delay: timedelta, callback: Callable[[], None]
+) -> Callable[[], None]:
+    """Keep non-Home Assistant unit doubles free of real event-loop timers."""
+    del delay, callback
+    return lambda: None
 
 
 def _is_valid_archive_activation_date(value: object) -> bool:
@@ -358,6 +382,8 @@ class GarminHistoryArchive:
         store_factory: Callable[..., Any] | None = None,
         source_factory: Callable[..., GarminHistorySource] | None = None,
         recorder_factory: Callable[..., GarminHistoryRecorder] | None = None,
+        clock: HistoryArchiveClock | None = None,
+        timer_factory: HistoryArchiveTimerFactory | None = None,
     ) -> None:
         """Initialize an archive without doing I/O or creating tasks."""
         self._hass = hass
@@ -366,6 +392,12 @@ class GarminHistoryArchive:
         self._store_factory = store_factory
         self._source_factory = source_factory
         self._recorder_factory = recorder_factory
+        self._clock = clock
+        self._timer_factory = timer_factory or (
+            _default_history_timer_factory
+            if isinstance(hass, HomeAssistant)
+            else _noop_history_timer_factory
+        )
         self._store: Any | None = None
         self._started = False
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -387,6 +419,9 @@ class GarminHistoryArchive:
         self._account_key_value: str | None = None
         self._backfill: BackfillScheduler | None = None
         self._backfill_task: asyncio.Task[Any] | None = None
+        self._cycle_timer_cancel: Callable[[], None] | None = None
+        self._cycle_task: asyncio.Task[Any] | None = None
+        self._cycle_pending = False
 
     @property
     def status(self) -> HistoryStatus:
@@ -548,7 +583,7 @@ class GarminHistoryArchive:
             # path attaches it before starting the archive.
             return
 
-        target_date = dt_util.as_local(dt_util.utcnow()).date()
+        target_date = self._current_local_date()
         async with self._sync_lock:
             report = await self._async_sync_range(
                 target_date,
@@ -557,17 +592,112 @@ class GarminHistoryArchive:
                 fail_on_fit_limit=False,
                 force_date=target_date,
             )
-        if report.outcome != "written" and self._status.state is not HistoryArchiveState.FAILED:
-            self._set_failed(report.error_type or "first_sync")
+        if report.outcome != "written":
+            if self._status.state is not HistoryArchiveState.FAILED:
+                self._set_failed(report.error_type or "first_sync")
+            return
+        self._schedule_next_cycle()
+
+    def _utc_now(self) -> datetime:
+        """Return the injected or Home Assistant UTC clock value."""
+        return self._clock() if self._clock is not None else dt_util.utcnow()
+
+    def _current_local_date(self) -> date:
+        """Return the current Home Assistant local calendar date."""
+        return dt_util.as_local(self._utc_now()).date()
+
+    def _schedule_next_cycle(self) -> None:
+        """Arm one nominal cadence wakeup after a successful first sync."""
+        if (
+            not self._started
+            or not self._archive_enabled
+            or self._cycle_timer_cancel is not None
+        ):
+            return
+        try:
+            self._cycle_timer_cancel = self._timer_factory(
+                _PROSPECTIVE_CYCLE_INTERVAL, self._async_cycle_tick
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._set_failed("schedule")
+            _LOGGER.warning(
+                "Garmin history archive cadence could not be scheduled for entry %s",
+                self._entry.entry_id,
+            )
+
+    def _async_cycle_tick(self) -> None:
+        """Handle one timer tick without allowing overlapping cycles."""
+        self._cycle_timer_cancel = None
+        if not self._started or not self._archive_enabled:
+            return
+        if self._cycle_task is not None and not self._cycle_task.done():
+            self._cycle_pending = True
+        else:
+            self._cycle_task = self._create_cycle_task()
+        self._schedule_next_cycle()
+
+    def _create_cycle_task(self) -> asyncio.Task[Any]:
+        """Create and retain one prospective cycle task."""
+        coroutine = self._async_run_cycle()
+        if isinstance(self._hass, HomeAssistant):
+            task = self._hass.async_create_task(coroutine)
+        else:
+            task = asyncio.create_task(coroutine)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    async def _async_run_cycle(self) -> None:
+        """Synchronize only the current local date at background priority."""
+        try:
+            target_date = self._current_local_date()
+            async with self._sync_lock:
+                report = await self._async_sync_range(
+                    target_date,
+                    target_date,
+                    fit_limit=_PROSPECTIVE_CYCLE_FIT_LIMIT,
+                    fail_on_fit_limit=False,
+                    force_date=target_date,
+                )
+            if (
+                report.outcome != "written"
+                and self._status.state is not HistoryArchiveState.FAILED
+            ):
+                self._set_failed(report.error_type or "cycle")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._set_failed("cycle")
+            _LOGGER.warning(
+                "Garmin history archive cycle failed for entry %s",
+                self._entry.entry_id,
+            )
+        finally:
+            if self._cycle_task is asyncio.current_task():
+                self._cycle_task = None
+            if self._cycle_pending and self._started and self._archive_enabled:
+                self._cycle_pending = False
+                self._cycle_task = self._create_cycle_task()
 
     async def async_stop(self) -> None:
         """Stop archive tasks and leave no background work behind."""
         self._started = False
+        self._cycle_pending = False
+        if self._cycle_timer_cancel is not None:
+            self._cycle_timer_cancel()
+            self._cycle_timer_cancel = None
         first_sync_task = self._first_sync_task
         if first_sync_task is not None and first_sync_task is not asyncio.current_task():
             first_sync_task.cancel()
             await asyncio.gather(first_sync_task, return_exceptions=True)
             self._first_sync_task = None
+        cycle_task = self._cycle_task
+        if cycle_task is not None and cycle_task is not asyncio.current_task():
+            cycle_task.cancel()
+            await asyncio.gather(cycle_task, return_exceptions=True)
+            self._cycle_task = None
         if self._backfill is not None:
             self._backfill.stop()
         if self._backfill_task is not None:

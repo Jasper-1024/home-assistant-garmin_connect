@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
-from datetime import UTC, date, datetime
+from collections.abc import Callable
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
@@ -58,6 +60,34 @@ class FakeRecorderChecker:
 
     async def async_check(self) -> RecorderCompatibilityResult:
         return await self.check()
+
+
+class DeterministicTimer:
+    """Timer adapter whose wakeups are driven explicitly by a test."""
+
+    def __init__(self) -> None:
+        self.scheduled: list[list[object]] = []
+
+    def call_later(self, delay: timedelta, callback: Callable[[], None]) -> Callable[[], None]:
+        slot = [delay, callback, True]
+        self.scheduled.append(slot)
+
+        def cancel() -> None:
+            slot[2] = False
+
+        return cancel
+
+    def fire_next(self) -> None:
+        for slot in self.scheduled:
+            if slot[2]:
+                slot[2] = False
+                cast(Callable[[], None], slot[1])()
+                return
+        raise AssertionError("no timer wakeup is scheduled")
+
+    @property
+    def active(self) -> list[list[object]]:
+        return [slot for slot in self.scheduled if slot[2]]
 
 
 def _entry(*, entry_id: str = "entry-1", data: dict | None = None) -> MagicMock:
@@ -222,6 +252,297 @@ async def test_enabled_start_syncs_only_the_current_local_date() -> None:
         date(2026, 8, 4)
     }
     assert recorder.async_write.await_args_list[0].args[2][0].value == 72.0
+
+
+async def test_successful_first_sync_starts_fifteen_minute_local_day_cycles() -> None:
+    """A successful activation schedules only current-local-date cycles."""
+    hass = _hass()
+    entry = _entry(
+        data={
+            "history_account_key": "opaque-account-key-1234567890",
+            CONF_ARCHIVE_PREVIOUSLY_ENABLED: False,
+        }
+    )
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=object()
+    )
+    now = [datetime(2026, 8, 3, 23, 30, tzinfo=UTC)]
+    timer = DeterministicTimer()
+    requested_dates: list[date] = []
+    first_cycle_done = asyncio.Event()
+    second_cycle_done = asyncio.Event()
+
+    async def fetch(target: date, _metric: str):
+        requested_dates.append(target)
+        if len(requested_dates) == 30:
+            first_cycle_done.set()
+        if len(requested_dates) == 45:
+            second_cycle_done.set()
+        return ()
+
+    source = MagicMock()
+    source.async_fetch = AsyncMock(side_effect=fetch)
+    source.async_fetch_details = None
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=_store_factory(FakeStore()),
+        source_factory=lambda *args: source,
+        recorder_factory=lambda: recorder,
+        clock=lambda: now[0],
+        timer_factory=timer.call_later,
+    )
+
+    with patch(
+        "custom_components.garmin_connect.history.dt_util.DEFAULT_TIME_ZONE",
+        ZoneInfo("Asia/Taipei"),
+    ):
+        await archive.async_start()
+        first_sync_task = archive._first_sync_task
+        assert first_sync_task is not None
+        await first_sync_task
+
+        assert [slot[0] for slot in timer.active] == [timedelta(minutes=15)]
+        timer.fire_next()
+        await asyncio.wait_for(first_cycle_done.wait(), timeout=0.1)
+        assert set(requested_dates) == {date(2026, 8, 4)}
+
+        now[0] = datetime(2026, 8, 4, 23, 30, tzinfo=UTC)
+        timer.fire_next()
+        await asyncio.wait_for(second_cycle_done.wait(), timeout=0.1)
+
+    assert set(requested_dates) == {date(2026, 8, 4), date(2026, 8, 5)}
+    await archive.async_stop()
+
+
+async def test_failed_first_sync_does_not_start_recurring_cadence() -> None:
+    """Activation failure leaves no future archive wakeup armed."""
+    hass = _hass()
+    entry = _entry(
+        data={
+            "history_account_key": "opaque-account-key-1234567890",
+            CONF_ARCHIVE_PREVIOUSLY_ENABLED: False,
+        }
+    )
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=object()
+    )
+    timer = DeterministicTimer()
+    source = MagicMock()
+    source.async_fetch = AsyncMock(
+        return_value=(
+            NormalizedSample(
+                datetime(2026, 8, 4, tzinfo=UTC),
+                date(2026, 8, 4),
+                "2026-08-04T00:00:00Z",
+                72.0,
+            ),
+        )
+    )
+    source.async_fetch_details = None
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(
+        return_value=RecorderWriteOutcome(0, "failed", "recorder_write")
+    )
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=_store_factory(FakeStore()),
+        source_factory=lambda *args: source,
+        recorder_factory=lambda: recorder,
+        timer_factory=timer.call_later,
+    )
+
+    await archive.async_start()
+    first_sync_task = archive._first_sync_task
+    assert first_sync_task is not None
+    await first_sync_task
+
+    assert archive.status.state is HistoryArchiveState.FAILED
+    assert timer.active == []
+
+
+async def test_restart_restores_one_cadence_without_replaying_missed_ticks() -> None:
+    """Restart schedules a fresh cadence and does not replay downtime."""
+    hass = _hass()
+    entry = _entry(
+        data={
+            "history_account_key": "opaque-account-key-1234567890",
+            CONF_ARCHIVE_ACTIVATION_DATE: "2026-08-04",
+            CONF_ARCHIVE_PREVIOUSLY_ENABLED: True,
+        }
+    )
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=object()
+    )
+    store = FakeStore()
+    source = MagicMock()
+    source.async_fetch = AsyncMock(return_value=())
+    source.async_fetch_details = None
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+
+    first_timer = DeterministicTimer()
+    first = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=_store_factory(store),
+        source_factory=lambda *args: source,
+        recorder_factory=lambda: recorder,
+        timer_factory=first_timer.call_later,
+    )
+    await first.async_start()
+    first_sync_task = first._first_sync_task
+    assert first_sync_task is not None
+    await first_sync_task
+    assert len(first_timer.active) == 1
+    await first.async_stop()
+
+    second_timer = DeterministicTimer()
+    restarted = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=_store_factory(store),
+        source_factory=lambda *args: source,
+        recorder_factory=lambda: recorder,
+        timer_factory=second_timer.call_later,
+    )
+    await restarted.async_start()
+    restarted_first_sync = restarted._first_sync_task
+    assert restarted_first_sync is not None
+    await restarted_first_sync
+
+    assert len(second_timer.active) == 1
+    assert [slot[0] for slot in second_timer.active] == [timedelta(minutes=15)]
+    await restarted.async_stop()
+
+
+async def test_cycle_ticks_coalesce_while_one_cycle_is_running() -> None:
+    """A slow cycle admits one follow-up, never a timer backlog."""
+    hass = _hass()
+    entry = _entry(
+        data={
+            "history_account_key": "opaque-account-key-1234567890",
+            CONF_ARCHIVE_PREVIOUSLY_ENABLED: False,
+        }
+    )
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=object()
+    )
+    timer = DeterministicTimer()
+    cycle_started = asyncio.Event()
+    release_cycle = asyncio.Event()
+    follow_up_done = asyncio.Event()
+    calls = 0
+
+    async def fetch(_target: date, _metric: str):
+        nonlocal calls
+        calls += 1
+        if calls == 16:
+            cycle_started.set()
+            await release_cycle.wait()
+        if calls == 45:
+            follow_up_done.set()
+        return ()
+
+    source = MagicMock()
+    source.async_fetch = AsyncMock(side_effect=fetch)
+    source.async_fetch_details = None
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=_store_factory(FakeStore()),
+        source_factory=lambda *args: source,
+        recorder_factory=lambda: recorder,
+        timer_factory=timer.call_later,
+    )
+
+    await archive.async_start()
+    first_sync_task = archive._first_sync_task
+    assert first_sync_task is not None
+    await first_sync_task
+    timer.fire_next()
+    await asyncio.wait_for(cycle_started.wait(), timeout=0.1)
+
+    timer.fire_next()
+    await asyncio.sleep(0)
+    assert calls == 16
+
+    release_cycle.set()
+    await asyncio.wait_for(follow_up_done.wait(), timeout=0.1)
+    assert calls == 45
+    await archive.async_stop()
+
+
+async def test_stop_cancels_cycle_and_future_wakeup() -> None:
+    """Disablement/unload cancels an active cycle and its next tick."""
+    hass = _hass()
+    entry = _entry(
+        data={
+            "history_account_key": "opaque-account-key-1234567890",
+            CONF_ARCHIVE_PREVIOUSLY_ENABLED: False,
+        }
+    )
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=object()
+    )
+    timer = DeterministicTimer()
+    cycle_started = asyncio.Event()
+    cycle_cancelled = asyncio.Event()
+    calls = 0
+
+    async def fetch(_target: date, _metric: str):
+        nonlocal calls
+        calls += 1
+        if calls == 16:
+            cycle_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cycle_cancelled.set()
+                raise
+        return ()
+
+    source = MagicMock()
+    source.async_fetch = AsyncMock(side_effect=fetch)
+    source.async_fetch_details = None
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=_store_factory(FakeStore()),
+        source_factory=lambda *args: source,
+        recorder_factory=lambda: recorder,
+        timer_factory=timer.call_later,
+    )
+
+    await archive.async_start()
+    first_sync_task = archive._first_sync_task
+    assert first_sync_task is not None
+    await first_sync_task
+    timer.fire_next()
+    await asyncio.wait_for(cycle_started.wait(), timeout=0.1)
+
+    await archive.async_stop()
+
+    assert cycle_cancelled.is_set()
+    assert timer.active == []
 
 
 async def test_first_sync_requests_completed_current_local_date() -> None:
