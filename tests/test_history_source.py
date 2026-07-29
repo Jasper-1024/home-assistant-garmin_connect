@@ -158,13 +158,23 @@ def test_normalize_activities_rejects_explicit_event_families() -> None:
 
 
 @pytest.mark.asyncio
-async def test_timed_activity_uses_local_fallback_date_across_utc_midnight() -> None:
+async def test_timed_activity_without_local_date_uses_request_date_across_utc_midnight() -> None:
     client = MagicMock()
-    client.get_activities = AsyncMock(return_value=[{"activityId": 2, "activityType": "walking", "startTimeLocal": "2026-07-25T00:30:00+02:00", "durationInSeconds": 60}])
+    client.get_activities = AsyncMock(
+        return_value=[
+            {
+                "activityId": 2,
+                "activityType": "walking",
+                "startTime": datetime(2025, 12, 31, 22, 30, tzinfo=UTC),
+                "durationInSeconds": 60,
+            }
+        ]
+    )
     source = GarminHistorySource(client, _ImmediateGate())
-    result = await source.async_fetch_details(date(2026, 7, 25), "timed_activities")
+    result = await source.async_fetch_details(date(2026, 1, 1), "timed_activities")
     assert len(result) == 1
-    assert result[0].calendar_date == date(2026, 7, 25)
+    assert result[0].calendar_date == date(2026, 1, 1)
+    assert result[0].start == datetime(2025, 12, 31, 22, 30, tzinfo=UTC)
 
 
 def test_health_event_revision_keeps_identity_and_rejects_bounds() -> None:

@@ -167,7 +167,7 @@ def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedAct
         duration_raw = _first_non_null(item, ("durationInSeconds", "duration"))
         if duration_raw is _MISSING:
             duration_raw = None
-        if not isinstance(activity_type, str) or len(activity_type) > 64 or not isinstance(activity_id, (str, int)) or not isinstance(start_raw, (str, int, float)) or (end_raw is None and duration_raw is None):
+        if not isinstance(activity_type, str) or len(activity_type) > 64 or not isinstance(activity_id, (str, int)) or not isinstance(start_raw, (str, int, float, datetime)) or (end_raw is None and duration_raw is None):
             raise HistorySchemaError("activity identity has invalid type")
         start = _timestamp(start_raw)
         if start is None:
@@ -191,7 +191,9 @@ def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedAct
         local_date = (
             datetime.fromisoformat(start_raw.replace("Z", "+00:00")).date()
             if isinstance(start_raw, str) and "T" in start_raw and start_key == "startTimeLocal"
-            else start.date()
+            else start_raw.date()
+            if isinstance(start_raw, datetime) and start_key == "startTimeLocal"
+            else target_date
         )
         result[logical_id] = NormalizedActivity(logical_id, str(activity_id), revision, activity_type, activity_name, start, end, duration, training_effect, load, recovery, local_date)
     return tuple(sorted(result.values(), key=lambda item: (item.start, item.logical_id)))
@@ -378,6 +380,10 @@ TRAINING_STATUS_FIELDS = {
 def _timestamp(value: Any, *, allow_date_only: bool = False) -> datetime | None:
     if isinstance(value, bool):
         return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            return None
+        return value.astimezone(UTC)
     if isinstance(value, int | float):
         number = float(value) / (1000 if abs(float(value)) >= 100_000_000_000 else 1)
         try:
