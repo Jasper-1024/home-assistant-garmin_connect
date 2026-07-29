@@ -1183,9 +1183,6 @@ class GarminHistoryArchive:
                             continue
                         del previous_records[activity.logical_id]
                         structured_dirty_years.add(previous_year)
-                        previous_fits = self._fit_archives.get(previous_year)
-                        if previous_fits is not None:
-                            previous_fits.pop(activity.logical_id, None)
                     structured_dirty_years.add(year)
                     activities_by_year.setdefault(year, {})[activity.logical_id] = {
                         "logical_id": activity.logical_id, "activity_id": activity.activity_id, "revision": activity.revision, "calendar_date": activity.calendar_date.isoformat(),

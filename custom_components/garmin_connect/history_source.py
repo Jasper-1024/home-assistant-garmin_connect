@@ -306,10 +306,24 @@ def normalize_health_events(payload: Any, target_date: date) -> tuple[Normalized
     raw_events: Any = payload
     if isinstance(payload, dict):
         event_aliases = ("events", "dailyEvents", "bodyBatteryEvents", "eventList")
-        event_key = next((key for key in event_aliases if key in payload), None)
-        raw_events = payload if event_key is None else payload[event_key]
-        if raw_events is None:
-            return ()
+        raw_events = _MISSING
+        for event_key in event_aliases:
+            if event_key not in payload:
+                continue
+            candidate = payload[event_key]
+            if candidate is None or (
+                isinstance(candidate, (list, dict)) and not candidate
+            ):
+                continue
+            if not isinstance(candidate, (list, dict)):
+                raise HistorySchemaError("health events have invalid type")
+            raw_events = candidate
+            break
+        if raw_events is _MISSING:
+            if not any(key in payload for key in event_aliases):
+                raw_events = payload
+            else:
+                return ()
     if isinstance(raw_events, dict):
         raw_events = [raw_events]
     if not isinstance(raw_events, list):
@@ -469,7 +483,7 @@ def _activity_source_calendar_date(
 ) -> date:
     """Prefer an activity's source-local date over its instant's UTC date."""
     local_start = item.get("startTimeLocal", _MISSING)
-    if local_start is _MISSING or local_start is None:
+    if local_start is _MISSING or local_start is None or local_start == "":
         return source_start.date()
     if isinstance(local_start, datetime):
         return local_start.date()

@@ -116,6 +116,25 @@ def test_normalize_health_events_preserves_explicit_fields_only() -> None:
     assert events[1].occurrence is not None
 
 
+def test_normalize_health_events_uses_later_non_empty_alias() -> None:
+    events = normalize_health_events(
+        {
+            "events": [],
+            "dailyEvents": [
+                {
+                    "source": "MOVE_IQ",
+                    "type": "walking",
+                    "occurrenceTime": "2026-07-24T01:00:00Z",
+                }
+            ],
+        },
+        date(2026, 7, 24),
+    )
+
+    assert len(events) == 1
+    assert events[0].event_type == "walking"
+
+
 def test_activity_and_health_timestamp_aliases_keep_priority_and_timezone_rules() -> None:
     activity = normalize_activities(
         [
@@ -360,6 +379,42 @@ async def test_unscoped_activity_without_source_calendar_date_uses_source_instan
     assert utc_day[0].calendar_date == date(2026, 1, 1)
 
 
+@pytest.mark.parametrize("local_start_state", ["missing", "null", "empty"])
+def test_activity_empty_or_null_local_start_uses_aware_start_utc_date(
+    local_start_state: str,
+) -> None:
+    item = {
+        "activityId": 6,
+        "activityType": "running",
+        "startTime": "2026-01-01T23:30:00+02:00",
+        "durationInSeconds": 60,
+    }
+    if local_start_state == "null":
+        item["startTimeLocal"] = None
+    elif local_start_state == "empty":
+        item["startTimeLocal"] = ""
+
+    activity = normalize_activities([item], date(2026, 1, 2))[0]
+
+    assert activity.calendar_date == date(2026, 1, 1)
+
+
+def test_activity_non_empty_malformed_local_start_fails() -> None:
+    with pytest.raises(HistorySchemaError):
+        normalize_activities(
+            [
+                {
+                    "activityId": 7,
+                    "activityType": "running",
+                    "startTime": "2026-01-01T23:30:00+02:00",
+                    "startTimeLocal": "not-a-timestamp",
+                    "durationInSeconds": 60,
+                }
+            ],
+            date(2026, 1, 2),
+        )
+
+
 def test_activity_calendar_date_revision_keeps_logical_identity_stable() -> None:
     first = normalize_activities(
         [{
@@ -408,11 +463,16 @@ def test_normalize_health_events_keeps_empty_structures_absent() -> None:
     target = date(2026, 7, 24)
     assert normalize_health_events({"events": None}, target) == ()
     assert normalize_health_events({"events": []}, target) == ()
+    assert normalize_health_events(
+        {"events": [], "dailyEvents": None, "bodyBatteryEvents": {}}, target
+    ) == ()
     assert normalize_health_events({}, target) == ()
     assert normalize_health_events({"events": [{}]}, target) == ()
 
     with pytest.raises(HistorySchemaError):
         normalize_health_events({"events": "malformed"}, target)
+    with pytest.raises(HistorySchemaError):
+        normalize_health_events({"events": [], "dailyEvents": "malformed"}, target)
 
 
 @pytest.mark.parametrize(
