@@ -256,6 +256,40 @@ def _enabled_reconciliation_archive(
     )
 
 
+def _manual_repair_archive(
+    store: FakeStore,
+    source: ReconciliationSource,
+    *,
+    activation_date: str | None = None,
+    previously_enabled: bool | None = None,
+) -> GarminHistoryArchive:
+    """Create a disabled archive for bounded Manual Repair tests."""
+    data: dict[str, Any] = {
+        "history_account_key": "opaque-account-key-1234567890",
+    }
+    if activation_date is not None:
+        data[CONF_ARCHIVE_ACTIVATION_DATE] = activation_date
+    if previously_enabled is not None:
+        data[CONF_ARCHIVE_PREVIOUSLY_ENABLED] = previously_enabled
+    entry = _entry(data=data)
+    entry.options = {CONF_ARCHIVE_ENABLED: False}
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=object()
+    )
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    return GarminHistoryArchive(
+        _hass(),
+        entry,
+        recorder_checker=FakeRecorderChecker(
+            RecorderCompatibilityResult.compatible_result()
+        ),
+        store_factory=_store_factory(store),
+        source_factory=lambda *_args: source,
+        recorder_factory=lambda: recorder,
+    )
+
+
 async def _run_reconciliation_cycle(
     archive: GarminHistoryArchive,
     timer: DeterministicTimer,
@@ -3899,29 +3933,11 @@ async def test_manual_repair_reopens_settled_date_while_archive_is_disabled() ->
     store = _reconciliation_store(target, state="settled", has_records=True, outcome="records")
     store.data["completed_dates"] = [target.isoformat()]
     source = ReconciliationSource({target: (72.0,)})
-    hass = _hass()
-    entry = _entry(
-        data={
-            "history_account_key": "opaque-account-key-1234567890",
-            CONF_ARCHIVE_ACTIVATION_DATE: "2026-08-01",
-            CONF_ARCHIVE_PREVIOUSLY_ENABLED: True,
-        }
-    )
-    entry.options = {CONF_ARCHIVE_ENABLED: False}
-    entry.runtime_data = SimpleNamespace(
-        core=SimpleNamespace(client=object()), request_gate=object()
-    )
-    recorder = MagicMock()
-    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
-    archive = GarminHistoryArchive(
-        hass,
-        entry,
-        recorder_checker=FakeRecorderChecker(
-            RecorderCompatibilityResult.compatible_result()
-        ),
-        store_factory=_store_factory(store),
-        source_factory=lambda *_args: source,
-        recorder_factory=lambda: recorder,
+    archive = _manual_repair_archive(
+        store,
+        source,
+        activation_date="2026-08-01",
+        previously_enabled=True,
     )
 
     await archive.async_start()
@@ -3934,7 +3950,24 @@ async def test_manual_repair_reopens_settled_date_while_archive_is_disabled() ->
     assert archive.activation_date == date(2026, 8, 1)
     assert archive._cycle_timer_cancel is None
     assert archive._backfill is None
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "settled"
+    assert archive.get_history_presence(target, target)[target.isoformat()][
+        "heart_rate"
+    ] == "present"
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
+
+    await archive.async_stop()
+    restarted = _manual_repair_archive(
+        store,
+        source,
+        activation_date="2026-08-01",
+        previously_enabled=True,
+    )
+    await restarted.async_start()
+    assert restarted.get_history_presence(target, target)[target.isoformat()][
+        "heart_rate"
+    ] == "present"
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
+    await restarted.async_stop()
 
 
 @pytest.mark.asyncio
@@ -3942,24 +3975,7 @@ async def test_manual_repair_accepts_one_and_31_days_but_rejects_32_before_reque
     """Manual Repair validates the inclusive bound before touching Garmin."""
     source = ReconciliationSource({date(2026, 7, 24): (72.0,)})
     store = _reconciliation_store(date(2026, 7, 24))
-    hass = _hass()
-    entry = _entry(data={"history_account_key": "opaque-account-key-1234567890"})
-    entry.options = {CONF_ARCHIVE_ENABLED: False}
-    entry.runtime_data = SimpleNamespace(
-        core=SimpleNamespace(client=object()), request_gate=object()
-    )
-    recorder = MagicMock()
-    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
-    archive = GarminHistoryArchive(
-        hass,
-        entry,
-        recorder_checker=FakeRecorderChecker(
-            RecorderCompatibilityResult.compatible_result()
-        ),
-        store_factory=_store_factory(store),
-        source_factory=lambda *_args: source,
-        recorder_factory=lambda: recorder,
-    )
+    archive = _manual_repair_archive(store, source)
     await archive.async_start()
 
     start = date(2026, 7, 24)

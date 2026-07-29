@@ -1568,28 +1568,29 @@ class GarminHistoryArchive:
                 start_date.fromordinal(start_date.toordinal() + offset)
                 for offset in range((end_date - start_date).days + 1)
             )
-            reopened: dict[str, _ReconciliationEntry] = {}
             changed = False
             for target in forced_dates:
                 entry = self._reconciliation.get(target.isoformat())
                 if entry is not None and entry.state == "settled":
-                    reopened[target.isoformat()] = replace(entry)
                     entry.state = "open"
                     changed = True
             if changed:
                 await self._async_save_reconciliation_state()
-            try:
-                return await self._async_sync_range(
-                    start_date,
-                    end_date,
-                    fit_limit=fit_limit,
-                    include_training_status=include_training_status,
-                    force_dates=frozenset(forced_dates),
-                )
-            finally:
-                if reopened:
-                    self._reconciliation.update(reopened)
-                    await self._async_save_reconciliation_state()
+            report = await self._async_sync_range(
+                start_date,
+                end_date,
+                fit_limit=fit_limit,
+                include_training_status=include_training_status,
+                force_dates=frozenset(forced_dates),
+            )
+            processed_dates = report.processed_dates
+            if report.outcome == "failed" and not processed_dates:
+                processed_dates = forced_dates
+            for target in processed_dates:
+                # One Manual Repair observation must not settle a date without
+                # the later unchanged confirmation used by automatic work.
+                await self._async_update_reconciliation_state(target, report)
+            return report
 
     async def _async_fetch_numeric_detail(
         self,
