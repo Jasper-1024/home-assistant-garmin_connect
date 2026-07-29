@@ -156,10 +156,15 @@ _STREAM_DESCRIPTOR_FIELDS = {
 
 
 def _stream_descriptors(item: dict[str, Any], metric: str) -> dict[str, int] | None:
-    raw = next(
-        (item[key] for key in _STREAM_DESCRIPTOR_FIELDS[metric] if key in item and item[key] is not None),
-        None,
-    )
+    raw = None
+    for key in _STREAM_DESCRIPTOR_FIELDS[metric]:
+        if key not in item:
+            continue
+        candidate = item[key]
+        if candidate is None or candidate == []:
+            continue
+        raw = candidate
+        break
     if raw is None:
         return None
     if not isinstance(raw, list):
@@ -185,9 +190,24 @@ def _stream_descriptors(item: dict[str, Any], metric: str) -> dict[str, int] | N
 def _sleep_streams(item: dict[str, Any]) -> tuple[SleepStream, ...]:
     result: list[SleepStream] = []
     for metric, aliases in _STREAM_FIELDS.items():
-        key = next((alias for alias in aliases if alias in item and item[alias] is not None), None)
+        key = None
+        fallback_key = None
+        for alias in aliases:
+            if alias not in item:
+                continue
+            value = item[alias]
+            if value is None:
+                fallback_key = fallback_key or alias
+                continue
+            if not isinstance(value, list):
+                raise SleepSchemaError("sleep stream has invalid type")
+            if not value:
+                fallback_key = fallback_key or alias
+                continue
+            key = alias
+            break
         if key is None:
-            key = next((alias for alias in aliases if alias in item), None)
+            key = fallback_key
         if key is None:
             continue
         values = item[key]

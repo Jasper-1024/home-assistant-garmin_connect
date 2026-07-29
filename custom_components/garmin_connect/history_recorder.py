@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC
@@ -13,6 +14,9 @@ from math import isfinite
 from typing import Any, Protocol
 
 from .history_source import NormalizedSample
+
+_RECORDER_CHUNK_SIZE = 1024
+_RECENT_VALUE_CACHE_SIZE = 4096
 
 
 class HistoryMetric(StrEnum):
@@ -84,7 +88,7 @@ class RecorderWriteOutcome:
 
 
 class _Recorder(Protocol):
-    def async_import_statistics(self, metadata: Any, stats: Sequence[Any], table: type) -> None: ...
+    def async_import_statistics(self, metadata: Any, stats: Sequence[Any], _table: type) -> None: ...
     def queue_task(self, task: Any) -> None: ...
 
 
@@ -99,7 +103,7 @@ class GarminHistoryRecorder:
 
     def __init__(self, recorder: _Recorder) -> None:
         self._recorder = recorder
-        self._known_values: dict[tuple[str, Any], float] = {}
+        self._recent_values: OrderedDict[tuple[str, Any], float] = OrderedDict()
 
     async def async_write(
         self,
@@ -112,67 +116,91 @@ class GarminHistoryRecorder:
             from homeassistant.components.recorder.db_schema import Statistics
             from homeassistant.components.recorder.models import StatisticMeanType
             from homeassistant.components.recorder.tasks import SynchronizeTask
-        except ImportError, AttributeError, TypeError:
+        except (ImportError, AttributeError, TypeError):
             return RecorderWriteOutcome(0, "incompatible", "recorder_symbols")
         if not statistic_id or not metric.key:
             return RecorderWriteOutcome(0, "invalid", "metric")
-        normalized_samples: list[NormalizedSample] = []
         for sample in samples:
             if sample.timestamp.tzinfo is None or sample.timestamp.utcoffset() is None:
                 return RecorderWriteOutcome(0, "invalid", "timestamp")
             if isinstance(sample.value, bool) or not isinstance(sample.value, int | float) or not isfinite(float(sample.value)):
                 return RecorderWriteOutcome(0, "invalid", "value")
-            normalized_samples.append(
-                NormalizedSample(
-                    sample.timestamp.astimezone(UTC),
-                    sample.request_date,
-                    sample.raw_timestamp,
-                    float(sample.value),
-                )
-            )
-        if tuple(inspect.signature(self._recorder.async_import_statistics).parameters) != (
-            "metadata",
-            "stats",
-            "table",
-        ):
-            return RecorderWriteOutcome(0, "incompatible", "recorder_signature")
         try:
-            metadata = {
-                "mean_type": StatisticMeanType.ARITHMETIC,
-                "has_sum": False,
-                "name": f"Garmin {metric.name}",
-                "source": "garmin_connect",
-                "statistic_id": statistic_id,
-                "unit_class": metric.unit_class,
-                "unit_of_measurement": metric.unit_of_measurement,
-            }
+            signature = tuple(inspect.signature(self._recorder.async_import_statistics).parameters)
+        except (AttributeError, TypeError, ValueError):
+            return RecorderWriteOutcome(0, "incompatible", "recorder_signature")
+        if signature != ("metadata", "stats", "table"):
+            return RecorderWriteOutcome(0, "incompatible", "recorder_signature")
+        metadata_record = {
+            "mean_type": StatisticMeanType.ARITHMETIC,
+            "has_sum": False,
+            "name": f"Garmin {metric.name}",
+            "source": "garmin_connect",
+            "statistic_id": statistic_id,
+            "unit_class": metric.unit_class,
+            "unit_of_measurement": metric.unit_of_measurement,
+        }
+        inserted = updated = skipped = 0
+
+        async def write_chunk(chunk: list[NormalizedSample]) -> tuple[int, int, int]:
+            """Import one bounded batch while retaining all source samples."""
             stats = [
                 {
-                    "start": sample.timestamp,
-                    "mean": sample.value,
-                    "min": sample.value,
-                    "max": sample.value,
+                    "start": sample.timestamp.astimezone(UTC),
+                    "mean": float(sample.value),
+                    "min": float(sample.value),
+                    "max": float(sample.value),
                 }
-                for sample in normalized_samples
+                for sample in chunk
             ]
-            self._recorder.async_import_statistics(metadata, stats, Statistics)
+            self._recorder.async_import_statistics(metadata_record, stats, Statistics)
             loop = asyncio.get_running_loop()
             future = loop.create_future()
             self._recorder.queue_task(SynchronizeTask(future))
             await future
+            chunk_inserted = chunk_updated = chunk_skipped = 0
+            for sample in chunk:
+                normalized = sample.timestamp.astimezone(UTC)
+                identity = (statistic_id, normalized)
+                previous = self._recent_values.get(identity)
+                if previous is None:
+                    chunk_inserted += 1
+                elif previous == float(sample.value):
+                    chunk_skipped += 1
+                else:
+                    chunk_updated += 1
+                self._recent_values[identity] = float(sample.value)
+                self._recent_values.move_to_end(identity)
+            while len(self._recent_values) > _RECENT_VALUE_CACHE_SIZE:
+                self._recent_values.popitem(last=False)
+            return chunk_inserted, chunk_updated, chunk_skipped
+
+        try:
+            chunk: list[NormalizedSample] = []
+            for sample in samples:
+                chunk.append(
+                    NormalizedSample(
+                        sample.timestamp.astimezone(UTC),
+                        sample.request_date,
+                        sample.raw_timestamp,
+                        float(sample.value),
+                    )
+                )
+                if len(chunk) == _RECORDER_CHUNK_SIZE:
+                    counts = await write_chunk(chunk)
+                    inserted += counts[0]
+                    updated += counts[1]
+                    skipped += counts[2]
+                    chunk = []
+            if chunk or not samples:
+                counts = await write_chunk(chunk)
+                inserted += counts[0]
+                updated += counts[1]
+                skipped += counts[2]
         except asyncio.CancelledError:
             raise
-        except AttributeError, ImportError, TypeError, ValueError, RuntimeError:
+        except (AttributeError, ImportError, TypeError, ValueError, RuntimeError):
             return RecorderWriteOutcome(0, "failed", "recorder_unavailable")
-        inserted = updated = skipped = 0
-        for sample in normalized_samples:
-            identity = (statistic_id, sample.timestamp)
-            previous = self._known_values.get(identity)
-            if previous is None:
-                inserted += 1
-            elif previous == sample.value:
-                skipped += 1
-            else:
-                updated += 1
-            self._known_values[identity] = sample.value
-        return RecorderWriteOutcome(len(samples), inserted_count=inserted, updated_count=updated, skipped_count=skipped)
+        return RecorderWriteOutcome(
+            len(samples), inserted_count=inserted, updated_count=updated, skipped_count=skipped
+        )

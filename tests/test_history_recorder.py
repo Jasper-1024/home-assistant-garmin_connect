@@ -193,3 +193,29 @@ async def test_release_gate_scratch_recorder_restart_revision_and_no_state_chang
     assert all(isinstance(task, SynchronizeTask) for task in requester.tasks)
     assert len(requester.tasks) == 3
     assert all("state_changed" not in row for _, rows, _ in requester.imports for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_writer_chunks_large_series_without_dropping_samples() -> None:
+    requester = FakeRequester()
+    writer = GarminHistoryRecorder(requester)
+    samples = tuple(
+        NormalizedSample(
+            datetime(2026, 7, 24, 0, 0, tzinfo=UTC) + timedelta(seconds=index),
+            date(2026, 7, 24),
+            index,
+            float(index % 100),
+        )
+        for index in range(2500)
+    )
+
+    result = await writer.async_write(
+        statistic_id_for("opaque-account-key-123", "heart_rate"),
+        HEART_RATE_METADATA,
+        samples,
+    )
+
+    assert result.accepted_count == len(samples)
+    assert sum(len(rows) for _, rows, _ in requester.imports) == len(samples)
+    assert max(len(rows) for _, rows, _ in requester.imports) < len(samples)
+    assert len(writer._recent_values) <= 4096

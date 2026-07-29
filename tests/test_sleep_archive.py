@@ -331,6 +331,19 @@ def test_sleep_stream_key_aliases_choose_first_non_null_array() -> None:
     assert session.streams[0].points[0].value == 61.0
 
 
+def test_empty_sleep_stream_alias_does_not_mask_later_valid_stream() -> None:
+    payload = {
+        "startTime": "2026-07-24T23:45:00Z", "endTime": "2026-07-25T07:15:00Z",
+        "sleepHeartRate": [],
+        "sleepHeartRateValues": [["2026-07-25T00:01:00Z", 61]],
+    }
+
+    session = parse_sleep_sessions(payload, date(2026, 7, 24))[0]
+
+    assert session.streams[0].presence == "present"
+    assert session.streams[0].points[0].value == 61.0
+
+
 def test_sleep_stream_numeric_epoch_timestamp_and_nested_descriptors() -> None:
     payload = {
         "sleepData": {

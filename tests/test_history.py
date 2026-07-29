@@ -31,7 +31,7 @@ from custom_components.garmin_connect.history import (
     HomeAssistantRecorderCompatibility,
     RecorderCompatibilityResult,
 )
-from custom_components.garmin_connect.history_recorder import RecorderWriteOutcome
+from custom_components.garmin_connect.history_recorder import RecorderWriteOutcome, statistic_id_for
 from custom_components.garmin_connect.history_sensor import GarminHistoryStatusSensor
 from custom_components.garmin_connect.history_source import (
     GarminHistorySource,
@@ -472,6 +472,116 @@ async def test_malformed_numeric_partition_does_not_abort_archive_startup() -> N
     assert target.isoformat() not in archive._completed_dates
     assert target.isoformat() in archive._numeric_source_date_replay_dates
     assert catalog.data["numeric_source_date_pending"]["2026"] == [target.isoformat()]
+
+
+@pytest.mark.asyncio
+async def test_corrupt_numeric_partition_replays_only_affected_dates() -> None:
+    retained = date(2026, 7, 24)
+    affected = date(2026, 7, 25)
+    statistic_id = statistic_id_for("opaque-account-key-123", "heart_rate")
+    catalog = FakeStore({
+        "schema_version": 1,
+        "account_key": "opaque-account-key-123",
+        "completed_dates": [retained.isoformat(), affected.isoformat()],
+        "hrv_summaries": {},
+        "numeric_source_date_index": ["2026"],
+        "numeric_source_date_dates": {"2026": [retained.isoformat(), affected.isoformat()]},
+        "numeric_source_date_pending": {},
+        "numeric_source_date_outbox": {},
+        "presence": {},
+        "sleep_index": {},
+        "event_index": {},
+        "activity_index": {},
+    })
+    partition = FakeStore({
+        "schema_version": 1,
+        "account_key": "opaque-account-key-123",
+        "year": "2026",
+        "dates": {
+            statistic_id: {
+                "2026-07-24T01:00:00+00:00": retained.isoformat(),
+                "malformed-instant": affected.isoformat(),
+            }
+        },
+    })
+    stores = {
+        "garmin_connect.entry-1.history_catalog": catalog,
+        "garmin_connect.entry-1.numeric_source_dates_2026": partition,
+    }
+
+    def factory(_hass, _version, path, **kwargs):
+        return stores.setdefault(path, FakeStore())
+
+    archive = GarminHistoryArchive(
+        _hass(),
+        _entry(data={"history_account_key": "opaque-account-key-123"}),
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=factory,
+    )
+    await archive.async_start()
+
+    assert archive._numeric_source_calendar_dates_by_year["2026"][statistic_id] == {
+        "2026-07-24T01:00:00+00:00": retained.isoformat(),
+    }
+    assert retained.isoformat() in archive._completed_dates
+    assert affected.isoformat() not in archive._completed_dates
+    assert archive._numeric_source_date_replay_dates == {affected.isoformat()}
+
+
+@pytest.mark.asyncio
+async def test_empty_numeric_replay_persists_tombstone_before_clearing_pending() -> None:
+    target = date(2026, 7, 24)
+    catalog = FakeStore({
+        "schema_version": 1,
+        "account_key": "opaque-account-key-123",
+        "completed_dates": [target.isoformat()],
+        "hrv_summaries": {},
+        "numeric_source_date_index": ["2026"],
+        "numeric_source_date_dates": {"2026": [target.isoformat()]},
+        "numeric_source_date_pending": {},
+        "numeric_source_date_outbox": {},
+        "presence": {},
+        "sleep_index": {},
+        "event_index": {},
+        "activity_index": {},
+    })
+    partition = FakeStore({"corrupt": True})
+    stores = {
+        "garmin_connect.entry-1.history_catalog": catalog,
+        "garmin_connect.entry-1.numeric_source_dates_2026": partition,
+    }
+
+    def factory(_hass, _version, path, **kwargs):
+        return stores.setdefault(path, FakeStore())
+
+    class EmptySource:
+        async def async_fetch_details(self, _target: date, _metric: str) -> object:
+            return ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
+
+    def make_archive() -> GarminHistoryArchive:
+        return GarminHistoryArchive(
+            _hass(), entry,
+            recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+            store_factory=factory,
+            source_factory=lambda _client, _gate: EmptySource(),
+            recorder_factory=lambda: recorder,
+        )
+
+    first = make_archive()
+    await first.async_start()
+    assert target.isoformat() not in first._completed_dates
+    assert (await first.async_sync_range(target, target)).outcome == "written"
+    assert partition.data["tombstones"] == [target.isoformat()]
+    assert catalog.data["numeric_source_date_pending"] == {}
+
+    restarted = make_archive()
+    await restarted.async_start()
+    assert target.isoformat() in restarted._completed_dates
+    assert target.isoformat() not in restarted._numeric_source_date_replay_dates
 
 
 @pytest.mark.asyncio

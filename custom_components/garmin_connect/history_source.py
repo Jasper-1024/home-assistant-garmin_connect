@@ -397,7 +397,7 @@ def _descriptors(payload: dict[str, Any], keys: tuple[str, ...]) -> dict[str, in
         if key not in payload:
             continue
         raw = payload[key]
-        if raw is None:
+        if raw is None or raw == []:
             continue
         if not isinstance(raw, list):
             raise HistorySchemaError(f"{key} is not a descriptor list")
@@ -521,6 +521,73 @@ def _object_series(
     return tuple(result[key] for key in sorted(result))
 
 
+def _nested_array_value(
+    payload: Any, aliases: tuple[str, ...]
+) -> tuple[list[Any] | None, str] | None:
+    """Select the first non-null, non-empty supported array alias."""
+    empty: tuple[list[Any] | None, str] | None = None
+    null: tuple[list[Any] | None, str] | None = None
+    for alias in aliases:
+        found = _nested_value(payload, (alias,))
+        if found is None:
+            continue
+        value, key = found
+        if value is None:
+            null = null or (None, key)
+            continue
+        if not isinstance(value, list):
+            raise HistorySchemaError(f"{key} is not an array")
+        if value:
+            return value, key
+        empty = empty or (value, key)
+    return empty or null
+
+
+def _has_non_null_series_value(
+    values: list[Any],
+    value_keys: tuple[str, ...],
+    descriptor_payload: dict[str, Any],
+    descriptor_keys: tuple[str, ...],
+) -> bool:
+    """Identify numeric values even when a quality filter removed them."""
+    positions = _descriptors(descriptor_payload, descriptor_keys)
+    for row in values:
+        if row is None:
+            continue
+        if isinstance(row, dict):
+            raw_value = _first_non_null(row, value_keys)
+        elif isinstance(row, (list, tuple)):
+            raw_value = _first_non_null_sequence(
+                row, positions, value_keys, fallback_index=1
+            )
+        else:
+            continue
+        if raw_value is not _MISSING and raw_value is not None:
+            return True
+    return False
+
+
+def _normalized_presence(
+    presence: str,
+    values: list[Any] | None,
+    readings: tuple[NormalizedSample, ...],
+    value_keys: tuple[str, ...],
+    descriptor_payload: dict[str, Any],
+    descriptor_keys: tuple[str, ...],
+) -> str:
+    """Add the all-null state without reclassifying sparse or zero data."""
+    if (
+        presence == "present"
+        and values
+        and not readings
+        and not _has_non_null_series_value(
+            values, value_keys, descriptor_payload, descriptor_keys
+        )
+    ):
+        return "all-null"
+    return presence
+
+
 def _nested_value(payload: Any, aliases: tuple[str, ...], depth: int = 0) -> tuple[Any, str] | None:
     if depth > 3 or not isinstance(payload, dict):
         return None
@@ -592,17 +659,10 @@ def _classify_source_array(payload: Any, aliases: tuple[str, ...]) -> tuple[str,
     marker = _nested_value(payload, ("presence", "state", "status", "availability"))
     if marker is not None and isinstance(marker[0], str) and marker[0].lower() == "returned-empty":
         return "returned-empty", None, None
-    found_values = [
-        found
-        for alias in aliases
-        if (found := _nested_value(payload, (alias,))) is not None
-    ]
-    if not found_values:
+    found = _nested_array_value(payload, aliases)
+    if found is None:
         return "missing", None, None
-    values, array_key = next(
-        (found for found in found_values if found[0] not in (None, [])),
-        found_values[0],
-    )
+    values, array_key = found
     if values is None:
         return "null", None, array_key
     if values == []:
@@ -630,7 +690,9 @@ def _normalize_source_series(
     presence, values, array_key = _classify_source_array(payload, array_aliases)
     if presence != "present":
         return SourceSeries((), presence)
+    series_payload: dict[str, Any]
     if array_key is None:
+        series_payload = {"data": values}
         if _is_object_series(values):
             readings = _object_series(
                 payload,
@@ -641,15 +703,20 @@ def _normalize_source_series(
             )
         else:
             readings = normalize_pair_series(
-                {"data": values},
+                series_payload,
                 values_key="data",
                 descriptor_keys=descriptor_aliases,
                 value_keys=value_keys,
                 exclude_negative=exclude_negative,
                 request_date=target_date,
             )
-        return SourceSeries(readings, "present")
-    descriptor_found = _nested_value(payload, descriptor_aliases)
+        return SourceSeries(
+            readings,
+            _normalized_presence(
+                presence, values, readings, value_keys, series_payload, descriptor_aliases
+            ),
+        )
+    descriptor_found = _nested_array_value(payload, descriptor_aliases)
     series_payload = {array_key: values}
     if descriptor_found is not None:
         series_payload[descriptor_found[1]] = descriptor_found[0]
@@ -670,7 +737,17 @@ def _normalize_source_series(
             exclude_negative=exclude_negative,
             request_date=target_date,
         )
-    return SourceSeries(readings, "present")
+    return SourceSeries(
+        readings,
+        _normalized_presence(
+            presence,
+            values,
+            readings,
+            value_keys,
+            series_payload,
+            descriptor_aliases,
+        ),
+    )
 
 
 def _array_presence(payload: Any, aliases: tuple[str, ...]) -> str:
@@ -738,45 +815,101 @@ def _segmented_totals(
     return values or None, states
 
 
-def normalize_steps(payload: Any, target_date: date) -> SegmentedData:
-    presence = _array_presence(payload, ("stepsValues", "stepsValuesArray", "chartData", "data"))
-    totals, total_presence = _segmented_totals(payload, ("totalSteps",))
+def _normalize_segmented(
+    payload: Any,
+    target_date: date,
+    array_aliases: tuple[str, ...],
+    value_keys: tuple[str, ...],
+    descriptor_keys: tuple[str, ...],
+    total_keys: tuple[str, ...],
+) -> SegmentedData:
+    presence, values, array_key = _classify_source_array(payload, array_aliases)
+    totals, total_presence = _segmented_totals(payload, total_keys)
     if presence != "present":
         return SegmentedData((), totals, presence, total_presence)
-    readings = _descriptor_segment(payload, target_date, ("stepsValues", "stepsValuesArray", "chartData", "data"), ("steps", "stepCount", "value"), ("stepsValueDescriptors", "stepsValueDescriptorsDTOList", "stepsValueDescriptorDTOList"))
-    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, ("steps", "stepCount", "value"), ("steps", "stepsValues", "stepsValuesArray", "chartData", "data")), totals, presence, total_presence)
+    selected_key = array_key or "data"
+    series_payload: dict[str, Any] = {selected_key: values}
+    descriptor_found = _nested_array_value(payload, descriptor_keys)
+    if descriptor_found is not None:
+        descriptor_values, descriptor_key = descriptor_found
+        series_payload[descriptor_key] = descriptor_values
+    if _is_object_series(values):
+        readings = _object_series(
+            series_payload, target_date, value_keys, (selected_key,)
+        )
+    else:
+        readings = normalize_pair_series(
+            series_payload,
+            values_key=selected_key,
+            descriptor_keys=descriptor_keys,
+            value_keys=value_keys,
+            request_date=target_date,
+        )
+    return SegmentedData(
+        readings,
+        totals,
+        _normalized_presence(
+            presence, values, readings, value_keys, series_payload, descriptor_keys
+        ),
+        total_presence,
+    )
+
+
+def normalize_steps(payload: Any, target_date: date) -> SegmentedData:
+    return _normalize_segmented(
+        payload,
+        target_date,
+        ("stepsValues", "stepsValuesArray", "chartData", "data"),
+        ("steps", "stepCount", "value"),
+        ("stepsValueDescriptors", "stepsValueDescriptorsDTOList", "stepsValueDescriptorDTOList"),
+        ("totalSteps",),
+    )
 
 
 def normalize_floors(payload: Any, target_date: date) -> SegmentedData:
-    presence = _array_presence(payload, ("floorsValues", "floorsValuesArray", "chartData", "data"))
-    totals, total_presence = _segmented_totals(payload, ("floorsAscended", "floorsDescended", "floorsAscendedInMeters", "floorsDescendedInMeters", "totalFloors"))
-    if presence != "present":
-        return SegmentedData((), totals, presence, total_presence)
-    readings = _descriptor_segment(payload, target_date, ("floorsValues", "floorsValuesArray", "chartData", "data"), ("floors", "floorCount", "value"), ("floorsValueDescriptors", "floorsValueDescriptorsDTOList", "floorsValueDescriptorDTOList"))
-    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, ("floors", "floorCount", "value"), ("floors", "floorValues", "floorsValuesArray", "chartData", "data")), totals, presence, total_presence)
+    return _normalize_segmented(
+        payload,
+        target_date,
+        ("floorsValues", "floorsValuesArray", "chartData", "data"),
+        ("floors", "floorCount", "value"),
+        ("floorsValueDescriptors", "floorsValueDescriptorsDTOList", "floorsValueDescriptorDTOList"),
+        ("floorsAscended", "floorsDescended", "floorsAscendedInMeters", "floorsDescendedInMeters", "totalFloors"),
+    )
 
 
 def normalize_intensity(payload: Any, target_date: date, kind: str) -> SegmentedData:
     if kind not in {"moderate", "vigorous"}:
         raise ValueError("unsupported intensity kind")
-    presence = _array_presence(payload, ("intensityValues", "intensityValuesArray", "chartData", "data"))
-    totals, total_presence = _segmented_totals(payload, ("moderateIntensityMinutes", "vigorousIntensityMinutes", "totalIntensityMinutes"))
-    if presence != "present":
-        return SegmentedData((), totals, presence, total_presence)
     keys = (f"{kind}IntensityMinutes", f"{kind}Minutes", "value")
-    readings = _descriptor_segment(payload, target_date, ("intensityValues", "intensityValuesArray", "chartData", "data"), keys, ("intensityValueDescriptors", "intensityValueDescriptorsDTOList", "intensityValueDescriptorDTOList"))
-    return SegmentedData(readings if readings is not None else _object_series(payload, target_date, keys, (f"{kind}IntensityMinutes", f"{kind}Minutes", "intensityMinutes", "chartData", "data")), totals, presence, total_presence)
+    return _normalize_segmented(
+        payload,
+        target_date,
+        ("intensityValues", "intensityValuesArray", "chartData", "data"),
+        keys,
+        ("intensityValueDescriptors", "intensityValueDescriptorsDTOList", "intensityValueDescriptorDTOList"),
+        ("moderateIntensityMinutes", "vigorousIntensityMinutes", "totalIntensityMinutes"),
+    )
 
 
 def _descriptor_segment(payload: Any, target_date: date, values_keys: tuple[str, ...], value_keys: tuple[str, ...], descriptor_keys: tuple[str, ...]) -> tuple[NormalizedSample, ...] | None:
     if not isinstance(payload, dict) or not any(key in payload for key in descriptor_keys):
         return None
-    present = [key for key in values_keys if key in payload]
-    values_key = next(
-        (key for key in present if payload[key] not in (None, [])),
-        present[0] if present else values_keys[0],
+    found = _nested_array_value(payload, values_keys)
+    if found is None:
+        return ()
+    values, values_key = found
+    series_payload = {values_key: values}
+    descriptor_found = _nested_array_value(payload, descriptor_keys)
+    if descriptor_found is not None:
+        descriptor_values, descriptor_key = descriptor_found
+        series_payload[descriptor_key] = descriptor_values
+    return normalize_pair_series(
+        series_payload,
+        values_key=values_key,
+        descriptor_keys=descriptor_keys,
+        value_keys=value_keys,
+        request_date=target_date,
     )
-    return normalize_pair_series(payload, values_key=values_key, descriptor_keys=descriptor_keys, value_keys=value_keys, request_date=target_date)
 
 
 def _select_daily_report(payload: Any, target_date: date) -> dict[str, Any]:
@@ -840,7 +973,27 @@ def _body_battery_presence(payload: Any, target_date: date) -> str:
             break
     elif not isinstance(payload, list):
         return _array_presence(payload, ("bodyBatteryValuesArray",))
-    return _array_presence(_select_daily_report(payload, target_date), ("bodyBatteryValuesArray",))
+    report = _select_daily_report(payload, target_date)
+    presence, values, array_key = _classify_source_array(
+        report, ("bodyBatteryValuesArray",)
+    )
+    if presence != "present":
+        return presence
+    readings = normalize_body_battery(payload, target_date)
+    descriptor_payload = report if array_key is not None else {"data": values}
+    return _normalized_presence(
+        presence,
+        values,
+        readings,
+        ("bodyBatteryValue", "bodyBatteryLevel", "value"),
+        descriptor_payload,
+        (
+            "bodyBatteryValueDescriptorsDTOList",
+            "bodyBatteryValueDescriptorsDtoList",
+            "bodyBatteryValueDescriptorDTOList",
+            "bodyBatteryValueDescriptors",
+        ),
+    )
 
 
 def parse_hrv_data(payload: Any, target_date: date) -> HRVData:
@@ -885,6 +1038,14 @@ def parse_hrv_data(payload: Any, target_date: date) -> HRVData:
             raise HistorySchemaError("HRV timestamp has an invalid value")
         readings.append(NormalizedSample(parsed, target_date, raw_time, float(raw_value)))
     latest = {sample.timestamp: sample for sample in readings}
+    if presence == "present" and raw_readings and not latest:
+        if not _has_non_null_series_value(
+            raw_readings,
+            ("hrvValue", "value"),
+            {},
+            (),
+        ):
+            presence = "all-null"
     raw_summary = payload.get("hrvSummary")
     if raw_summary is not None and not isinstance(raw_summary, dict):
         raise HistorySchemaError("HRV summary is not an object")

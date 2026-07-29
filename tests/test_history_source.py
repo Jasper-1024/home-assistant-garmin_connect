@@ -264,6 +264,28 @@ def test_known_numeric_scalar_payloads_fail_closed(normalizer, args) -> None:
         normalizer("malformed", date(2026, 7, 24), *args)
 
 
+def test_all_null_numeric_arrays_are_not_present() -> None:
+    target = date(2026, 7, 24)
+
+    pair = normalize_respiration(
+        {"respirationValuesArray": [["2026-07-24T01:00:00Z", None], None]},
+        target,
+    )
+    segmented = normalize_steps(
+        {"stepsValuesArray": [["2026-07-24T01:00:00Z", None]]}, target
+    )
+    hrv = parse_hrv_data(
+        {"hrvReadings": [{"readingTimeGMT": "2026-07-24T01:00:00Z", "hrvValue": None}]},
+        target,
+    )
+    spo2 = normalize_spo2(
+        {"spO2SingleValues": [{"readingTime": "2026-07-24T01:00:00Z", "spO2": None}]},
+        target,
+        "single",
+    )
+    assert pair.presence == segmented.presence == spo2.presence == hrv.presence == "all-null"
+
+
 def test_snapshot_aliases_prefer_non_null_values() -> None:
     target = date(2026, 7, 24)
 
@@ -511,6 +533,23 @@ def test_descriptor_aliases_use_first_non_null_and_fail_closed_when_selected_ali
         )
 
 
+def test_empty_descriptor_alias_does_not_mask_later_descriptor() -> None:
+    samples = normalize_pair_series(
+        {
+            "heartRateValueDescriptors": [],
+            "heartRateValueDescriptorsDTOList": [
+                {"key": "timestamp", "index": 0},
+                {"key": "heartRate", "index": 1},
+            ],
+            "heartRateValues": [["2026-07-24T01:00:00Z", 61]],
+        },
+        values_key="heartRateValues",
+        descriptor_keys=("heartRateValueDescriptors", "heartRateValueDescriptorsDTOList"),
+        value_keys=("heartRate",),
+    )
+    assert [sample.value for sample in samples] == [61.0]
+
+
 def test_hrv_mixed_null_rows_preserve_valid_objects_and_reject_malformed_objects() -> None:
     parsed = parse_hrv_data(
         {
@@ -594,6 +633,22 @@ async def test_top_level_list_body_battery_is_present() -> None:
     assert isinstance(result, SourceSeries)
     assert [sample.value for sample in result.readings] == [42]
     assert result.presence == "present"
+
+
+@pytest.mark.asyncio
+async def test_body_battery_all_null_array_is_not_present() -> None:
+    client = MagicMock()
+    client._base_url = "https://garmin.example"
+    client._request = AsyncMock(return_value=[{
+        "calendarDate": "2026-07-24",
+        "bodyBatteryValuesArray": [["2026-07-24T01:00:00Z", None]],
+    }])
+    source = GarminHistorySource(client, _ImmediateGate())
+
+    result = await source.async_fetch_details(date(2026, 7, 24), "body_battery")
+
+    assert isinstance(result, SourceSeries)
+    assert result.presence == "all-null"
 
 
 @pytest.mark.parametrize(

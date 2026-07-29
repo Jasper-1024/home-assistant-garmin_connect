@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from ha_garmin.exceptions import GarminConnectError
 
 from custom_components.garmin_connect import history as history_module
 from custom_components.garmin_connect.const import CONF_ARCHIVE_ENABLED
@@ -582,6 +583,26 @@ async def test_numeric_family_failure_does_not_block_other_families_or_checkpoin
         "steps_daily_total",
         "daily_abnormal_heart_rate_alerts",
     }
+
+
+@pytest.mark.asyncio
+async def test_garmin_client_error_becomes_bounded_archive_failure() -> None:
+    class Source:
+        async def async_fetch_details(self, _target: date, metric: str) -> object:
+            if metric == "heart_rate":
+                raise GarminConnectError("private endpoint failed")
+            return ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = _sync_archive(Source(), recorder, _Store())
+    await archive.async_start()
+
+    report = await archive.async_sync_range(date(2026, 1, 1), date(2026, 1, 1))
+
+    assert report.outcome == "failed"
+    assert report.error_type == "garmin_client_error"
+    assert archive.status.state is HistoryArchiveState.FAILED
 
 
 @pytest.mark.asyncio
