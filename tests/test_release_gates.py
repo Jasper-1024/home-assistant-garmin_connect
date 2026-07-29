@@ -186,6 +186,22 @@ def test_release_metadata_targets_beta_and_core_gate() -> None:
     assert hacs["homeassistant"] == "2026.7.4"
 
 
+def test_release_guidance_is_prospective_and_reversible() -> None:
+    """Operator guidance must not revive the fixed-date backfill rollout."""
+    guidance = (ROOT / "docs" / "release-3.1.0-beta.1.md").read_text()
+    assert "2026-07-24" not in guidance
+    assert "full-year enablement switch" in guidance
+    assert "Prospective Archive" in guidance
+    assert "Historical Backfill" in guidance
+    assert "Home Assistant backup" in guidance
+    assert "explicitly enable" in guidance
+    assert "Restart Home Assistant" in guidance
+    assert "Disablement is the reversible stop mechanism" in guidance
+    assert "no archive deletion" in guidance
+    assert "fifteen-minute freshness target" in guidance
+    assert "seven-day reconciliation" in guidance
+
+
 def test_fixture_text_has_no_obvious_credentials_or_route_payloads() -> None:
     for name in FROZEN_FIXTURES:
         text = (FIXTURES / name).read_text().lower()
