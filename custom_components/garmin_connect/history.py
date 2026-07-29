@@ -306,6 +306,39 @@ class HistoryCalendarEvent:
     summary: str
 
 
+def _add_structured_calendar_event(
+    events: dict[tuple[str, datetime, datetime, str], HistoryCalendarEvent],
+    *,
+    logical_id: str,
+    record: Mapping[str, Any],
+    start: datetime,
+    end: datetime,
+    summary: str,
+    query_start_date: date,
+    query_end_date: date,
+) -> None:
+    """Add one deduplicated activity or health event matching a date query."""
+    source_calendar_date: date | None = None
+    raw_source_calendar_date = record.get("calendar_date")
+    if isinstance(raw_source_calendar_date, str):
+        try:
+            source_calendar_date = date.fromisoformat(raw_source_calendar_date)
+        except ValueError:
+            pass
+    source_calendar_date_matches = (
+        source_calendar_date is not None
+        and query_start_date <= source_calendar_date <= query_end_date
+    )
+    source_instants_overlap = (
+        start.date() <= query_end_date and end.date() >= query_start_date
+    )
+    if not source_calendar_date_matches and not source_instants_overlap:
+        return
+    events[(logical_id, start, end, summary)] = HistoryCalendarEvent(
+        start, end, summary
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class RecorderCompatibilityResult:
     """Result of the private Recorder compatibility seam."""
@@ -1758,21 +1791,21 @@ class GarminHistoryArchive:
                             end = start + timedelta(seconds=duration)
                     if end is None:
                         continue
-                    raw_activity_source_date = record.get("calendar_date")
-                    activity_source_date = (
-                        date.fromisoformat(raw_activity_source_date)
-                        if isinstance(raw_activity_source_date, str)
-                        else None
+                    summary = str(
+                        record.get("name")
+                        or record.get("activity_type")
+                        or "Activity"
+                    )[:64]
+                    _add_structured_calendar_event(
+                        events,
+                        logical_id=logical_id,
+                        record=record,
+                        start=start,
+                        end=end,
+                        summary=summary,
+                        query_start_date=start_date,
+                        query_end_date=end_date,
                     )
-                    overlaps_range = (
-                        start.date() <= end_date and end.date() >= start_date
-                    )
-                    if (
-                        activity_source_date is not None
-                        and start_date <= activity_source_date <= end_date
-                    ) or overlaps_range:
-                        summary = str(record.get("name") or record.get("activity_type") or "Activity")[:64]
-                        events[(logical_id, start, end, summary)] = HistoryCalendarEvent(start, end, summary)
             return tuple(sorted(events.values(), key=lambda event: event.start))
         if calendar == "health":
             for records in self._health_events.values():
@@ -1783,28 +1816,35 @@ class GarminHistoryArchive:
                     if health_start is None and health_end is None and occurrence is not None:
                         health_start = occurrence
                         health_end = occurrence + timedelta(seconds=1)
+                    elif health_start is not None and health_end is None and occurrence is None:
+                        health_end = health_start + timedelta(seconds=1)
+                    elif health_start is None and health_end is not None and occurrence is None:
+                        health_start = health_end
+                        health_end += timedelta(seconds=1)
                     else:
                         health_start = health_start or occurrence or health_end
                         health_end = health_end or occurrence or health_start
                     if health_start is None or health_end is None:
                         continue
-                    source_date: date | None = None
-                    raw_source_date = record.get("calendar_date")
-                    if isinstance(raw_source_date, str):
-                        try:
-                            source_date = date.fromisoformat(raw_source_date)
-                        except ValueError:
-                            continue
-                    overlaps_range = (
-                        health_start.date() <= end_date
-                        and health_end.date() >= start_date
+                    if health_start == health_end:
+                        health_end += timedelta(seconds=1)
+                    elif health_end < health_start:
+                        continue
+                    summary = str(
+                        record.get("category")
+                        or record.get("event_type")
+                        or "Health event"
+                    )[:64]
+                    _add_structured_calendar_event(
+                        events,
+                        logical_id=logical_id,
+                        record=record,
+                        start=health_start,
+                        end=health_end,
+                        summary=summary,
+                        query_start_date=start_date,
+                        query_end_date=end_date,
                     )
-                    if (
-                        source_date is not None
-                        and start_date <= source_date <= end_date
-                    ) or overlaps_range:
-                        summary = str(record.get("category") or record.get("event_type") or "Health event")[:64]
-                        events[(logical_id, health_start, health_end, summary)] = HistoryCalendarEvent(health_start, health_end, summary)
             return tuple(sorted(events.values(), key=lambda event: event.start))
         for records in self._sleep_sessions.values():
             for logical_id, record in records.items():

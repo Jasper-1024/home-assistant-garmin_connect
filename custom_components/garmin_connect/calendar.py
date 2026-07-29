@@ -1,8 +1,8 @@
-"""Read-only Calendar entities backed by structured Garmin sleep sessions."""
+"""Read-only Calendar entities backed by structured Garmin Source Records."""
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 from homeassistant.components.calendar import CalendarEntity, CalendarEvent
 from homeassistant.config_entries import ConfigEntry
@@ -25,28 +25,25 @@ async def async_setup_entry(
         ])
 
 
-class GarminSleepCalendar(CalendarEntity):
-    """Expose sleep and nap intervals without payload details."""
+class GarminStructuredCalendar(CalendarEntity):
+    """Common read-only Calendar behavior for structured Source Records."""
 
     _attr_has_entity_name = True
-    _attr_name = "Sleep"
+    _calendar_name: str
+    _unique_id_suffix: str
 
     def __init__(self, archive: GarminHistoryArchive, entry_id: str) -> None:
         self._archive = archive
-        self._attr_unique_id = f"{entry_id}_sleep_calendar"
+        self._attr_unique_id = f"{entry_id}_{self._unique_id_suffix}"
 
     async def async_get_events(
         self, hass: HomeAssistant, start_date: datetime, end_date: datetime
     ) -> list[CalendarEvent]:
-        """Return only bounded interval events in the requested date range."""
-        return await self._async_get_events("sleep", start_date, end_date)
-
-    async def _async_get_events(
-        self, calendar: str, start_date: datetime, end_date: datetime
-    ) -> list[CalendarEvent]:
-        """Return source-date candidates that overlap the exact requested interval."""
+        """Return candidates that exactly overlap the requested Source Instants."""
         events = await self._archive.async_get_calendar_events(
-            calendar, start_date.date(), end_date.date()
+            self._calendar_name,
+            start_date.astimezone(UTC).date(),
+            end_date.astimezone(UTC).date(),
         )
         return [
             CalendarEvent(
@@ -64,27 +61,25 @@ class GarminSleepCalendar(CalendarEntity):
         return None
 
 
-class GarminHealthEventsCalendar(GarminSleepCalendar):
+class GarminSleepCalendar(GarminStructuredCalendar):
+    """Expose sleep and nap intervals without payload details."""
+
+    _attr_name = "Sleep"
+    _calendar_name = "sleep"
+    _unique_id_suffix = "sleep_calendar"
+
+
+class GarminHealthEventsCalendar(GarminStructuredCalendar):
     """Expose sanitized health event intervals only."""
 
     _attr_name = "Health events"
-
-    def __init__(self, archive: GarminHistoryArchive, entry_id: str) -> None:
-        super().__init__(archive, entry_id)
-        self._attr_unique_id = f"{entry_id}_health_events_calendar"
-
-    async def async_get_events(self, hass: HomeAssistant, start_date: datetime, end_date: datetime) -> list[CalendarEvent]:
-        return await self._async_get_events("health", start_date, end_date)
+    _calendar_name = "health"
+    _unique_id_suffix = "health_events_calendar"
 
 
-class GarminActivityCalendar(GarminSleepCalendar):
+class GarminActivityCalendar(GarminStructuredCalendar):
     """Expose timed activity summaries without routes or raw streams."""
 
     _attr_name = "Activities"
-
-    def __init__(self, archive: GarminHistoryArchive, entry_id: str) -> None:
-        super().__init__(archive, entry_id)
-        self._attr_unique_id = f"{entry_id}_activity_calendar"
-
-    async def async_get_events(self, hass: HomeAssistant, start_date: datetime, end_date: datetime) -> list[CalendarEvent]:
-        return await self._async_get_events("activity", start_date, end_date)
+    _calendar_name = "activity"
+    _unique_id_suffix = "activity_calendar"

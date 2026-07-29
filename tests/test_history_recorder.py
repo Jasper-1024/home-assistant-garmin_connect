@@ -42,7 +42,7 @@ class StalledRequester(FakeRequester):
 
 
 @pytest.mark.asyncio
-async def test_writer_preserves_aware_timestamps_and_equal_values_without_state_events() -> None:
+async def test_writer_preserves_source_instants_and_equal_values_without_state_events() -> None:
     recorder = FakeRequester()
     writer = GarminHistoryRecorder(recorder)
     samples = (
@@ -77,7 +77,7 @@ async def test_writer_preserves_aware_timestamps_and_equal_values_without_state_
 
 @pytest.mark.asyncio
 async def test_writer_uses_absolute_source_instant_for_equivalent_offsets() -> None:
-    """Different offset spellings of one source instant share one statistics row."""
+    """Different offset spellings of one Source Instant share one statistics row."""
     recorder = FakeRequester()
     writer = GarminHistoryRecorder(recorder)
     source_instant = datetime(2026, 7, 24, 8, 0, tzinfo=UTC)
@@ -117,7 +117,7 @@ async def test_writer_keeps_source_calendar_date_outside_recorder_statistics() -
 
 
 @pytest.mark.asyncio
-async def test_writer_rejects_naive_source_timestamps_before_history_write() -> None:
+async def test_writer_rejects_naive_datetime_before_source_instant_write() -> None:
     recorder = FakeRequester()
     writer = GarminHistoryRecorder(recorder)
 

@@ -69,7 +69,7 @@ def test_normalize_pair_series_uses_descriptors_and_keeps_ordered_equal_values()
     assert samples[1].raw_timestamp == 1_784_852_400_000
 
 
-def test_measurement_timestamp_without_offset_fails_closed() -> None:
+def test_measurement_without_source_instant_offset_fails_closed() -> None:
     with pytest.raises(HistorySchemaError):
         normalize_pair_series(
             {"heartRateValues": [[60, "2026-07-24T01:00:00", "ignored"]]},
@@ -159,7 +159,7 @@ def test_normalize_activities_rejects_explicit_event_families() -> None:
 
 
 @pytest.mark.asyncio
-async def test_timed_activity_preserves_ha_garmin_local_date_and_gmt_instant() -> None:
+async def test_timed_activity_preserves_source_calendar_date_and_source_instants_without_duration() -> None:
     client = GarminClient(MagicMock())
     client._request = AsyncMock(
         return_value=[
@@ -168,7 +168,7 @@ async def test_timed_activity_preserves_ha_garmin_local_date_and_gmt_instant() -
                 "activityType": {"typeKey": "walking"},
                 "startTimeGMT": "2025-12-31T22:30:00.000",
                 "startTimeLocal": "2026-01-01T00:30:00.000",
-                "durationInSeconds": 60,
+                "endTimeGMT": "2025-12-31T22:31:00.000",
             }
         ]
     )
@@ -177,10 +177,11 @@ async def test_timed_activity_preserves_ha_garmin_local_date_and_gmt_instant() -
     assert len(result) == 1
     assert result[0].calendar_date == date(2026, 1, 1)
     assert result[0].start == datetime(2025, 12, 31, 22, 30, tzinfo=UTC)
+    assert result[0].end == datetime(2025, 12, 31, 22, 31, tzinfo=UTC)
 
 
 @pytest.mark.asyncio
-async def test_unscoped_activity_without_local_date_uses_source_instant_utc_date() -> None:
+async def test_unscoped_activity_without_source_calendar_date_uses_source_instant_utc_date() -> None:
     client = MagicMock()
     client.get_activities = AsyncMock(
         return_value=[
@@ -234,7 +235,7 @@ def test_normalize_health_events_keeps_empty_structures_absent() -> None:
         [{"metadata": "only"}],
     ],
 )
-def test_abnormal_hr_without_aware_time_remains_absent(values: list) -> None:
+def test_abnormal_hr_without_source_instant_remains_absent(values: list) -> None:
     assert normalize_health_events(
         {"abnormalHRValuesArray": values}, date(2026, 7, 24)
     ) == ()
@@ -917,7 +918,7 @@ def test_daily_summary_and_training_snapshot_presence_and_type_drift() -> None:
 
 
 def test_date_only_snapshots_use_the_utc_plus_eight_calendar_bucket() -> None:
-    """Calendar summaries retain their source date without inventing a Garmin instant."""
+    """Summaries retain Source Calendar Date without inventing a Source Instant."""
     calendar_date = date(2027, 1, 1)
 
     bucketed = normalize_snapshot(

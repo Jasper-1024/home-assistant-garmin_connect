@@ -169,6 +169,14 @@ def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedAct
         end_raw = _first_non_null(item, ("endTimeGMT", "endTime"))
         if end_raw is _MISSING:
             end_raw = None
+        end_key = next(
+            (
+                key
+                for key in ("endTimeGMT", "endTime")
+                if item.get(key) is not None
+            ),
+            None,
+        )
         duration_raw = _first_non_null(item, ("durationInSeconds", "duration"))
         if duration_raw is _MISSING:
             duration_raw = None
@@ -181,7 +189,15 @@ def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedAct
         )
         if start is None:
             raise HistorySchemaError("activity timestamp is invalid")
-        end = _timestamp(end_raw) if end_raw is not None else None
+        end = (
+            (
+                _timestamp_as_utc(end_raw)
+                if end_key == "endTimeGMT"
+                else _timestamp(end_raw)
+            )
+            if end_raw is not None
+            else None
+        )
         def numeric(item_data: dict[str, Any], *names: str) -> float | None:
             value = _first_non_null(item_data, names)
             if value is _MISSING:

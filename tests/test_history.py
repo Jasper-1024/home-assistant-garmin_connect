@@ -145,6 +145,53 @@ def _archive(
     )
 
 
+async def _sync_health_calendar_records(
+    raw_events: list[dict[str, object]],
+) -> tuple[GarminHistoryArchive, dict[str, FakeStore]]:
+    """Archive captured health records through the public synchronization seam."""
+    target = date(2026, 7, 24)
+    hass = _hass()
+    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=None
+    )
+    stores: dict[str, FakeStore] = {}
+    health_events = normalize_health_events({"events": raw_events}, target)
+
+    def store_factory(_hass, _version, path, **kwargs):
+        return stores.setdefault(path, FakeStore())
+
+    class Source:
+        async def async_fetch_details(
+            self, _request_date: date, metric: str
+        ) -> object:
+            if metric == "health_events_daily":
+                return health_events
+            if metric in {
+                "sleep_sessions",
+                "health_events_body_battery",
+                "timed_activities",
+            }:
+                return ()
+            return SourceSeries((), "missing")
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(
+            RecorderCompatibilityResult.compatible_result()
+        ),
+        store_factory=store_factory,
+        source_factory=lambda _client, _gate: Source(),
+        recorder_factory=lambda: recorder,
+    )
+    await archive.async_start()
+    assert (await archive.async_sync_range(target, target)).outcome == "written"
+    return archive, stores
+
+
 async def test_start_persists_opaque_account_key_and_reuses_it() -> None:
     """The identity is generated once and survives a new archive instance."""
     hass = _hass()
@@ -318,6 +365,174 @@ async def test_calendar_exposes_instantaneous_health_source_record() -> None:
             "abnormal",
             datetime(2026, 7, 23, 22, 34, 56, tzinfo=UTC),
             datetime(2026, 7, 23, 22, 34, 57, tzinfo=UTC),
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("raw_event", "expected_start", "stored_start", "stored_end"),
+    [
+        pytest.param(
+            {"startTime": "2026-07-24T10:00:00Z"},
+            datetime(2026, 7, 24, 10, 0, tzinfo=UTC),
+            "2026-07-24T10:00:00+00:00",
+            None,
+            id="start-source-instant-only",
+        ),
+        pytest.param(
+            {"endTime": "2026-07-24T11:00:00Z"},
+            datetime(2026, 7, 24, 11, 0, tzinfo=UTC),
+            None,
+            "2026-07-24T11:00:00+00:00",
+            id="end-source-instant-only",
+        ),
+    ],
+)
+async def test_health_single_endpoint_source_instant_is_queryable(
+    raw_event: dict[str, object],
+    expected_start: datetime,
+    stored_start: str | None,
+    stored_end: str | None,
+) -> None:
+    """A single endpoint projects to one second without changing Source Instants."""
+    archive, stores = await _sync_health_calendar_records([raw_event])
+
+    events = await archive.async_get_calendar_events(
+        "health", date(2026, 7, 24), date(2026, 7, 24)
+    )
+
+    assert [(event.start, event.end) for event in events] == [
+        (expected_start, expected_start + timedelta(seconds=1))
+    ]
+    stored_event = next(
+        iter(stores["garmin_connect.entry-1.sleep_2026"].data["events"].values())
+    )
+    assert (stored_event["start"], stored_event["end"]) == (
+        stored_start,
+        stored_end,
+    )
+
+
+async def test_health_equal_endpoint_source_instants_project_to_valid_interval() -> None:
+    """Equal Source Instants project to one second without changing persistence."""
+    archive, stores = await _sync_health_calendar_records(
+        [
+            {
+                "startTime": "2026-07-24T10:00:00Z",
+                "endTime": "2026-07-24T10:00:00Z",
+            }
+        ]
+    )
+
+    events = await archive.async_get_calendar_events(
+        "health", date(2026, 7, 24), date(2026, 7, 24)
+    )
+
+    source_instant = datetime(2026, 7, 24, 10, 0, tzinfo=UTC)
+    assert [(event.start, event.end) for event in events] == [
+        (source_instant, source_instant + timedelta(seconds=1))
+    ]
+    stored_event = next(
+        iter(stores["garmin_connect.entry-1.sleep_2026"].data["events"].values())
+    )
+    assert stored_event["start"] == stored_event["end"]
+
+
+async def test_health_reversed_interval_is_skipped_without_hiding_valid_record() -> None:
+    """A reversed Source Instant interval cannot fail the Calendar query."""
+    archive, stores = await _sync_health_calendar_records(
+        [
+            {
+                "category": "reversed",
+                "startTime": "2026-07-24T11:00:00Z",
+                "endTime": "2026-07-24T10:00:00Z",
+            },
+            {
+                "category": "valid",
+                "startTime": "2026-07-24T12:00:00Z",
+                "endTime": "2026-07-24T13:00:00Z",
+            },
+        ]
+    )
+
+    events = await archive.async_get_calendar_events(
+        "health", date(2026, 7, 24), date(2026, 7, 24)
+    )
+
+    assert [(event.summary, event.start, event.end) for event in events] == [
+        (
+            "valid",
+            datetime(2026, 7, 24, 12, 0, tzinfo=UTC),
+            datetime(2026, 7, 24, 13, 0, tzinfo=UTC),
+        )
+    ]
+    assert len(stores["garmin_connect.entry-1.sleep_2026"].data["events"]) == 2
+
+
+async def test_activity_with_gmt_source_instants_is_calendar_queryable_without_duration() -> None:
+    """A raw activity with GMT Source Instants needs no synthetic duration."""
+    target = date(2026, 1, 1)
+    hass = _hass()
+    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=None
+    )
+    stores: dict[str, FakeStore] = {}
+    activities = normalize_activities(
+        [
+            {
+                "activityId": 2,
+                "activityType": {"typeKey": "walking"},
+                "activityName": "New Year walk",
+                "startTimeGMT": "2025-12-31T22:30:00.000",
+                "startTimeLocal": "2026-01-01T00:30:00.000",
+                "endTimeGMT": "2025-12-31T22:31:00.000",
+            }
+        ],
+        target,
+    )
+
+    def store_factory(_hass, _version, path, **kwargs):
+        return stores.setdefault(path, FakeStore())
+
+    class Source:
+        async def async_fetch_details(
+            self, _request_date: date, metric: str
+        ) -> object:
+            if metric == "timed_activities":
+                return activities
+            if metric in {
+                "sleep_sessions",
+                "health_events_daily",
+                "health_events_body_battery",
+            }:
+                return ()
+            return SourceSeries((), "missing")
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(
+            RecorderCompatibilityResult.compatible_result()
+        ),
+        store_factory=store_factory,
+        source_factory=lambda _client, _gate: Source(),
+        recorder_factory=lambda: recorder,
+    )
+    await archive.async_start()
+    assert (await archive.async_sync_range(target, target)).outcome == "written"
+
+    events = await archive.async_get_calendar_events(
+        "activity", date(2025, 12, 31), date(2025, 12, 31)
+    )
+
+    assert [(event.summary, event.start, event.end) for event in events] == [
+        (
+            "New Year walk",
+            datetime(2025, 12, 31, 22, 30, tzinfo=UTC),
+            datetime(2025, 12, 31, 22, 31, tzinfo=UTC),
         )
     ]
 
@@ -855,7 +1070,7 @@ async def test_segmented_totals_are_written_with_provenance_and_revisions() -> N
 
 @pytest.mark.asyncio
 async def test_date_only_segmented_total_uses_cross_year_calendar_bucket() -> None:
-    """Daily totals use the UTC+08:00 bucket while retaining the source date."""
+    """Daily totals use the UTC+08:00 bucket and retain Source Calendar Date."""
     target = date(2027, 1, 1)
     writes: list[tuple[str, tuple[NormalizedSample, ...]]] = []
     recorder = MagicMock()
@@ -961,7 +1176,7 @@ async def test_numeric_manifest_recovery_replays_after_partition_failure() -> No
 async def test_confirmed_numeric_provenance_survives_storage_failure_and_empty_replay(
     failure_kind: str,
 ) -> None:
-    """A successful Recorder write keeps its source date through empty recovery."""
+    """A Recorder write keeps Source Calendar Date through empty recovery."""
     target = date(2026, 12, 31)
     instant = datetime(2026, 12, 31, 23, 30, tzinfo=UTC)
     hass = _hass()
@@ -1263,8 +1478,8 @@ async def test_empty_numeric_replay_persists_tombstone_before_clearing_pending()
 
 
 @pytest.mark.asyncio
-async def test_cross_year_numeric_source_date_catalog_tombstone_restarts() -> None:
-    """Source-date tombstones are keyed by Source Instant UTC year."""
+async def test_cross_year_numeric_source_calendar_date_catalog_tombstone_restarts() -> None:
+    """Source Calendar Date tombstones use the Source Instant UTC year."""
     source_date = date(2027, 1, 1)
     instant_year = "2026"
     catalog = FakeStore({
@@ -1301,8 +1516,8 @@ async def test_cross_year_numeric_source_date_catalog_tombstone_restarts() -> No
 
 
 @pytest.mark.asyncio
-async def test_cross_year_numeric_source_date_partition_tombstone_restarts() -> None:
-    """Partition tombstones recover source dates crossing the UTC year boundary."""
+async def test_cross_year_numeric_source_calendar_date_partition_tombstone_restarts() -> None:
+    """Partition tombstones recover Source Calendar Dates across a UTC year."""
     source_date = date(2027, 1, 1)
     instant_year = "2026"
     catalog = FakeStore({
@@ -1429,8 +1644,8 @@ def test_history_status_and_archive_metadata_use_one_public_contract() -> None:
     assert not hasattr(const, "CONF_ARCHIVE_LAST_ENABLED")
 
 
-async def test_enablement_persists_local_activation_date() -> None:
-    """Enabling archival records the current Home Assistant local date."""
+async def test_enablement_persists_archive_activation_date() -> None:
+    """Enablement records the Home Assistant date as Archive Activation Date."""
     hass = _hass()
     entry = _entry(data={CONF_ARCHIVE_PREVIOUSLY_ENABLED: False})
     entry.options = {CONF_ARCHIVE_ENABLED: True}
@@ -1445,7 +1660,7 @@ async def test_enablement_persists_local_activation_date() -> None:
     assert persisted[CONF_ARCHIVE_PREVIOUSLY_ENABLED] is True
 
 
-async def test_enabled_start_syncs_only_the_current_local_date() -> None:
+async def test_enabled_start_syncs_only_the_archive_activation_date() -> None:
     """Archive enablement immediately imports one bounded current-day batch."""
     hass = _hass()
     entry = _entry(
@@ -1506,7 +1721,7 @@ async def test_enabled_start_syncs_only_the_current_local_date() -> None:
 
 
 async def test_successful_first_sync_starts_fifteen_minute_local_day_cycles() -> None:
-    """A successful activation schedules only current-local-date cycles."""
+    """A successful activation schedules current Archive Activation Date cycles."""
     hass = _hass()
     entry = _entry(
         data={
@@ -2067,7 +2282,7 @@ async def test_stop_cancels_cycle_and_future_wakeup() -> None:
     assert timer.active == []
 
 
-async def test_first_sync_requests_completed_current_local_date() -> None:
+async def test_first_sync_requests_completed_archive_activation_date() -> None:
     """Enablement retries today even when a prior repair checkpoint exists."""
     hass = _hass()
     target_date = date(2026, 8, 4)
@@ -2237,8 +2452,8 @@ async def test_stop_cancels_an_in_flight_first_sync() -> None:
     await archive.async_stop()
 
 
-async def test_enablement_uses_configured_local_date_across_utc_midnight() -> None:
-    """Enablement uses HA's local calendar date, not the UTC date."""
+async def test_enablement_uses_configured_timezone_for_archive_activation_date() -> None:
+    """Archive Activation Date follows HA timezone across UTC midnight."""
     hass = _hass()
     entry = _entry(data={CONF_ARCHIVE_PREVIOUSLY_ENABLED: False})
     entry.options = {CONF_ARCHIVE_ENABLED: True}
@@ -2342,7 +2557,7 @@ async def test_enabled_archive_fails_closed_for_invalid_persisted_activation_dat
 
 
 async def test_archive_lifecycle_persists_through_reload_restart_and_reenablement() -> None:
-    """Reload/restart preserves identity, while re-enable establishes a new date."""
+    """Reload preserves identity; re-enable sets a new Archive Activation Date."""
     hass = _hass()
     entry = _entry(data={CONF_ARCHIVE_PREVIOUSLY_ENABLED: False})
     entry.options = {CONF_ARCHIVE_ENABLED: True}
