@@ -159,45 +159,20 @@ def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedAct
         if non_timed_family or has_event_fields:
             continue
         start_aliases = ("startTime", "startTimeGMT", "startTimeLocal")
-        start_raw = _first_non_null(item, start_aliases)
+        start_raw, start = _timestamp_from_aliases(item, start_aliases)
         if start_raw is _MISSING:
             start_raw = None
-        start_key = next(
-            (key for key in start_aliases if item.get(key) is not None), None
-        )
         activity_id = item.get("activityId", item.get("activityUUID"))
-        end_raw = _first_non_null(item, ("endTimeGMT", "endTime"))
+        end_raw, end = _timestamp_from_aliases(item, ("endTimeGMT", "endTime"))
         if end_raw is _MISSING:
             end_raw = None
-        end_key = next(
-            (
-                key
-                for key in ("endTimeGMT", "endTime")
-                if item.get(key) is not None
-            ),
-            None,
-        )
         duration_raw = _first_non_null(item, ("durationInSeconds", "duration"))
         if duration_raw is _MISSING:
             duration_raw = None
         if not isinstance(activity_type, str) or len(activity_type) > 64 or not isinstance(activity_id, (str, int)) or not isinstance(start_raw, (str, int, float, datetime)) or (end_raw is None and duration_raw is None):
             raise HistorySchemaError("activity identity has invalid type")
-        start = (
-            _timestamp_as_utc(start_raw)
-            if start_key == "startTimeGMT"
-            else _timestamp(start_raw)
-        )
         if start is None:
             raise HistorySchemaError("activity timestamp is invalid")
-        end = (
-            (
-                _timestamp_as_utc(end_raw)
-                if end_key == "endTimeGMT"
-                else _timestamp(end_raw)
-            )
-            if end_raw is not None
-            else None
-        )
         def numeric(item_data: dict[str, Any], *names: str) -> float | None:
             value = _first_non_null(item_data, names)
             if value is _MISSING:
@@ -344,19 +319,12 @@ def normalize_health_events(payload: Any, target_date: date) -> tuple[Normalized
         category = next((event[key] for key in ("category", "eventCategory") if key in event), None)
         if any(value is not None and (not isinstance(value, str) or len(value) > 64) for value in (source, event_type, category)):
             raise HistorySchemaError("health event identity has invalid type")
-        def event_time(event_data: dict[str, Any], names: tuple[str, ...]) -> datetime | None:
-            for name in names:
-                value = event_data.get(name)
-                if value is not None:
-                    return (
-                        _timestamp_as_utc(value)
-                        if name.endswith("GMT")
-                        else _timestamp(value)
-                    )
-            return None
-        start = event_time(event, ("startTime", "startTimeGMT", "start"))
-        end = event_time(event, ("endTime", "endTimeGMT", "end"))
-        occurrence = event_time(event, ("occurrenceTime", "occurrenceTimeGMT", "eventTime", "timestamp", "time"))
+        _, start = _timestamp_from_aliases(event, ("startTime", "startTimeGMT", "start"))
+        _, end = _timestamp_from_aliases(event, ("endTime", "endTimeGMT", "end"))
+        _, occurrence = _timestamp_from_aliases(
+            event,
+            ("occurrenceTime", "occurrenceTimeGMT", "eventTime", "timestamp", "time"),
+        )
         if all(value is None for value in (start, end, occurrence)):
             continue
         logical_id, revision = _health_identity_revision(event_type, source, category, start, end, occurrence)
@@ -457,6 +425,23 @@ def _timestamp_as_utc(value: Any) -> datetime | None:
         if parsed.tzinfo is None:
             return parsed.replace(tzinfo=UTC)
     return None
+
+
+def _timestamp_from_aliases(
+    mapping: Mapping[str, Any], aliases: tuple[str, ...]
+) -> tuple[Any, datetime | None]:
+    """Select and parse the first non-null timestamp alias."""
+    for alias in aliases:
+        value = mapping.get(alias)
+        if value is None:
+            continue
+        parsed = (
+            _timestamp_as_utc(value)
+            if alias.endswith("GMT")
+            else _timestamp(value)
+        )
+        return value, parsed
+    return _MISSING, None
 
 
 def _snapshot_calendar_date(value: Any, fallback: date) -> date:

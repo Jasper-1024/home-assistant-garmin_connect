@@ -116,6 +116,43 @@ def test_normalize_health_events_preserves_explicit_fields_only() -> None:
     assert events[1].occurrence is not None
 
 
+def test_activity_and_health_timestamp_aliases_keep_priority_and_timezone_rules() -> None:
+    activity = normalize_activities(
+        [
+            {
+                "activityId": 1,
+                "activityType": "running",
+                "startTime": "2026-07-24T01:00:00+02:00",
+                "startTimeGMT": "2026-07-24T02:00:00.000",
+                "startTimeLocal": "2026-07-24T03:00:00.000",
+                "endTimeGMT": "2026-07-24T03:00:00.000",
+                "endTime": "2026-07-24T04:00:00+02:00",
+            }
+        ],
+        date(2026, 7, 24),
+    )[0]
+    health = normalize_health_events(
+        {
+            "events": [
+                {
+                    "startTime": "2026-07-24T01:00:00+02:00",
+                    "startTimeGMT": "2026-07-24T02:00:00.000",
+                    "endTimeGMT": "2026-07-24T03:00:00.000",
+                    "endTime": "2026-07-24T04:00:00+02:00",
+                    "occurrenceTimeGMT": "2026-07-24T02:30:00.000",
+                }
+            ]
+        },
+        date(2026, 7, 24),
+    )[0]
+
+    assert activity.start == datetime(2026, 7, 23, 23, tzinfo=UTC)
+    assert activity.end == datetime(2026, 7, 24, 3, tzinfo=UTC)
+    assert health.start == datetime(2026, 7, 23, 23, tzinfo=UTC)
+    assert health.end == datetime(2026, 7, 24, 2, tzinfo=UTC)
+    assert health.occurrence == datetime(2026, 7, 24, 2, 30, tzinfo=UTC)
+
+
 @pytest.mark.asyncio
 async def test_timed_activities_uses_pagination_and_deduplicates_overlap() -> None:
     client = MagicMock()
