@@ -1107,7 +1107,8 @@ class GarminHistoryArchive:
                 outcome = "records"
             if previous is not None:
                 if not (
-                    outcome == "records" and previous.outcome == "incomplete"
+                    outcome == "records"
+                    and previous.outcome in {"failed", "incomplete"}
                 ):
                     outcome = _merge_reconciliation_evidence(previous.outcome, outcome)
             evidence_requires_open = outcome in {"failed", "incomplete"}
@@ -1142,7 +1143,7 @@ class GarminHistoryArchive:
         target_key: str,
         accumulator: _FamilyObservationAccumulator,
     ) -> None:
-        """Store one observation while retaining prior failure evidence."""
+        """Store current completeness while retaining prior failure evidence."""
         previous = self._reconciliation_family_presence.get(target_key, {})
         current = accumulator.presence
         merged = dict(previous)
@@ -1152,7 +1153,7 @@ class GarminHistoryArchive:
             )
         self._reconciliation_family_presence[target_key] = merged
         self._last_reconciliation_observation[target_key] = _date_reconciliation_observation(
-            accumulator, family_presence=merged
+            accumulator
         )
 
     async def _async_checkpoint_observation(

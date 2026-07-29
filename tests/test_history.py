@@ -703,6 +703,87 @@ async def test_incomplete_checkpoint_survives_restart_and_empty_window() -> None
 
 
 @pytest.mark.asyncio
+async def test_public_archive_failure_then_complete_records_then_unchanged_settles() -> None:
+    """A recovered complete observation can reach terminal settlement."""
+    target = date(2026, 8, 4)
+    store = _reconciliation_store(target)
+
+    class FailureThenRecordsSource(ReconciliationSource):
+        def __init__(self) -> None:
+            super().__init__({target: (72.0,)})
+            self.fail_target = True
+
+        async def async_fetch_details(self, target_date: date, metric: str) -> object:
+            if self.fail_target and target_date == target and metric == "heart_rate":
+                self.requested.append(target_date)
+                raise GarminConnectError("temporary family failure")
+            return await super().async_fetch_details(target_date, metric)
+
+    source = FailureThenRecordsSource()
+    now = [datetime(2026, 8, 5, tzinfo=UTC)]
+    timer = DeterministicTimer()
+    archive = _enabled_reconciliation_archive(store, source, now, timer)
+
+    await archive.async_start()
+    await _wait_for_remote_requests(source, 19)
+    await _run_reconciliation_cycle(archive, timer, source)
+    failed_requests = source.requested.count(target)
+
+    source.fail_target = False
+    await _run_reconciliation_cycle(archive, timer, source)
+    complete_requests = source.requested.count(target)
+    assert complete_requests > failed_requests
+    assert archive.get_history_presence(target, target)[target.isoformat()]["heart_rate"] == "present"
+
+    await _run_reconciliation_cycle(archive, timer, source)
+    settled_requests = source.requested.count(target)
+    await _run_reconciliation_cycle(archive, timer, source)
+
+    assert settled_requests > complete_requests
+    assert source.requested.count(target) == settled_requests
+    await archive.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_public_archive_failure_then_empty_through_window_stays_open() -> None:
+    """A failed observation prevents empty-through-window gap settlement."""
+    target = date(2026, 8, 4)
+    store = _reconciliation_store(target)
+
+    class FailureThenEmptySource(ReconciliationSource):
+        def __init__(self) -> None:
+            super().__init__({})
+            self.fail_target = True
+
+        async def async_fetch_details(self, target_date: date, metric: str) -> object:
+            if self.fail_target and target_date == target and metric == "heart_rate":
+                self.requested.append(target_date)
+                raise GarminConnectError("temporary family failure")
+            return await super().async_fetch_details(target_date, metric)
+
+    source = FailureThenEmptySource()
+    now = [datetime(2026, 8, 5, tzinfo=UTC)]
+    timer = DeterministicTimer()
+    archive = _enabled_reconciliation_archive(store, source, now, timer)
+
+    await archive.async_start()
+    await _wait_for_remote_requests(source, 19)
+    await _run_reconciliation_cycle(archive, timer, source)
+    source.fail_target = False
+    await _run_reconciliation_cycle(archive, timer, source)
+
+    now[0] = datetime(2026, 8, 12, tzinfo=UTC)
+    await _run_reconciliation_cycle(archive, timer, source)
+    requests_at_window_end = source.requested.count(target)
+
+    now[0] = datetime(2026, 8, 10, tzinfo=UTC)
+    await _run_reconciliation_cycle(archive, timer, source)
+
+    assert source.requested.count(target) > requests_at_window_end
+    await archive.async_stop()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("interruption", ("success", "failure", "cancel"))
 async def test_reconciliation_family_checkpoint_survives_interruption(
     interruption: str,
