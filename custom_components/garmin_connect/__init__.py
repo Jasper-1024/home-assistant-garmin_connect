@@ -200,6 +200,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: GarminConnectConfigEntry
         return_exceptions=True,
     )
 
+    # The archive's bounded first synchronization uses the same client and
+    # account request gate as current-value coordinators.  Attach runtime data
+    # before archive startup so its background-priority requests are admitted
+    # through the established account boundary.
+    entry.runtime_data = coordinators
     history_archive = GarminHistoryArchive(hass, entry)
     try:
         await history_archive.async_start()
@@ -214,7 +219,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: GarminConnectConfigEntry
             entry.entry_id,
         )
     coordinators.history_archive = history_archive
-    entry.runtime_data = coordinators
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 

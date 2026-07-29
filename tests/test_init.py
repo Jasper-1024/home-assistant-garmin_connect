@@ -30,6 +30,7 @@ from custom_components.garmin_connect.history import (
     GarminHistoryArchive,
     RecorderCompatibilityResult,
 )
+from custom_components.garmin_connect.history_recorder import RecorderWriteOutcome
 from custom_components.garmin_connect.request_gate import (
     GarminRequestGate,
     GarminRequestPriority,
@@ -295,6 +296,29 @@ async def test_real_config_entry_lifecycle_keeps_backfill_dormant_and_surfaces_v
                 patch(
                     "custom_components.garmin_connect.history.HomeAssistantRecorderCompatibility.async_check",
                     new=AsyncMock(return_value=MagicMock(compatible=True, error_type=None)),
+                )
+            )
+            source = MagicMock()
+            source.async_fetch = AsyncMock(return_value=())
+            source.async_fetch_details = None
+            stack.enter_context(
+                patch(
+                    "custom_components.garmin_connect.history.GarminHistorySource",
+                    return_value=source,
+                )
+            )
+            recorder = MagicMock()
+            recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+            stack.enter_context(
+                patch(
+                    "custom_components.garmin_connect.history.GarminHistoryRecorder",
+                    return_value=recorder,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "homeassistant.helpers.recorder.get_instance",
+                    return_value=recorder,
                 )
             )
             backfill = stack.enter_context(

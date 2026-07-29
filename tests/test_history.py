@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from datetime import UTC, date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
@@ -27,7 +29,9 @@ from custom_components.garmin_connect.history import (
     HomeAssistantRecorderCompatibility,
     RecorderCompatibilityResult,
 )
+from custom_components.garmin_connect.history_recorder import RecorderWriteOutcome
 from custom_components.garmin_connect.history_sensor import GarminHistoryStatusSensor
+from custom_components.garmin_connect.history_source import NormalizedSample
 
 
 class FakeStore:
@@ -90,6 +94,7 @@ def _archive(
         entry,
         recorder_checker=checker,
         store_factory=_store_factory(store),
+        run_first_sync=False,
     )
 
 
@@ -158,6 +163,174 @@ async def test_enablement_persists_local_activation_date() -> None:
     persisted = hass.config_entries.async_update_entry.call_args.kwargs["data"]
     assert persisted[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-08-03"
     assert persisted[CONF_ARCHIVE_PREVIOUSLY_ENABLED] is True
+
+
+async def test_enabled_start_syncs_only_the_current_local_date() -> None:
+    """Archive enablement immediately imports one bounded current-day batch."""
+    hass = _hass()
+    entry = _entry(
+        data={
+            "history_account_key": "opaque-account-key-1234567890",
+            CONF_ARCHIVE_PREVIOUSLY_ENABLED: False,
+        }
+    )
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=object()
+    )
+    source = MagicMock()
+
+    async def fetch(target: date, metric: str):
+        if metric == "heart_rate":
+            return (
+                NormalizedSample(
+                    datetime.combine(target, datetime.min.time(), tzinfo=UTC),
+                    target,
+                    target.isoformat(),
+                    72.0,
+                ),
+            )
+        return ()
+
+    source.async_fetch = AsyncMock(side_effect=fetch)
+    source.async_fetch_details = None
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(1))
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=_store_factory(FakeStore()),
+        source_factory=lambda *args: source,
+        recorder_factory=lambda: recorder,
+    )
+
+    with patch(
+        "custom_components.garmin_connect.history.dt_util.utcnow",
+        return_value=datetime(2026, 8, 3, 23, 30, tzinfo=UTC),
+    ), patch(
+        "custom_components.garmin_connect.history.dt_util.DEFAULT_TIME_ZONE",
+        ZoneInfo("Asia/Taipei"),
+    ):
+        await archive.async_start()
+
+    assert archive.status.state is HistoryArchiveState.IDLE
+    assert source.async_fetch.await_count == 15
+    assert {call.args[0] for call in source.async_fetch.await_args_list} == {
+        date(2026, 8, 4)
+    }
+    assert recorder.async_write.await_args_list[0].args[2][0].value == 72.0
+
+
+async def test_disabled_start_does_not_request_an_archive_date() -> None:
+    """Disabled archive setup retains infrastructure without Garmin work."""
+    hass = _hass()
+    entry = _entry(data={"history_account_key": "opaque-account-key-1234567890"})
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=object()
+    )
+    source = MagicMock()
+    source.async_fetch = AsyncMock(return_value=())
+    source.async_fetch_details = None
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=_store_factory(FakeStore()),
+        source_factory=lambda *args: source,
+    )
+
+    await archive.async_start()
+
+    assert archive.status.state is HistoryArchiveState.DISABLED
+    source.async_fetch.assert_not_awaited()
+
+
+async def test_failed_first_sync_fails_closed_without_background_work() -> None:
+    """A required history write failure stops the first archive attempt."""
+    hass = _hass()
+    entry = _entry(
+        data={
+            "history_account_key": "opaque-account-key-1234567890",
+            CONF_ARCHIVE_PREVIOUSLY_ENABLED: False,
+        }
+    )
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=object()
+    )
+    source = MagicMock()
+    source.async_fetch = AsyncMock(
+        return_value=(
+            NormalizedSample(
+                datetime(2026, 8, 4, tzinfo=UTC),
+                date(2026, 8, 4),
+                "2026-08-04T00:00:00Z",
+                72.0,
+            ),
+        )
+    )
+    source.async_fetch_details = None
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(
+        return_value=RecorderWriteOutcome(0, "failed", "recorder_write")
+    )
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=_store_factory(FakeStore()),
+        source_factory=lambda *args: source,
+        recorder_factory=lambda: recorder,
+    )
+
+    with patch(
+        "custom_components.garmin_connect.history.dt_util.utcnow",
+        return_value=datetime(2026, 8, 4, tzinfo=UTC),
+    ):
+        await archive.async_start()
+
+    assert archive.status.state is HistoryArchiveState.FAILED
+    assert archive.status.error_type == "recorder_write"
+
+
+async def test_stop_cancels_an_in_flight_first_sync() -> None:
+    """Unload can cancel the bounded first request without leaving it running."""
+    hass = _hass()
+    entry = _entry(
+        data={
+            "history_account_key": "opaque-account-key-1234567890",
+            CONF_ARCHIVE_PREVIOUSLY_ENABLED: False,
+        }
+    )
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=object()
+    )
+    started = asyncio.Event()
+
+    async def fetch(_target: date, _metric: str):
+        started.set()
+        await asyncio.Event().wait()
+        return ()
+
+    source = MagicMock()
+    source.async_fetch = AsyncMock(side_effect=fetch)
+    source.async_fetch_details = None
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=_store_factory(FakeStore()),
+        source_factory=lambda *args: source,
+    )
+
+    start_task = asyncio.create_task(archive.async_start())
+    await started.wait()
+    await archive.async_stop()
+
+    with pytest.raises(asyncio.CancelledError):
+        await start_task
 
 
 async def test_enablement_uses_configured_local_date_across_utc_midnight() -> None:

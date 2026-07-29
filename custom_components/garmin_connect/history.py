@@ -106,6 +106,7 @@ _RECORDER_SUPPORTED_VERSIONS = frozenset({"2026.7.3", "2026.7.4"})
 _RECORDER_BARRIER_TIMEOUT = 10
 _HISTORY_MIN_DATE = date(2026, 1, 1)
 _HISTORY_MAX_DAYS = 31
+_FIRST_SYNC_FIT_LIMIT = 1
 _PRESENCE_STATES = frozenset({"null", "empty", "missing", "unsupported", "returned-empty", "present", "absent"})
 _SLEEP_SCHEMA_VERSION = 1
 _SLEEP_STREAM_METADATA = {
@@ -357,6 +358,7 @@ class GarminHistoryArchive:
         store_factory: Callable[..., Any] | None = None,
         source_factory: Callable[..., GarminHistorySource] | None = None,
         recorder_factory: Callable[..., GarminHistoryRecorder] | None = None,
+        run_first_sync: bool = True,
     ) -> None:
         """Initialize an archive without doing I/O or creating tasks."""
         self._hass = hass
@@ -365,9 +367,11 @@ class GarminHistoryArchive:
         self._store_factory = store_factory
         self._source_factory = source_factory
         self._recorder_factory = recorder_factory
+        self._run_first_sync = run_first_sync
         self._store: Any | None = None
         self._started = False
         self._tasks: set[asyncio.Task[Any]] = set()
+        self._first_sync_task: asyncio.Task[Any] | None = None
         self._status = HistoryStatus(HistoryArchiveState.IDLE)
         self._completed_dates: set[str] = set()
         self._sync_lock = asyncio.Lock()
@@ -513,9 +517,52 @@ class GarminHistoryArchive:
             **self._backfill_status_fields(),
         )
 
+        if self._archive_enabled and self._run_first_sync:
+            self._first_sync_task = asyncio.current_task()
+            try:
+                await self._async_run_first_sync()
+            except asyncio.CancelledError:
+                self._started = False
+                await self.async_stop()
+                raise
+            except Exception:
+                self._set_failed("first_sync")
+                _LOGGER.warning(
+                    "Garmin history archive first synchronization failed for entry %s",
+                    self._entry.entry_id,
+                )
+            finally:
+                self._first_sync_task = None
+
+    async def _async_run_first_sync(self) -> None:
+        """Import one bounded batch for the current Home Assistant local date."""
+        runtime_data = getattr(self._entry, "runtime_data", None)
+        client = getattr(getattr(runtime_data, "core", None), "client", None)
+        if client is None:
+            # Direct archive construction is also used by the lifecycle seam
+            # before config-entry runtime data is attached.  The real setup
+            # path attaches it before starting the archive.
+            return
+
+        target_date = dt_util.as_local(dt_util.utcnow()).date()
+        async with self._sync_lock:
+            report = await self._async_sync_range(
+                target_date,
+                target_date,
+                fit_limit=_FIRST_SYNC_FIT_LIMIT,
+                fail_on_fit_limit=False,
+            )
+        if report.outcome != "written" and self._status.state is not HistoryArchiveState.FAILED:
+            self._set_failed(report.error_type or "first_sync")
+
     async def async_stop(self) -> None:
         """Stop archive tasks and leave no background work behind."""
         self._started = False
+        first_sync_task = self._first_sync_task
+        if first_sync_task is not None and first_sync_task is not asyncio.current_task():
+            first_sync_task.cancel()
+            await asyncio.gather(first_sync_task, return_exceptions=True)
+            self._first_sync_task = None
         if self._backfill is not None:
             self._backfill.stop()
         if self._backfill_task is not None:
@@ -578,7 +625,15 @@ class GarminHistoryArchive:
         async with self._sync_lock:
             return await self._async_sync_range(start_date, end_date, fit_limit=fit_limit, include_training_status=include_training_status)
 
-    async def _async_sync_range(self, start_date: date, end_date: date, *, fit_limit: int | None = None, include_training_status: bool = True) -> HistorySyncReport:
+    async def _async_sync_range(
+        self,
+        start_date: date,
+        end_date: date,
+        *,
+        fit_limit: int | None = None,
+        include_training_status: bool = True,
+        fail_on_fit_limit: bool = True,
+    ) -> HistorySyncReport:
         """Run one serialized, checkpointed manual sync."""
 
         runtime_data = getattr(self._entry, "runtime_data", None)
@@ -840,9 +895,12 @@ class GarminHistoryArchive:
                             activities_by_year=activities_by_year,
                         )
                     )
-                    self._runtime_sync_failure = True
-                    self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, error_type="fit_limit_pending", **self._backfill_status_fields())
-                    return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome="failed", error_type="fit_limit_pending")
+                    if fail_on_fit_limit:
+                        self._runtime_sync_failure = True
+                        self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, error_type="fit_limit_pending", **self._backfill_status_fields())
+                        return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome="failed", error_type="fit_limit_pending")
+                    self._presence = presence
+                    continue
                 # Publish the catalog checkpoint only after every affected annual
                 # partition is durable. A failed partition save must be replayed.
                 await store.async_save(
