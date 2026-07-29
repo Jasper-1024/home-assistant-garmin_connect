@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from custom_components.garmin_connect import history as history_module
+from custom_components.garmin_connect.const import CONF_ARCHIVE_ENABLED
 from custom_components.garmin_connect.fit_archive import fit_file_name
 from custom_components.garmin_connect.history import (
     GarminHistoryArchive,
@@ -72,8 +73,9 @@ class _NamedStore(_Store):
         await super().async_save(data)
 
 
-def _sync_archive(source, recorder, store):
+def _sync_archive(source, recorder, store, *, options=None):
     entry = MagicMock(data={"history_account_key": "opaque-account-key-1234567890"}, entry_id="e")
+    entry.options = {CONF_ARCHIVE_ENABLED: True} if options is None else options
     entry.runtime_data = SimpleNamespace(core=SimpleNamespace(client=object()), request_gate=object())
     archive = GarminHistoryArchive(
         MagicMock(), entry,
@@ -85,8 +87,12 @@ def _sync_archive(source, recorder, store):
     return archive
 
 
-def _partition_archive(source, recorder, stores):
-    entry = MagicMock(data={"history_account_key": "opaque-account-key-1234567890"}, entry_id="e")
+def _partition_archive(source, recorder, stores, *, options=None, data=None):
+    entry = MagicMock(
+        data=data or {"history_account_key": "opaque-account-key-1234567890"},
+        entry_id="e",
+    )
+    entry.options = {CONF_ARCHIVE_ENABLED: True} if options is None else options
     entry.runtime_data = SimpleNamespace(core=SimpleNamespace(client=object()), request_gate=object())
     return GarminHistoryArchive(
         MagicMock(), entry,
@@ -127,6 +133,7 @@ async def test_sync_fetches_only_supported_metrics_and_writes_each_day():
     recorder = MagicMock()
     recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(1))
     entry = MagicMock(data={"history_account_key": "opaque-account-key-1234567890"}, entry_id="e")
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
     entry.runtime_data = SimpleNamespace(core=SimpleNamespace(client=object()), request_gate=object())
     archive = GarminHistoryArchive(
         MagicMock(), entry,
@@ -160,6 +167,29 @@ async def test_sync_fetches_only_supported_metrics_and_writes_each_day():
     }
     assert recorder.async_write.await_count == 26
     assert archive.status.state is HistoryArchiveState.IDLE
+
+
+@pytest.mark.asyncio
+async def test_manual_repair_remains_available_while_archive_is_disabled():
+    """Disablement stops automatic work but does not disable Manual Repair."""
+    source = MagicMock()
+    source.async_fetch = AsyncMock(return_value=())
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = _sync_archive(
+        source,
+        recorder,
+        _Store(),
+        options={CONF_ARCHIVE_ENABLED: False},
+    )
+    await archive.async_start()
+
+    assert archive.status.state is HistoryArchiveState.DISABLED
+    report = await archive.async_sync_range(date(2026, 1, 1), date(2026, 1, 1))
+
+    assert report.outcome == "written"
+    assert archive.status.state is HistoryArchiveState.DISABLED
+    source.async_fetch.assert_awaited()
 
 
 @pytest.mark.asyncio
@@ -488,6 +518,53 @@ async def test_sleep_streams_write_distinct_statistics_and_calendar_stays_bounde
     events = await archive.async_get_calendar_events("sleep", date(2026, 7, 24), date(2026, 7, 25))
     assert events[0].summary == "Sleep"
     assert not hasattr(events[0], "streams")
+
+
+@pytest.mark.asyncio
+async def test_disabled_archive_keeps_retained_calendar_query_available():
+    """Disablement leaves already persisted Calendar records queryable."""
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "garmin_sleep_streams.json").read_text())
+    session = parse_sleep_sessions(fixture, date(2026, 7, 24))[0]
+
+    class Source:
+        async def async_fetch_details(self, target, metric):
+            return (session,) if metric == "sleep_sessions" else ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(1, inserted_count=1))
+    catalog = _NamedStore()
+    stores = {"garmin_connect.e.history_catalog": catalog}
+    enabled = _partition_archive(
+        Source(),
+        recorder,
+        stores,
+        options={CONF_ARCHIVE_ENABLED: True},
+        data={
+            "history_account_key": "opaque-account-key-1234567890",
+            "archive_last_enabled": True,
+            "archive_activation_date": "2026-07-24",
+        },
+    )
+    await enabled.async_start()
+    await enabled.async_sync_range(date(2026, 7, 24), date(2026, 7, 24))
+
+    disabled = _partition_archive(
+        Source(),
+        recorder,
+        stores,
+        options={CONF_ARCHIVE_ENABLED: False},
+        data={
+            "history_account_key": "opaque-account-key-1234567890",
+            "archive_last_enabled": True,
+            "archive_activation_date": "2026-07-24",
+        },
+    )
+    await disabled.async_start()
+
+    events = await disabled.async_get_calendar_events(
+        "sleep", date(2026, 7, 24), date(2026, 7, 25)
+    )
+    assert events[0].summary == "Sleep"
 
 
 @pytest.mark.asyncio

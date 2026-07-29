@@ -26,7 +26,7 @@ from .backfill import (
 from .const import (
     CONF_ARCHIVE_ACTIVATION_DATE,
     CONF_ARCHIVE_ENABLED,
-    CONF_ARCHIVE_LAST_ENABLED,
+    CONF_ARCHIVE_PREVIOUSLY_ENABLED,
     CONF_HISTORY_ACCOUNT_KEY,
     DOMAIN,
     HISTORY_STORE_VERSION,
@@ -123,6 +123,7 @@ class HistoryArchiveState(StrEnum):
     """Observable states of the history archive."""
 
     IDLE = "idle"
+    DISABLED = "disabled"
     RUNNING = "running"
     COMPATIBILITY_DISABLED = "compatibility-disabled"
     FAILED = "failed"
@@ -144,12 +145,14 @@ class HistoryStatus:
     last_success: str | None = None
     backoff_until: str | None = None
     safe_error_class: str | None = None
+    activation_date: str | None = None
 
     def as_attributes(self) -> dict[str, Any]:
         """Return the bounded status attributes exposed by the sensor."""
         return {
             "recorder_target": self.recorder_target,
             "archive_state": self.state.value,
+            "activation_date": self.activation_date,
             "current_date": self.current_date,
             "processed_dates": self.processed_dates,
             "record_count": self.record_count,
@@ -353,6 +356,7 @@ class GarminHistoryArchive:
 
     def _backfill_status_fields(self) -> dict[str, Any]:
         return {
+            "activation_date": self._activation_date.isoformat() if self._activation_date else None,
             "queued_count": self._status.queued_count,
             "completed_count": self._status.completed_count,
             "next_eligible_run": self._status.next_eligible_run,
@@ -444,6 +448,7 @@ class GarminHistoryArchive:
         if not compatibility.compatible:
             self._status = HistoryStatus(
                 HistoryArchiveState.COMPATIBILITY_DISABLED,
+                **self._backfill_status_fields(),
                 error_type=compatibility.error_type or "recorder_incompatible",
             )
             _LOGGER.warning(
@@ -453,7 +458,10 @@ class GarminHistoryArchive:
             )
             return
 
-        self._status = HistoryStatus(HistoryArchiveState.IDLE)
+        self._status = HistoryStatus(
+            HistoryArchiveState.IDLE if self._archive_enabled else HistoryArchiveState.DISABLED,
+            **self._backfill_status_fields(),
+        )
 
     async def async_stop(self) -> None:
         """Stop archive tasks and leave no background work behind."""
@@ -508,7 +516,10 @@ class GarminHistoryArchive:
         validation_error = _validate_sync_range(start_date, end_date)
         if validation_error:
             return HistorySyncReport(outcome="invalid", error_type=validation_error)
-        if self._status.state is not HistoryArchiveState.IDLE:
+        if self._status.state not in {
+            HistoryArchiveState.IDLE,
+            HistoryArchiveState.DISABLED,
+        }:
             if not (self._status.state is HistoryArchiveState.FAILED and self._runtime_sync_failure):
                 return HistorySyncReport(outcome="disabled", error_type=self._status.error_type)
         if self._sync_lock.locked():
@@ -796,14 +807,14 @@ class GarminHistoryArchive:
                 self._completed_dates = completed_dates
                 self._presence = presence
             except asyncio.CancelledError:
-                self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
+                self._status = HistoryStatus(self._resting_state(), current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
                 raise
             except (AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError) as error:
                 self._runtime_sync_failure = True
                 self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type="sync_failed", **self._backfill_status_fields())
                 return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome="failed", error_type=classify_backfill_error(error))
         self._runtime_sync_failure = False
-        self._status = HistoryStatus(HistoryArchiveState.IDLE, current_date=end_date.isoformat(), processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
+        self._status = HistoryStatus(self._resting_state(), current_date=end_date.isoformat(), processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
         return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome="written")
 
     def _catalog_record(
@@ -869,6 +880,10 @@ class GarminHistoryArchive:
         if not isinstance(account_key, str) or not _is_valid_account_key(account_key):
             raise RuntimeError("account identity unavailable")
         return account_key
+
+    def _resting_state(self) -> HistoryArchiveState:
+        """Return the public non-running state after a manual operation."""
+        return HistoryArchiveState.IDLE if self._archive_enabled else HistoryArchiveState.DISABLED
 
     async def async_get_calendar_events(
         self,
@@ -1061,13 +1076,13 @@ class GarminHistoryArchive:
         raw_data = getattr(self._entry, "data", {})
         data = dict(raw_data) if isinstance(raw_data, Mapping) else {}
         original = dict(data)
-        was_enabled = data.get(CONF_ARCHIVE_LAST_ENABLED) is True
+        was_enabled = data.get(CONF_ARCHIVE_PREVIOUSLY_ENABLED) is True
 
         if enabled and not was_enabled:
             data[CONF_ARCHIVE_ACTIVATION_DATE] = dt_util.now().date().isoformat()
-            data[CONF_ARCHIVE_LAST_ENABLED] = True
+            data[CONF_ARCHIVE_PREVIOUSLY_ENABLED] = True
         elif not enabled and was_enabled:
-            data[CONF_ARCHIVE_LAST_ENABLED] = False
+            data[CONF_ARCHIVE_PREVIOUSLY_ENABLED] = False
 
         if data != original:
             if self._account_key_value is not None:
@@ -1198,7 +1213,11 @@ class GarminHistoryArchive:
     def _set_failed(self, error_type: str) -> None:
         """Set a bounded startup failure without exposing exception details."""
         self._runtime_sync_failure = False
-        self._status = HistoryStatus(HistoryArchiveState.FAILED, error_type=error_type)
+        self._status = HistoryStatus(
+            HistoryArchiveState.FAILED,
+            error_type=error_type,
+            **self._backfill_status_fields(),
+        )
 
 
 def _is_valid_account_key(value: str) -> bool:

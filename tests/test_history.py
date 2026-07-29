@@ -16,7 +16,7 @@ from homeassistant.setup import async_setup_component
 from custom_components.garmin_connect.const import (
     CONF_ARCHIVE_ACTIVATION_DATE,
     CONF_ARCHIVE_ENABLED,
-    CONF_ARCHIVE_LAST_ENABLED,
+    CONF_ARCHIVE_PREVIOUSLY_ENABLED,
 )
 from custom_components.garmin_connect.history import (
     GarminHistoryArchive,
@@ -105,14 +105,14 @@ async def test_start_persists_opaque_account_key_and_reuses_it() -> None:
     assert len(account_key) >= 20
     assert "@" not in account_key
     assert entry.title not in account_key
-    assert first.status.state is HistoryArchiveState.IDLE
+    assert first.status.state is HistoryArchiveState.DISABLED
     assert first_store.saved[0]["account_key"] == account_key
 
     entry.data = persisted_data
     second = _archive(hass, entry, checker, FakeStore(data=first_store.data))
     await second.async_start()
 
-    assert second.status.state is HistoryArchiveState.IDLE
+    assert second.status.state is HistoryArchiveState.DISABLED
     assert hass.config_entries.async_update_entry.call_count == 1
 
 
@@ -131,7 +131,7 @@ async def test_start_keeps_historical_backfill_dormant() -> None:
 async def test_enablement_persists_local_activation_date() -> None:
     """Enabling archival records the current Home Assistant local date."""
     hass = _hass()
-    entry = _entry(data={CONF_ARCHIVE_LAST_ENABLED: False})
+    entry = _entry(data={CONF_ARCHIVE_PREVIOUSLY_ENABLED: False})
     entry.options = {CONF_ARCHIVE_ENABLED: True}
     checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
     now = datetime(2026, 8, 3, 1, 30, tzinfo=UTC)
@@ -141,7 +141,7 @@ async def test_enablement_persists_local_activation_date() -> None:
 
     persisted = hass.config_entries.async_update_entry.call_args.kwargs["data"]
     assert persisted[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-08-03"
-    assert persisted[CONF_ARCHIVE_LAST_ENABLED] is True
+    assert persisted[CONF_ARCHIVE_PREVIOUSLY_ENABLED] is True
 
 
 async def test_reenablement_replaces_activation_date_without_starting_backfill() -> None:
@@ -149,8 +149,9 @@ async def test_reenablement_replaces_activation_date_without_starting_backfill()
     hass = _hass()
     entry = _entry(
         data={
+            "history_account_key": "opaque-account-key-1234567890",
             CONF_ARCHIVE_ACTIVATION_DATE: "2026-07-01",
-            CONF_ARCHIVE_LAST_ENABLED: False,
+            CONF_ARCHIVE_PREVIOUSLY_ENABLED: False,
         }
     )
     entry.options = {CONF_ARCHIVE_ENABLED: True}
@@ -163,8 +164,59 @@ async def test_reenablement_replaces_activation_date_without_starting_backfill()
 
     persisted = hass.config_entries.async_update_entry.call_args.kwargs["data"]
     assert persisted[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-08-03"
-    assert persisted[CONF_ARCHIVE_LAST_ENABLED] is True
+    assert persisted[CONF_ARCHIVE_PREVIOUSLY_ENABLED] is True
     assert archive.async_sync_range is not None
+
+
+async def test_archive_lifecycle_persists_through_reload_restart_and_reenablement() -> None:
+    """Reload/restart preserves identity, while re-enable establishes a new date."""
+    hass = _hass()
+    entry = _entry(data={CONF_ARCHIVE_PREVIOUSLY_ENABLED: False})
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
+    store = FakeStore()
+    first_now = datetime(2026, 8, 3, 1, 30, tzinfo=UTC)
+
+    with patch("custom_components.garmin_connect.history.dt_util.now", return_value=first_now):
+        first = _archive(hass, entry, checker, store)
+        await first.async_start()
+
+    persisted = hass.config_entries.async_update_entry.call_args.kwargs["data"]
+    account_key = persisted["history_account_key"]
+    entry.data = persisted
+    hass.config_entries.async_update_entry.reset_mock()
+
+    restarted = _archive(hass, entry, checker, FakeStore(data=store.data))
+    await restarted.async_start()
+
+    assert restarted.activation_date == date(2026, 8, 3)
+    assert restarted.status.state is HistoryArchiveState.IDLE
+    assert hass.config_entries.async_update_entry.call_count == 0
+
+    entry.options = {CONF_ARCHIVE_ENABLED: False}
+    disabled = _archive(hass, entry, checker, FakeStore(data=store.data))
+    await disabled.async_start()
+    disabled_persisted = hass.config_entries.async_update_entry.call_args.kwargs["data"]
+
+    assert disabled.status.state is HistoryArchiveState.DISABLED
+    assert disabled.activation_date == date(2026, 8, 3)
+    assert disabled_persisted["history_account_key"] == account_key
+    assert disabled_persisted[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-08-03"
+    assert disabled_persisted[CONF_ARCHIVE_PREVIOUSLY_ENABLED] is False
+
+    entry.data = disabled_persisted
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    second_now = datetime(2026, 8, 10, 1, 30, tzinfo=UTC)
+    with patch("custom_components.garmin_connect.history.dt_util.now", return_value=second_now):
+        reenabled = _archive(hass, entry, checker, FakeStore(data=store.data))
+        await reenabled.async_start()
+
+    reenabled_persisted = hass.config_entries.async_update_entry.call_args.kwargs["data"]
+    assert reenabled.status.state is HistoryArchiveState.IDLE
+    assert reenabled.activation_date == date(2026, 8, 10)
+    assert reenabled_persisted["history_account_key"] == account_key
+    assert reenabled_persisted[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-08-10"
+    assert reenabled_persisted[CONF_ARCHIVE_PREVIOUSLY_ENABLED] is True
 
 
 async def test_disablement_preserves_activation_date_and_manual_repair() -> None:
@@ -172,8 +224,9 @@ async def test_disablement_preserves_activation_date_and_manual_repair() -> None
     hass = _hass()
     entry = _entry(
         data={
+            "history_account_key": "opaque-account-key-1234567890",
             CONF_ARCHIVE_ACTIVATION_DATE: "2026-07-01",
-            CONF_ARCHIVE_LAST_ENABLED: True,
+            CONF_ARCHIVE_PREVIOUSLY_ENABLED: True,
         }
     )
     entry.options = {CONF_ARCHIVE_ENABLED: False}
@@ -184,9 +237,33 @@ async def test_disablement_preserves_activation_date_and_manual_repair() -> None
 
     persisted = hass.config_entries.async_update_entry.call_args.kwargs["data"]
     assert persisted[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-07-01"
-    assert persisted[CONF_ARCHIVE_LAST_ENABLED] is False
+    assert persisted[CONF_ARCHIVE_PREVIOUSLY_ENABLED] is False
     assert archive.archive_enabled is False
     assert archive.activation_date == date(2026, 7, 1)
+
+
+async def test_disabled_archive_keeps_query_surface_available() -> None:
+    """Disablement does not hide retained archive queries."""
+    hass = _hass()
+    entry = _entry(
+        data={
+            "history_account_key": "opaque-account-key-1234567890",
+            CONF_ARCHIVE_ACTIVATION_DATE: "2026-07-01",
+            CONF_ARCHIVE_PREVIOUSLY_ENABLED: True,
+        }
+    )
+    entry.options = {CONF_ARCHIVE_ENABLED: False}
+    checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
+    archive = _archive(hass, entry, checker)
+    await archive.async_start()
+
+    assert archive.get_history_presence(date(2026, 7, 1), date(2026, 7, 1)) == {}
+    assert await archive.async_get_calendar_events(
+        "sleep", date(2026, 7, 1), date(2026, 7, 1)
+    ) == ()
+    sensor = GarminHistoryStatusSensor(archive, "entry-1")
+    assert sensor.native_value == "disabled"
+    assert sensor.extra_state_attributes["activation_date"] == "2026-07-01"
 
 
 async def test_different_entries_get_different_account_keys() -> None:
@@ -262,6 +339,7 @@ async def test_status_sensor_exposes_only_privacy_safe_placeholders() -> None:
     assert set(sensor.extra_state_attributes) == {
         "recorder_target",
         "archive_state",
+        "activation_date",
         "current_date",
         "processed_dates",
         "record_count",
@@ -286,7 +364,7 @@ async def test_stop_is_idempotent() -> None:
     await archive.async_stop()
     await archive.async_stop()
 
-    assert archive.status.state is HistoryArchiveState.IDLE
+    assert archive.status.state is HistoryArchiveState.DISABLED
 
 
 async def test_recorder_compatibility_uses_real_scratch_recorder() -> None:

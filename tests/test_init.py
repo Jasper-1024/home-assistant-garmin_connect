@@ -9,6 +9,7 @@ import pytest
 from custom_components.garmin_connect import (
     _migrate_entity_unique_ids,
     async_migrate_entry,
+    async_options_update_listener,
     async_setup_entry,
     async_unload_entry,
 )
@@ -54,6 +55,21 @@ def _stack_coordinators(stack: ExitStack, coord: MagicMock) -> None:
 
 
 # ── Setup tests ───────────────────────────────────────────────────────────────
+
+
+async def test_options_update_listener_reloads_config_entry() -> None:
+    """Option changes use the config-entry reload lifecycle seam."""
+    entry = MagicMock(entry_id="entry-1")
+    hass = MagicMock()
+    reload = AsyncMock()
+    hass.config_entries.async_reload = reload
+    tasks = []
+    hass.async_create_task = MagicMock(side_effect=tasks.append)
+
+    await async_options_update_listener(hass, entry)
+    await tasks[0]
+
+    reload.assert_awaited_once_with("entry-1")
 
 
 async def test_setup_entry_success() -> None:

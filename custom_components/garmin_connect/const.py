@@ -25,7 +25,11 @@ CONF_ARCHIVE_ENABLED: Final = "archive_enabled"
 # activation date and last observed state are persisted with the config entry
 # so reloads and restarts preserve the archive identity and transition history.
 CONF_ARCHIVE_ACTIVATION_DATE: Final = "archive_activation_date"
-CONF_ARCHIVE_LAST_ENABLED: Final = "archive_last_enabled"
+# Keep the persisted key stable while using a name that describes its role:
+# this records the previous automatic enablement state across reloads.
+CONF_ARCHIVE_PREVIOUSLY_ENABLED: Final = "archive_last_enabled"
+# Compatibility alias for callers that imported the original symbol.
+CONF_ARCHIVE_LAST_ENABLED: Final = CONF_ARCHIVE_PREVIOUSLY_ENABLED
 DEFAULT_ARCHIVE_ENABLED: Final = False
 DEFAULT_SCAN_INTERVAL: Final = 900  # 15 minutes
 MIN_SCAN_INTERVAL: Final = 60  # 1 minute
