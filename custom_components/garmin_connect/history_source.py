@@ -330,7 +330,7 @@ def normalize_snapshot(
     if not isinstance(payload, dict):
         raise HistorySchemaError("snapshot payload is not an object")
     timestamp_value = _first_non_null(payload, ("timestamp", "startTime", "calendarDate"))
-    if timestamp_value is _MISSING:
+    if timestamp_value is _MISSING or timestamp_value is None:
         timestamp_key = None
         timestamp_value = target_date.isoformat()
     else:

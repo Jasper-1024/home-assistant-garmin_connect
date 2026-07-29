@@ -435,6 +435,83 @@ async def test_numeric_manifest_recovery_replays_after_partition_failure() -> No
 
 
 @pytest.mark.asyncio
+async def test_recorder_failure_outbox_does_not_confirm_provenance_on_empty_retry() -> None:
+    """An unbarriered Recorder write cannot become durable provenance after restart."""
+    target = date(2026, 12, 31)
+    hass = _hass()
+    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
+    checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
+    stores: dict[str, FakeStore] = {}
+
+    def factory(_hass, _version, path, **kwargs):
+        store = stores.setdefault(path, FakeStore())
+        store.path = path
+        return store
+
+    class SampleSource:
+        async def async_fetch_details(self, _request_date: date, metric: str) -> object:
+            if metric in {"sleep_sessions", "health_events_daily", "health_events_body_battery", "timed_activities"}:
+                return ()
+            return SourceSeries(
+                (
+                    NormalizedSample(
+                        datetime(2026, 12, 31, tzinfo=UTC),
+                        target,
+                        target.isoformat(),
+                        1.0,
+                    ),
+                ),
+                "present",
+            )
+
+    class EmptySource:
+        async def async_fetch_details(self, _request_date: date, _metric: str) -> object:
+            return ()
+
+    failed_recorder = MagicMock()
+    failed_recorder.async_write = AsyncMock(
+        return_value=RecorderWriteOutcome(0, "failed", "recorder_write")
+    )
+
+    first = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=checker,
+        store_factory=factory,
+        source_factory=lambda _client, _gate: SampleSource(),
+        recorder_factory=lambda: failed_recorder,
+    )
+    await first.async_start()
+
+    assert (await first.async_sync_range(target, target)).outcome == "failed"
+    assert stores["garmin_connect.entry-1.history_catalog"].data[
+        "numeric_source_date_outbox"
+    ]
+
+    retry_recorder = MagicMock()
+    retry_recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    restarted = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=checker,
+        store_factory=factory,
+        source_factory=lambda _client, _gate: EmptySource(),
+        recorder_factory=lambda: retry_recorder,
+    )
+    await restarted.async_start()
+
+    assert target.isoformat() not in restarted._completed_dates
+    assert target.isoformat() in restarted._numeric_source_date_replay_dates
+    assert (await restarted.async_sync_range(target, target)).outcome == "written"
+    numeric_store = stores["garmin_connect.entry-1.numeric_source_dates_2026"]
+    assert numeric_store.data["dates"] == {}
+    assert numeric_store.data["tombstones"] == [target.isoformat()]
+    assert stores["garmin_connect.entry-1.history_catalog"].data["completed_dates"] == [
+        target.isoformat()
+    ]
+
+
+@pytest.mark.asyncio
 async def test_malformed_numeric_partition_does_not_abort_archive_startup() -> None:
     target = date(2026, 7, 24)
     hass = _hass()

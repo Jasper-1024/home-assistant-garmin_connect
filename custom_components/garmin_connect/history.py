@@ -880,6 +880,7 @@ class GarminHistoryArchive:
                     raise _NumericFamilyError(
                         snapshot_outcome.error_type or "sync_failed", write_failure=True
                     )
+                self._confirm_numeric_source_dates(statistic_id, (snapshot,))
                 inserted += getattr(snapshot_outcome, "inserted_count", snapshot_outcome.accepted_count)
                 updated += getattr(snapshot_outcome, "updated_count", 0)
                 skipped += getattr(snapshot_outcome, "skipped_count", 0)
@@ -894,6 +895,7 @@ class GarminHistoryArchive:
         outcome = await recorder.async_write(statistic_id, metadata, samples)
         if outcome.outcome != "written":
             raise _NumericFamilyError(outcome.error_type or "sync_failed", write_failure=True)
+        self._confirm_numeric_source_dates(statistic_id, samples)
 
         if isinstance(details, SegmentedData) and details.totals:
             total_metadata = {
@@ -926,6 +928,7 @@ class GarminHistoryArchive:
                     raise _NumericFamilyError(
                         total_outcome.error_type or "sync_failed", write_failure=True
                     )
+                self._confirm_numeric_source_dates(total_statistic_id, (total_sample,))
                 inserted += getattr(total_outcome, "inserted_count", total_outcome.accepted_count)
                 updated += getattr(total_outcome, "updated_count", 0)
                 skipped += getattr(total_outcome, "skipped_count", 0)
@@ -1084,6 +1087,7 @@ class GarminHistoryArchive:
                         )
                         if stream_outcome.outcome != "written":
                             raise RuntimeError(stream_outcome.error_type or "sleep_stream_write_failed")
+                        self._confirm_numeric_source_dates(stream_statistic_id, samples)
                         inserted += getattr(stream_outcome, "inserted_count", stream_outcome.accepted_count)
                         updated += getattr(stream_outcome, "updated_count", 0)
                         skipped += getattr(stream_outcome, "skipped_count", 0)
@@ -1354,7 +1358,7 @@ class GarminHistoryArchive:
     def _remember_numeric_source_dates(
         self, statistic_id: str, samples: Collection[NormalizedSample]
     ) -> None:
-        """Retain source calendar dates outside Recorder's instant/value rows."""
+        """Persist pre-Recorder source-date intent without confirming provenance."""
         if not samples:
             return
         for sample in samples:
@@ -1364,8 +1368,6 @@ class GarminHistoryArchive:
                 raise ValueError("numeric source calendar date is invalid")
             instant = sample.timestamp.astimezone(UTC).isoformat()
             year = str(sample.timestamp.astimezone(UTC).year)
-            dates = self._numeric_source_calendar_dates_by_year.setdefault(year, {}).setdefault(statistic_id, {})
-            dates[instant] = sample.request_date.isoformat()
             self._numeric_source_date_years.add(year)
             self._numeric_source_date_dirty_years.add(year)
             source_date = sample.request_date.isoformat()
@@ -1374,6 +1376,17 @@ class GarminHistoryArchive:
             self._numeric_source_date_outbox.setdefault(year, {}).setdefault(
                 statistic_id, {}
             )[instant] = source_date
+
+    def _confirm_numeric_source_dates(
+        self, statistic_id: str, samples: Collection[NormalizedSample]
+    ) -> None:
+        """Confirm provenance only after Recorder has crossed its write barrier."""
+        for sample in samples:
+            instant = sample.timestamp.astimezone(UTC).isoformat()
+            year = str(sample.timestamp.astimezone(UTC).year)
+            self._numeric_source_calendar_dates_by_year.setdefault(year, {}).setdefault(
+                statistic_id, {}
+            )[instant] = sample.request_date.isoformat()
 
     def _numeric_source_date_is_repaired(self, year: str, source_date: str) -> bool:
         """Return whether an annual provenance partition retains this date."""
@@ -1551,9 +1564,6 @@ class GarminHistoryArchive:
                     "Garmin numeric source-date partition unavailable for %s; affected dates will replay",
                     year,
                 )
-            for statistic_id, instants in self._numeric_source_date_outbox.get(year, {}).items():
-                restored_year.setdefault(statistic_id, {}).update(instants)
-                affected_dates.difference_update(instants.values())
             if repaired:
                 self._numeric_source_date_dirty_years.add(year)
             self._numeric_source_calendar_dates_by_year[year] = restored_year
@@ -1983,10 +1993,6 @@ class GarminHistoryArchive:
             self._numeric_source_date_outbox[year] = restored_statistics
             self._numeric_source_date_years.add(year)
             self._numeric_source_date_dirty_years.add(year)
-            for statistic_id, instants in restored_statistics.items():
-                self._numeric_source_calendar_dates_by_year.setdefault(year, {}).setdefault(
-                    statistic_id, {}
-                ).update(instants)
         raw_numeric_date_dates = catalog.get("numeric_source_date_dates", {})
         if not isinstance(raw_numeric_date_dates, Mapping):
             raise ValueError("Store numeric source-date dates are invalid")

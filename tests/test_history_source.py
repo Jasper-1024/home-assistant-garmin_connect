@@ -318,6 +318,27 @@ def test_snapshot_timestamp_aliases_prefer_non_null_values() -> None:
         )
 
 
+def test_snapshot_all_null_timestamp_aliases_fall_back_to_target_date() -> None:
+    """Null timestamp aliases are calendar metadata, not a schema failure."""
+    target = date(2026, 7, 24)
+
+    snapshot = normalize_snapshot(
+        {
+            "timestamp": None,
+            "startTime": None,
+            "calendarDate": None,
+            "acuteLoad": None,
+        },
+        target,
+        TRAINING_STATUS_FIELDS,
+    )
+
+    assert snapshot.timestamp == datetime(2026, 7, 24, tzinfo=UTC)
+    assert snapshot.raw_timestamp == target.isoformat()
+    assert snapshot.fields["acute_load"] == ("null", None)
+    assert snapshot.fields["vo2_max"] == ("absent", None)
+
+
 def test_object_series_timestamp_aliases_prefer_non_null_values() -> None:
     series = normalize_respiration(
         {
