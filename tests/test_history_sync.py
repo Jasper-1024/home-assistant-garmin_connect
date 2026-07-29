@@ -1859,6 +1859,67 @@ async def test_activity_partition_uses_local_calendar_year_at_utc_year_boundary(
 
 
 @pytest.mark.asyncio
+async def test_activity_calendar_date_correction_moves_record_between_year_partitions() -> None:
+    initial = normalize_activities(
+        [{
+            "activityId": 1001,
+            "activityType": "running",
+            "startTime": "2026-12-31T22:30:00Z",
+            "startTimeLocal": "2026-12-31T23:30:00+01:00",
+            "durationInSeconds": 60,
+        }],
+        date(2026, 12, 31),
+    )[0]
+    corrected = normalize_activities(
+        [{
+            "activityId": 1001,
+            "activityType": "running",
+            "startTime": "2026-12-31T22:30:00Z",
+            "startTimeLocal": "2027-01-01T00:30:00+02:00",
+            "durationInSeconds": 60,
+        }],
+        date(2027, 1, 1),
+    )[0]
+
+    class Source:
+        activity = initial
+
+        async def async_fetch(self, _target: date, _metric: str) -> tuple[()]:
+            return ()
+
+        async def async_fetch_details(self, _target: date, metric: str) -> object:
+            return (self.activity,) if metric == "timed_activities" else ()
+
+    stores = {"garmin_connect.e.history_catalog": _NamedStore()}
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    source = Source()
+    archive = _partition_archive(source, recorder, stores)
+    await archive.async_start()
+
+    await archive.async_sync_range(date(2026, 12, 31), date(2026, 12, 31))
+    source.activity = corrected
+    await archive.async_sync_range(date(2027, 1, 1), date(2027, 1, 1))
+    retry = await archive.async_sync_range(date(2027, 1, 1), date(2027, 1, 1))
+
+    assert retry.skipped_count == 1
+    assert stores["garmin_connect.e.sleep_2026"].data["activities"] == {}
+    assert set(stores["garmin_connect.e.sleep_2027"].data["activities"]) == {
+        corrected.logical_id
+    }
+    assert stores["garmin_connect.e.history_catalog"].data["activity_index"] == {
+        "2026": [],
+        "2027": [corrected.logical_id],
+    }
+    events = await archive.async_get_calendar_events(
+        "activity", date(2027, 1, 1), date(2027, 1, 1)
+    )
+    assert [(event.start, event.end) for event in events] == [
+        (corrected.start, corrected.start + timedelta(seconds=60))
+    ]
+
+
+@pytest.mark.asyncio
 async def test_bad_fit_is_removed_without_touching_same_year_activity_partition() -> None:
     activity = normalize_activities(
         [{"activityId": 999, "activityType": "running", "startTime": "2026-01-01T10:00:00Z", "durationInSeconds": 60}],

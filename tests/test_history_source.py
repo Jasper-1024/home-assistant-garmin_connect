@@ -360,6 +360,34 @@ async def test_unscoped_activity_without_source_calendar_date_uses_source_instan
     assert utc_day[0].calendar_date == date(2026, 1, 1)
 
 
+def test_activity_calendar_date_revision_keeps_logical_identity_stable() -> None:
+    first = normalize_activities(
+        [{
+            "activityId": 4,
+            "activityType": "running",
+            "startTime": "2026-12-31T22:30:00Z",
+            "startTimeLocal": "2026-12-31T23:30:00+01:00",
+            "durationInSeconds": 60,
+        }],
+        date(2026, 12, 31),
+    )[0]
+    corrected = normalize_activities(
+        [{
+            "activityId": 4,
+            "activityType": "running",
+            "startTime": "2026-12-31T22:30:00Z",
+            "startTimeLocal": "2027-01-01T00:30:00+02:00",
+            "durationInSeconds": 60,
+        }],
+        date(2027, 1, 1),
+    )[0]
+
+    assert first.logical_id == corrected.logical_id
+    assert first.revision != corrected.revision
+    assert first.calendar_date == date(2026, 12, 31)
+    assert corrected.calendar_date == date(2027, 1, 1)
+
+
 def test_health_event_revision_keeps_identity_and_rejects_bounds() -> None:
     first = normalize_health_events({"events": [{"source": "A", "type": "x", "category": "one", "occurrenceTime": "2026-07-24T00:00:00Z"}]}, date(2026, 7, 24))[0]
     revised = normalize_health_events({"events": [{"source": "B", "type": "x", "category": "two", "occurrenceTime": "2026-07-24T00:00:00Z"}]}, date(2026, 7, 24))[0]

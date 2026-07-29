@@ -117,9 +117,20 @@ class NormalizedActivity:
     calendar_date: date
 
 
-def _activity_hashes(activity_type: str, activity_id: str, start: datetime, end: datetime | None, duration: float | None, name: str | None, training_effect: float | None, load: float | None, recovery: float | None) -> tuple[str, str]:
+def _activity_hashes(
+    activity_type: str,
+    activity_id: str,
+    start: datetime,
+    end: datetime | None,
+    duration: float | None,
+    name: str | None,
+    training_effect: float | None,
+    load: float | None,
+    recovery: float | None,
+    source_calendar_date: date,
+) -> tuple[str, str]:
     logical_id = hashlib.sha256(f"{activity_id}:{activity_type}:{start.astimezone(UTC).isoformat()}".encode()).hexdigest()[:24]
-    revision = hashlib.sha256(json.dumps((activity_type, activity_id, start.isoformat(), end.isoformat() if end else None, duration, name, training_effect, load, recovery), sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+    revision = hashlib.sha256(json.dumps((activity_type, activity_id, start.isoformat(), end.isoformat() if end else None, duration, name, training_effect, load, recovery, source_calendar_date.isoformat()), sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
     return logical_id, revision
 
 
@@ -192,8 +203,8 @@ def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedAct
         training_effect = numeric(item, "trainingEffect", "aerobicTrainingEffect")
         load = numeric(item, "activityTrainingLoad", "trainingLoad")
         recovery = numeric(item, "recoveryTime")
-        logical_id, revision = _activity_hashes(activity_type, str(activity_id), start, end, duration, activity_name, training_effect, load, recovery)
         local_date = _activity_source_calendar_date(item, start)
+        logical_id, revision = _activity_hashes(activity_type, str(activity_id), start, end, duration, activity_name, training_effect, load, recovery, local_date)
         result[logical_id] = NormalizedActivity(logical_id, str(activity_id), revision, activity_type, activity_name, start, end, duration, training_effect, load, recovery, local_date)
     return tuple(sorted(result.values(), key=lambda item: (item.start, item.logical_id)))
 
@@ -212,7 +223,7 @@ def activity_from_record(record: Mapping[str, Any]) -> NormalizedActivity:
         duration = values[0]
         if duration is not None and (not isfinite(float(duration)) or duration < 0):
             raise HistorySchemaError("activity record is invalid")
-        logical_id, revision = _activity_hashes(activity_type, activity_id, start, end, values[0], name, values[1], values[2], values[3])
+        logical_id, revision = _activity_hashes(activity_type, activity_id, start, end, values[0], name, values[1], values[2], values[3], calendar_date)
         if record.get("logical_id") != logical_id or record.get("revision") != revision:
             raise HistorySchemaError("activity record is inconsistent")
         return NormalizedActivity(logical_id, activity_id, revision, activity_type, name, start, end, values[0], values[1], values[2], values[3], calendar_date)
