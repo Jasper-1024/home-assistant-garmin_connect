@@ -33,7 +33,11 @@ from custom_components.garmin_connect.history import (
 )
 from custom_components.garmin_connect.history_recorder import RecorderWriteOutcome
 from custom_components.garmin_connect.history_sensor import GarminHistoryStatusSensor
-from custom_components.garmin_connect.history_source import NormalizedSample
+from custom_components.garmin_connect.history_source import GarminHistorySource, NormalizedSample
+from custom_components.garmin_connect.request_gate import (
+    GarminRequestGate,
+    GarminRequestPriority,
+)
 
 
 class FakeStore:
@@ -317,6 +321,263 @@ async def test_successful_first_sync_starts_fifteen_minute_local_day_cycles() ->
 
     assert set(requested_dates) == {date(2026, 8, 4), date(2026, 8, 5)}
     await archive.async_stop()
+
+
+async def test_recurring_archive_yields_real_shared_gate_to_foreground_refresh() -> None:
+    """Foreground work keeps priority and current-value continuity during a cycle."""
+    hass = _hass()
+    entry = _entry(
+        data={
+            "history_account_key": "opaque-account-key-1234567890",
+            CONF_ARCHIVE_PREVIOUSLY_ENABLED: False,
+        }
+    )
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    timer = DeterministicTimer()
+    gate = GarminRequestGate()
+    cycle_started = asyncio.Event()
+    release_cycle_request = asyncio.Event()
+    first_sync_done = asyncio.Event()
+    cycle_done = asyncio.Event()
+    events: list[str] = []
+
+    class Client:
+        _base_url = "https://garmin.example"
+
+        def __init__(self) -> None:
+            self.requests = 0
+            self.cycle_requests = 0
+            self.cycle_enabled = False
+
+        async def get_user_profile(self):
+            return SimpleNamespace(display_name="athlete")
+
+        async def _mark_request(self):
+            self.requests += 1
+            if not self.cycle_enabled:
+                if self.requests == 19:
+                    first_sync_done.set()
+                return {}
+            self.cycle_requests += 1
+            events.append(f"archive-{self.cycle_requests}")
+            if self.cycle_requests == 1:
+                cycle_started.set()
+                await release_cycle_request.wait()
+            if self.cycle_requests == 19:
+                cycle_done.set()
+            return {}
+
+        async def _request(self, *_args, **_kwargs):
+            return await self._mark_request()
+
+        async def _get_hrv_data_raw(self, _target):
+            return await self._mark_request()
+
+        async def _get_sleep_data_raw(self, _target):
+            return await self._mark_request()
+
+        async def _get_user_summary_raw(self, _target):
+            return await self._mark_request()
+
+        async def get_activities(self, _offset, _limit):
+            await self._mark_request()
+            return []
+
+        async def get_training_status(self, _target):
+            return await self._mark_request()
+
+    client = Client()
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=client), request_gate=gate
+    )
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=_store_factory(FakeStore()),
+        source_factory=lambda source_client, request_gate: GarminHistorySource(
+            source_client, request_gate
+        ),
+        recorder_factory=lambda: recorder,
+        timer_factory=timer.call_later,
+    )
+
+    await archive.async_start()
+    await asyncio.wait_for(first_sync_done.wait(), timeout=0.1)
+    for _ in range(100):
+        if timer.active:
+            break
+        await asyncio.sleep(0)
+    assert timer.active, (archive.status.error_type, client.requests)
+
+    client.cycle_enabled = True
+    timer.fire_next()
+    await asyncio.wait_for(cycle_started.wait(), timeout=0.1)
+
+    async def current_value_request() -> str:
+        events.append("current")
+        return "current-value"
+
+    current_task = asyncio.create_task(
+        gate.async_request(GarminRequestPriority.FOREGROUND, current_value_request)
+    )
+    await asyncio.sleep(0)
+    release_cycle_request.set()
+
+    assert await asyncio.wait_for(current_task, timeout=0.1) == "current-value"
+    assert events.index("current") < events.index("archive-2")
+
+    await asyncio.wait_for(cycle_done.wait(), timeout=0.1)
+    assert archive.status.state is HistoryArchiveState.IDLE
+    await archive.async_stop()
+
+
+async def test_archive_cycle_failure_does_not_break_foreground_request() -> None:
+    """A failed recurring cycle leaves healthy current-value work functional."""
+    hass = _hass()
+    entry = _entry(
+        data={
+            "history_account_key": "opaque-account-key-1234567890",
+            CONF_ARCHIVE_PREVIOUSLY_ENABLED: False,
+        }
+    )
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    timer = DeterministicTimer()
+    gate = GarminRequestGate()
+    cycle_started = asyncio.Event()
+    release_cycle_request = asyncio.Event()
+    first_sync_done = asyncio.Event()
+
+    class FailingSource:
+        def __init__(self, request_gate: GarminRequestGate) -> None:
+            self.request_gate = request_gate
+            self.calls = 0
+            self.cycle_enabled = False
+
+        async def async_fetch(self, _target: date, _metric: str):
+            self.calls += 1
+            if self.calls == 15:
+                first_sync_done.set()
+
+            async def request():
+                if self.cycle_enabled:
+                    cycle_started.set()
+                    await release_cycle_request.wait()
+                    raise OSError("archive endpoint unavailable")
+                return ()
+
+            return await self.request_gate.async_request(
+                GarminRequestPriority.BACKGROUND, request
+            )
+
+    source: FailingSource | None = None
+
+    def source_factory(_client, request_gate):
+        nonlocal source
+        if source is None:
+            source = FailingSource(request_gate)
+        return source
+
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=gate
+    )
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=_store_factory(FakeStore()),
+        source_factory=source_factory,
+        recorder_factory=lambda: recorder,
+        timer_factory=timer.call_later,
+    )
+
+    await archive.async_start()
+    await asyncio.wait_for(first_sync_done.wait(), timeout=0.1)
+    for _ in range(100):
+        if timer.active:
+            break
+        await asyncio.sleep(0)
+    assert timer.active
+    assert source is not None
+    source.cycle_enabled = True
+    timer.fire_next()
+    await asyncio.wait_for(cycle_started.wait(), timeout=0.1)
+
+    async def current_value_request() -> str:
+        return "current-value"
+
+    current_task = asyncio.create_task(
+        gate.async_request(GarminRequestPriority.FOREGROUND, current_value_request)
+    )
+    await asyncio.sleep(0)
+    release_cycle_request.set()
+
+    assert await asyncio.wait_for(current_task, timeout=0.1) == "current-value"
+    for _ in range(100):
+        if archive.status.state is HistoryArchiveState.FAILED:
+            break
+        await asyncio.sleep(0)
+    assert archive.status.state is HistoryArchiveState.FAILED
+    assert archive.status.error_type == "sync_failed"
+    await archive.async_stop()
+
+
+async def test_archive_scheduler_failure_does_not_break_foreground_request() -> None:
+    """A cadence scheduling failure leaves healthy current-value work functional."""
+    hass = _hass()
+    entry = _entry(
+        data={
+            "history_account_key": "opaque-account-key-1234567890",
+            CONF_ARCHIVE_PREVIOUSLY_ENABLED: False,
+        }
+    )
+    entry.options = {CONF_ARCHIVE_ENABLED: True}
+    gate = GarminRequestGate()
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=gate
+    )
+    source = MagicMock()
+    source.async_fetch = AsyncMock(return_value=())
+    source.async_fetch_details = None
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+
+    def failing_timer(_delay: timedelta, _callback: Callable[[], None]) -> Callable[[], None]:
+        raise OSError("timer unavailable")
+
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=_store_factory(FakeStore()),
+        source_factory=lambda *_args: source,
+        recorder_factory=lambda: recorder,
+        timer_factory=failing_timer,
+    )
+
+    await archive.async_start()
+    first_sync_task = archive._first_sync_task
+    assert first_sync_task is not None
+    await first_sync_task
+
+    assert archive.status.state is HistoryArchiveState.FAILED
+    assert archive.status.error_type == "schedule"
+    assert (
+        await gate.async_request(
+            GarminRequestPriority.FOREGROUND, lambda: _current_value()
+        )
+        == "current-value"
+    )
+    await archive.async_stop()
+
+
+async def _current_value() -> str:
+    """Return the healthy current-value result used by isolation tests."""
+    return "current-value"
 
 
 async def test_failed_first_sync_does_not_start_recurring_cadence() -> None:

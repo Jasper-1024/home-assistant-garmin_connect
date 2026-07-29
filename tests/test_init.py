@@ -2,7 +2,7 @@
 
 import asyncio
 from contextlib import ExitStack
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -355,6 +355,143 @@ async def test_real_config_entry_lifecycle_keeps_backfill_dormant_and_surfaces_v
             assert backfill.call_count == 0
             assert await hass.config_entries.async_unload(entry.entry_id)
             assert entry.state is ConfigEntryState.NOT_LOADED
+    finally:
+        hass.config_entries._store._async_cleanup_delay_listener()
+        await hass.async_stop(force=True)
+
+
+async def test_option_disablement_reload_cancels_recurring_archive_work(tmp_path) -> None:
+    """Config-option disablement reload cancels active work and future wakeups."""
+    hass = HomeAssistant(str(tmp_path))
+    hass.config_entries = ConfigEntries(hass, {})
+    loader.async_setup(hass)
+    entry = ConfigEntry(
+        version=2,
+        minor_version=1,
+        domain=DOMAIN,
+        title="Garmin account",
+        data={
+            **ENTRY_DATA,
+            "history_account_key": "opaque-account-key-1234567890",
+            CONF_ARCHIVE_ACTIVATION_DATE: "2026-08-04",
+            CONF_ARCHIVE_PREVIOUSLY_ENABLED: True,
+        },
+        options={CONF_ARCHIVE_ENABLED: True},
+        source=SOURCE_USER,
+        unique_id="garmin-account",
+        discovery_keys={},
+        subentries_data=None,
+        entry_id="entry-1",
+    )
+    coordinator = _coord_mock()
+    archives: list[tuple[GarminHistoryArchive, object, object]] = []
+
+    class Timer:
+        def __init__(self) -> None:
+            self.slots: list[list[object]] = []
+
+        def call_later(self, delay: timedelta, callback) -> object:
+            slot = [delay, callback, True]
+            self.slots.append(slot)
+
+            def cancel() -> None:
+                slot[2] = False
+
+            return cancel
+
+        @property
+        def active(self) -> list[list[object]]:
+            return [slot for slot in self.slots if slot[2]]
+
+    class Source:
+        async_fetch_details = None
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.first_sync_done = asyncio.Event()
+            self.cycle_started = asyncio.Event()
+            self.cycle_cancelled = asyncio.Event()
+
+        async def async_fetch(self, _target, _metric):
+            self.calls += 1
+            if self.calls == 15:
+                self.first_sync_done.set()
+                return ()
+            if self.calls == 16:
+                self.cycle_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cycle_cancelled.set()
+                    raise
+            return ()
+
+    class LifecycleArchive(GarminHistoryArchive):
+        def __init__(self, hass_arg, entry_arg) -> None:
+            timer = Timer()
+            source = Source()
+            store = MagicMock()
+            store.async_load = AsyncMock(return_value=None)
+            store.async_save = AsyncMock()
+            recorder = MagicMock()
+            recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+            super().__init__(
+                hass_arg,
+                entry_arg,
+                recorder_checker=MagicMock(
+                    async_check=AsyncMock(
+                        return_value=RecorderCompatibilityResult.compatible_result()
+                    )
+                ),
+                store_factory=lambda *_args, **_kwargs: store,
+                source_factory=lambda *_args, **_kwargs: source,
+                recorder_factory=lambda: recorder,
+                timer_factory=timer.call_later,
+            )
+            archives.append((self, timer, source))
+
+    try:
+        with ExitStack() as stack:
+            stack.enter_context(patch("custom_components.garmin_connect.GarminAuth"))
+            stack.enter_context(patch("custom_components.garmin_connect.GarminClient"))
+            _stack_coordinators(stack, coordinator)
+            stack.enter_context(
+                patch(
+                    "custom_components.garmin_connect.GarminHistoryArchive",
+                    new=LifecycleArchive,
+                )
+            )
+            stack.enter_context(
+                patch("custom_components.garmin_connect.async_setup_services", new=AsyncMock())
+            )
+            hass.config_entries.async_forward_entry_setups = AsyncMock()
+            hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
+
+            await hass.config_entries.async_add(entry)
+            _, first_timer, first_source = archives[0]
+            await asyncio.wait_for(first_source.first_sync_done.wait(), timeout=0.1)
+            for _ in range(100):
+                if first_timer.active:
+                    break
+                await asyncio.sleep(0)
+            assert first_timer.active
+
+            first_slot = first_timer.active[0]
+            first_slot[2] = False
+            first_slot[1]()
+            await asyncio.wait_for(first_source.cycle_started.wait(), timeout=0.1)
+
+            hass.config_entries.async_update_entry(
+                entry, options={CONF_ARCHIVE_ENABLED: False}
+            )
+            await hass.async_block_till_done()
+
+            assert first_source.cycle_cancelled.is_set()
+            assert first_timer.active == []
+            assert len(archives) >= 2
+            assert entry.runtime_data.history_archive is archives[-1][0]
+            assert entry.runtime_data.history_archive.archive_enabled is False
+            assert all(timer.active == [] for _, timer, _ in archives[1:])
     finally:
         hass.config_entries._store._async_cleanup_delay_listener()
         await hass.async_stop(force=True)
