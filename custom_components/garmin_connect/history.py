@@ -238,6 +238,19 @@ def _normalized_detail_type(details: Any) -> str | None:
     return None
 
 
+@dataclass(frozen=True, slots=True)
+class _NormalizedDetailRecord:
+    """Pair normalized details with the single dispatch tag for the response."""
+
+    details: Any
+    detail_type: str | None
+
+
+def _normalized_detail_record(details: Any) -> _NormalizedDetailRecord:
+    """Build the normalized detail record consumed by numeric import dispatch."""
+    return _NormalizedDetailRecord(details, _normalized_detail_type(details))
+
+
 def _details_presence(details: Any, *, available: bool = True) -> str:
     """Return presence from this normalized response, never from prior state."""
     detail_type = _normalized_detail_type(details)
@@ -327,10 +340,6 @@ class _FamilyObservationAccumulator:
             family: observation.presence
             for family, observation in self.observations.items()
         }
-
-    def as_date_observation(self) -> _ReconciliationObservation:
-        return _date_reconciliation_observation(self)
-
 
 @dataclass(frozen=True, slots=True)
 class _ReconciliationObservation:
@@ -1071,8 +1080,6 @@ class GarminHistoryArchive:
             if previous is not None:
                 if previous.outcome == "failed" or outcome == "failed":
                     outcome = "failed"
-                elif previous.outcome == "incomplete" or outcome == "incomplete":
-                    outcome = "incomplete"
             evidence_requires_open = outcome in {"failed", "incomplete"}
             if (
                 report.outcome != "written"
@@ -1117,15 +1124,23 @@ class GarminHistoryArchive:
             accumulator, family_presence=merged
         )
 
-    async def _async_finalize_observation(
+    async def _async_checkpoint_observation(
         self,
+        target: date,
         target_key: str,
         accumulator: _FamilyObservationAccumulator,
         checkpoint: _StructuredCheckpoint,
+        *,
+        outcome: str = "written",
     ) -> None:
         """Publish one observation and the structured records it made durable."""
         self._remember_date_reconciliation_observation(target_key, accumulator)
         await self._async_persist_observed_structured_records(checkpoint)
+        await self._async_update_reconciliation_state(
+            target,
+            HistorySyncReport(outcome=outcome),
+            is_current_date=target == self._current_local_date(),
+        )
 
     async def _async_expire_empty_reconciliation_dates(self, current: date) -> None:
         """Settle empty Open Archive Dates that reached the window boundary."""
@@ -1350,18 +1365,13 @@ class GarminHistoryArchive:
         async with self._sync_lock:
             return await self._async_sync_range(start_date, end_date, fit_limit=fit_limit, include_training_status=include_training_status)
 
-    async def _async_import_numeric_metric(
+    async def _async_fetch_numeric_detail(
         self,
         source: GarminHistorySource,
-        recorder: Any,
         target: date,
-        target_key: str,
         metric: str,
-        metadata: Any,
-        presence: dict[str, dict[str, str]],
-        health_events: list[NormalizedHealthEvent],
-    ) -> _NumericImportResult:
-        """Import one numeric family without deciding the date checkpoint."""
+    ) -> _NormalizedDetailRecord:
+        """Fetch one numeric response and resolve its normalized dispatch tag once."""
         try:
             details_descriptor = inspect.getattr_static(source, "async_fetch_details")
         except AttributeError:
@@ -1377,9 +1387,28 @@ class GarminHistoryArchive:
                     details = candidate
         if inspect.isawaitable(details):
             details = await details
-        if _normalized_detail_type(details) is None:
-            details = await source.async_fetch(target, metric)
-        detail_type = _normalized_detail_type(details)
+        detail_record = _normalized_detail_record(details)
+        if detail_record.detail_type is None:
+            detail_record = _normalized_detail_record(
+                await source.async_fetch(target, metric)
+            )
+        return detail_record
+
+    async def _async_import_numeric_metric(
+        self,
+        source: GarminHistorySource,
+        recorder: Any,
+        target: date,
+        target_key: str,
+        metric: str,
+        metadata: Any,
+        presence: dict[str, dict[str, str]],
+        health_events: list[NormalizedHealthEvent],
+    ) -> _NumericImportResult:
+        """Import one numeric family without deciding the date checkpoint."""
+        detail_record = await self._async_fetch_numeric_detail(source, target, metric)
+        details = detail_record.details
+        detail_type = detail_record.detail_type
         family_observation = _FamilyObservation.from_details(details)
 
         inserted = updated = skipped = 0
@@ -1629,7 +1658,21 @@ class GarminHistoryArchive:
                         )
                         if error.write_failure:
                             numeric_write_failed = True
+                            await self._async_checkpoint_observation(
+                                target,
+                                target_key,
+                                family_observations,
+                                checkpoint,
+                                outcome="failed",
+                            )
                             break
+                        await self._async_checkpoint_observation(
+                            target,
+                            target_key,
+                            family_observations,
+                            checkpoint,
+                            outcome="failed",
+                        )
                         continue
                     except GarminConnectError:
                         failed_families.add(metric)
@@ -1638,6 +1681,13 @@ class GarminHistoryArchive:
                         family_observations.record_failure(metric, failed_family_error)
                         _LOGGER.warning(
                             "Garmin numeric family failed for %s (%s)", target_key, metric
+                        )
+                        await self._async_checkpoint_observation(
+                            target,
+                            target_key,
+                            family_observations,
+                            checkpoint,
+                            outcome="failed",
                         )
                         continue
                     except (AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError) as error:
@@ -1649,11 +1699,21 @@ class GarminHistoryArchive:
                             "Garmin numeric family failed for %s (%s)", target_key, metric
                         )
                         del error
+                        await self._async_checkpoint_observation(
+                            target,
+                            target_key,
+                            family_observations,
+                            checkpoint,
+                            outcome="failed",
+                        )
                         continue
                     inserted += metric_result.inserted_count
                     updated += metric_result.updated_count
                     skipped += metric_result.skipped_count
                     family_observations.record(metric, metric_result.observation)
+                    await self._async_checkpoint_observation(
+                        target, target_key, family_observations, checkpoint
+                    )
                 try:
                     structured_descriptor = inspect.getattr_static(source, "async_fetch_details")
                 except AttributeError:
@@ -1667,6 +1727,17 @@ class GarminHistoryArchive:
                     "sleep_sessions",
                     family_observations,
                 )
+                await self._async_checkpoint_observation(
+                    target,
+                    target_key,
+                    family_observations,
+                    checkpoint,
+                    outcome=(
+                        "failed"
+                        if sleep_observation.presence == "failed"
+                        else "written"
+                    ),
+                )
                 sleep_details = sleep_observation.details
                 if sleep_observation.presence == "failed":
                     failed_families.add("sleep_sessions")
@@ -1676,6 +1747,13 @@ class GarminHistoryArchive:
                     failed_family_error = "sync_failed"
                     family_observations.record_failure("sleep_sessions", failed_family_error)
                     sleep_details = ()
+                    await self._async_checkpoint_observation(
+                        target,
+                        target_key,
+                        family_observations,
+                        checkpoint,
+                        outcome="failed",
+                    )
                 invalid_sleep_streams: set[tuple[str, str]] = set()
                 for session in sleep_details:
                     for stream in session.streams:
@@ -1750,8 +1828,8 @@ class GarminHistoryArchive:
                     structured_dirty_years.add(year)
                     events_by_year.setdefault(year, {})[event.logical_id] = health_event_record(event)
                 health_events.clear()
-                await self._async_finalize_observation(
-                    target_key, family_observations, checkpoint
+                await self._async_checkpoint_observation(
+                    target, target_key, family_observations, checkpoint
                 )
                 for event_metric in ("health_events_daily", "health_events_body_battery"):
                     event_observation = await _async_observe_family(
@@ -1766,18 +1844,32 @@ class GarminHistoryArchive:
                     if event_observation.presence == "failed":
                         failed_families.add(event_metric)
                         failed_family_error = event_observation.error_type or "sync_failed"
+                        await self._async_checkpoint_observation(
+                            target,
+                            target_key,
+                            family_observations,
+                            checkpoint,
+                            outcome="failed",
+                        )
                         continue
                     if not isinstance(event_details, tuple) or any(not isinstance(item, NormalizedHealthEvent) for item in event_details):
                         failed_families.add(event_metric)
                         failed_family_error = "health_event_schema"
                         family_observations.record_failure(event_metric, failed_family_error)
+                        await self._async_checkpoint_observation(
+                            target,
+                            target_key,
+                            family_observations,
+                            checkpoint,
+                            outcome="failed",
+                        )
                         continue
                     for event in event_details:
                         year = str((event.start or event.occurrence or datetime.combine(event.calendar_date, time.min, tzinfo=UTC)).year)
                         structured_dirty_years.add(year)
                         events_by_year.setdefault(year, {})[event.logical_id] = health_event_record(event)
-                    await self._async_finalize_observation(
-                        target_key, family_observations, checkpoint
+                    await self._async_checkpoint_observation(
+                        target, target_key, family_observations, checkpoint
                     )
                 activity_observation = await _async_observe_family(
                     structured_fetch
@@ -1786,6 +1878,17 @@ class GarminHistoryArchive:
                     target,
                     "timed_activities",
                     family_observations,
+                )
+                await self._async_checkpoint_observation(
+                    target,
+                    target_key,
+                    family_observations,
+                    checkpoint,
+                    outcome=(
+                        "failed"
+                        if activity_observation.presence == "failed"
+                        else "written"
+                    ),
                 )
                 activity_details = activity_observation.details
                 if activity_observation.presence == "failed":
@@ -1797,6 +1900,13 @@ class GarminHistoryArchive:
                     failed_family_error = "activity_schema"
                     family_observations.record_failure("timed_activities", failed_family_error)
                     activity_details = ()
+                    await self._async_checkpoint_observation(
+                        target,
+                        target_key,
+                        family_observations,
+                        checkpoint,
+                        outcome="failed",
+                    )
                 fit_count = 0
                 fit_deferred = False
                 for activity in activity_details:
@@ -1815,13 +1925,6 @@ class GarminHistoryArchive:
                         "end": activity.end.isoformat() if activity.end else None, "duration_seconds": activity.duration_seconds,
                         "training_effect": activity.training_effect, "load": activity.load, "recovery": activity.recovery,
                     }
-                await self._async_finalize_observation(
-                    target_key, family_observations, checkpoint
-                )
-                for activity in activity_details:
-                    if activity.calendar_date != target:
-                        continue
-                    year = str(activity.calendar_date.year)
                     download_activity = getattr(client, "download_activity", None)
                     if callable(download_activity):
                         if activity.logical_id in self._fit_archives.get(year, {}):
@@ -1839,6 +1942,9 @@ class GarminHistoryArchive:
                         )
                         self._fit_archives.setdefault(year, {})[activity.logical_id] = fit_result
                         fit_count += 1
+                await self._async_checkpoint_observation(
+                    target, target_key, family_observations, checkpoint
+                )
                 self._remember_date_reconciliation_observation(target_key, family_observations)
                 if failed_families:
                     await self._async_save_numeric_source_manifest()
@@ -1995,6 +2101,26 @@ class GarminHistoryArchive:
                 self._presence = presence
                 self._remember_date_reconciliation_observation(target_key, family_observations)
             except asyncio.CancelledError:
+                self._remember_date_reconciliation_observation(
+                    target_key, family_observations
+                )
+                try:
+                    await asyncio.shield(
+                        self._async_persist_observed_structured_records(checkpoint)
+                    )
+                    await asyncio.shield(
+                        self._async_update_reconciliation_state(
+                            target,
+                            HistorySyncReport(
+                                outcome="failed", error_type="sync_cancelled"
+                            ),
+                        )
+                    )
+                except (AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError):
+                    _LOGGER.warning(
+                        "Garmin reconciliation could not be checkpointed after cancellation for %s",
+                        target_key,
+                    )
                 self._status = HistoryStatus(self._resting_state(), current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
                 raise
             except _NumericFamilyError as error:
@@ -2013,6 +2139,7 @@ class GarminHistoryArchive:
                     outcome="failed", error_type=error.error_type,
                 )
             except (GarminConnectError, AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError) as error:
+                self._remember_date_reconciliation_observation(target_key, family_observations)
                 try:
                     await self._async_persist_observed_structured_records(checkpoint)
                 except (AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError):
@@ -2021,7 +2148,17 @@ class GarminHistoryArchive:
                         type(error).__name__,
                         target_key,
                     )
-                self._remember_date_reconciliation_observation(target_key, family_observations)
+                try:
+                    await self._async_update_reconciliation_state(
+                        target,
+                        HistorySyncReport(outcome="failed", error_type="sync_failed"),
+                    )
+                except (AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError):
+                    _LOGGER.warning(
+                        "Garmin reconciliation could not be checkpointed after %s for %s",
+                        type(error).__name__,
+                        target_key,
+                    )
                 self._runtime_sync_failure = True
                 error_type = "garmin_client_error" if isinstance(error, GarminConnectError) else "sync_failed"
                 self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted, error_type=error_type, **self._backfill_status_fields())

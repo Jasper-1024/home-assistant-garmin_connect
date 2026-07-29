@@ -609,6 +609,64 @@ async def test_failed_then_empty_observation_remains_open_after_window_end() -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("interruption", ("success", "failure", "cancel"))
+async def test_reconciliation_family_checkpoint_survives_interruption(
+    interruption: str,
+) -> None:
+    """A family checkpoint keeps an interrupted date Open across restart."""
+    target = date(2026, 8, 4)
+    store = FakeStore()
+    now = [datetime(2026, 8, 4, tzinfo=UTC)]
+    timer = DeterministicTimer()
+    family_started = asyncio.Event()
+    release_family = asyncio.Event()
+
+    class InterruptedSource(ReconciliationSource):
+        async def async_fetch_details(self, target_date: date, metric: str) -> object:
+            if target_date == target and metric == "heart_rate":
+                if interruption == "cancel":
+                    family_started.set()
+                    await release_family.wait()
+                if interruption == "failure":
+                    raise GarminConnectError("temporary family failure")
+                return SourceSeries(
+                    (
+                        NormalizedSample(
+                            datetime(2026, 8, 4, 12, tzinfo=UTC),
+                            target,
+                            "2026-08-04T12:00:00Z",
+                            72.0,
+                        ),
+                    ),
+                    "present",
+                )
+            if target_date == target and metric == "sleep_sessions":
+                family_started.set()
+                await release_family.wait()
+            return await super().async_fetch_details(target_date, metric)
+
+    source = InterruptedSource({})
+    archive = _enabled_reconciliation_archive(store, source, now, timer)
+
+    await archive.async_start()
+    await family_started.wait()
+    await archive.async_stop()
+
+    restarted_source = ReconciliationSource({})
+    now[0] = datetime(2026, 8, 5, tzinfo=UTC)
+    restarted_timer = DeterministicTimer()
+    restarted = _enabled_reconciliation_archive(
+        store, restarted_source, now, restarted_timer
+    )
+    await restarted.async_start()
+    await _wait_for_remote_requests(restarted_source, 19)
+    await _run_reconciliation_cycle(restarted, restarted_timer, restarted_source)
+
+    assert target in restarted_source.requested
+    await restarted.async_stop()
+
+
+@pytest.mark.asyncio
 async def test_reenable_does_not_expire_open_date_before_new_activation_boundary() -> None:
     target = date(2026, 8, 1)
     store = _reconciliation_store(target)
