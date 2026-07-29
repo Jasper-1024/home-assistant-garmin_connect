@@ -193,6 +193,46 @@ async def _sync_health_calendar_records(
     return archive, stores
 
 
+def _activity_calendar_archive(
+    activities: tuple[object, ...],
+) -> tuple[GarminHistoryArchive, dict[str, FakeStore]]:
+    hass = _hass()
+    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=None
+    )
+    stores: dict[str, FakeStore] = {}
+
+    def store_factory(_hass, _version, path, **kwargs):
+        return stores.setdefault(path, FakeStore())
+
+    class Source:
+        async def async_fetch_details(self, _request_date: date, metric: str) -> object:
+            if metric == "timed_activities":
+                return activities
+            if metric in {
+                "sleep_sessions",
+                "health_events_daily",
+                "health_events_body_battery",
+            }:
+                return ()
+            return SourceSeries((), "missing")
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(
+            RecorderCompatibilityResult.compatible_result()
+        ),
+        store_factory=store_factory,
+        source_factory=lambda _client, _gate: Source(),
+        recorder_factory=lambda: recorder,
+    )
+    return archive, stores
+
+
 async def test_start_persists_opaque_account_key_and_reuses_it() -> None:
     """The identity is generated once and survives a new archive instance."""
     hass = _hass()
@@ -500,12 +540,6 @@ async def test_health_reversed_interval_is_skipped_without_hiding_valid_record()
 async def test_activity_with_gmt_source_instants_is_calendar_queryable_without_duration() -> None:
     """A raw activity with GMT Source Instants needs no synthetic duration."""
     target = date(2026, 1, 1)
-    hass = _hass()
-    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
-    entry.runtime_data = SimpleNamespace(
-        core=SimpleNamespace(client=object()), request_gate=None
-    )
-    stores: dict[str, FakeStore] = {}
     activities = normalize_activities(
         [
             {
@@ -519,36 +553,7 @@ async def test_activity_with_gmt_source_instants_is_calendar_queryable_without_d
         ],
         target,
     )
-
-    def store_factory(_hass, _version, path, **kwargs):
-        return stores.setdefault(path, FakeStore())
-
-    class Source:
-        async def async_fetch_details(
-            self, _request_date: date, metric: str
-        ) -> object:
-            if metric == "timed_activities":
-                return activities
-            if metric in {
-                "sleep_sessions",
-                "health_events_daily",
-                "health_events_body_battery",
-            }:
-                return ()
-            return SourceSeries((), "missing")
-
-    recorder = MagicMock()
-    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
-    archive = GarminHistoryArchive(
-        hass,
-        entry,
-        recorder_checker=FakeRecorderChecker(
-            RecorderCompatibilityResult.compatible_result()
-        ),
-        store_factory=store_factory,
-        source_factory=lambda _client, _gate: Source(),
-        recorder_factory=lambda: recorder,
-    )
+    archive, _stores = _activity_calendar_archive(activities)
     await archive.async_start()
     assert (await archive.async_sync_range(target, target)).outcome == "written"
 
@@ -569,16 +574,6 @@ async def test_activity_with_gmt_source_instants_is_calendar_queryable_without_d
 async def test_calendar_retains_distinct_same_time_activities() -> None:
     """Calendar deduplication cannot thin distinct activity Source Records."""
     target = date(2026, 7, 24)
-    hass = _hass()
-    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
-    entry.runtime_data = SimpleNamespace(
-        core=SimpleNamespace(client=object()), request_gate=None
-    )
-    stores: dict[str, FakeStore] = {}
-
-    def store_factory(_hass, _version, path, **kwargs):
-        return stores.setdefault(path, FakeStore())
-
     activities = normalize_activities(
         {
             "activities": [
@@ -600,29 +595,7 @@ async def test_calendar_retains_distinct_same_time_activities() -> None:
         },
         target,
     )
-
-    class Source:
-        async def async_fetch_details(self, _request_date: date, metric: str) -> object:
-            if metric == "timed_activities":
-                return activities
-            if metric in {
-                "sleep_sessions",
-                "health_events_daily",
-                "health_events_body_battery",
-            }:
-                return ()
-            return SourceSeries((), "missing")
-
-    recorder = MagicMock()
-    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
-    archive = GarminHistoryArchive(
-        hass,
-        entry,
-        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
-        store_factory=store_factory,
-        source_factory=lambda _client, _gate: Source(),
-        recorder_factory=lambda: recorder,
-    )
+    archive, stores = _activity_calendar_archive(activities)
     await archive.async_start()
 
     assert (await archive.async_sync_range(target, target)).outcome == "written"
