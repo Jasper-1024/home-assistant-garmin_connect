@@ -146,32 +146,29 @@ def _archive(
     )
 
 
-async def _sync_health_calendar_records(
-    raw_events: list[dict[str, object]],
+def _structured_calendar_archive(
+    metric: str,
+    payload: object,
 ) -> tuple[GarminHistoryArchive, dict[str, FakeStore]]:
-    """Archive captured health records through the public synchronization seam."""
-    target = date(2026, 7, 24)
+    """Build a structured archive with one metric supplied by a test source."""
     hass = _hass()
     entry = _entry(data={"history_account_key": "opaque-account-key-123"})
     entry.runtime_data = SimpleNamespace(
         core=SimpleNamespace(client=object()), request_gate=None
     )
     stores: dict[str, FakeStore] = {}
-    health_events = normalize_health_events({"events": raw_events}, target)
 
     def store_factory(_hass, _version, path, **kwargs):
         return stores.setdefault(path, FakeStore())
 
     class Source:
         async def async_fetch_details(
-            self, _request_date: date, metric: str
+            self, _request_date: date, requested_metric: str
         ) -> object:
-            if metric == "health_events_daily":
-                return health_events
-            if metric in {
-                "sleep_sessions",
-                "health_events_body_battery",
-                "timed_activities",
+            if requested_metric == metric:
+                return payload
+            if requested_metric in {
+                "sleep_sessions", "health_events_daily", "health_events_body_battery", "timed_activities"
             }:
                 return ()
             return SourceSeries((), "missing")
@@ -188,6 +185,16 @@ async def _sync_health_calendar_records(
         source_factory=lambda _client, _gate: Source(),
         recorder_factory=lambda: recorder,
     )
+    return archive, stores
+
+
+async def _sync_health_calendar_records(
+    raw_events: list[dict[str, object]],
+) -> tuple[GarminHistoryArchive, dict[str, FakeStore]]:
+    """Archive captured health records through the public synchronization seam."""
+    target = date(2026, 7, 24)
+    health_events = normalize_health_events({"events": raw_events}, target)
+    archive, stores = _structured_calendar_archive("health_events_daily", health_events)
     await archive.async_start()
     assert (await archive.async_sync_range(target, target)).outcome == "written"
     return archive, stores
@@ -196,41 +203,7 @@ async def _sync_health_calendar_records(
 def _activity_calendar_archive(
     activities: tuple[object, ...],
 ) -> tuple[GarminHistoryArchive, dict[str, FakeStore]]:
-    hass = _hass()
-    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
-    entry.runtime_data = SimpleNamespace(
-        core=SimpleNamespace(client=object()), request_gate=None
-    )
-    stores: dict[str, FakeStore] = {}
-
-    def store_factory(_hass, _version, path, **kwargs):
-        return stores.setdefault(path, FakeStore())
-
-    class Source:
-        async def async_fetch_details(self, _request_date: date, metric: str) -> object:
-            if metric == "timed_activities":
-                return activities
-            if metric in {
-                "sleep_sessions",
-                "health_events_daily",
-                "health_events_body_battery",
-            }:
-                return ()
-            return SourceSeries((), "missing")
-
-    recorder = MagicMock()
-    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
-    archive = GarminHistoryArchive(
-        hass,
-        entry,
-        recorder_checker=FakeRecorderChecker(
-            RecorderCompatibilityResult.compatible_result()
-        ),
-        store_factory=store_factory,
-        source_factory=lambda _client, _gate: Source(),
-        recorder_factory=lambda: recorder,
-    )
-    return archive, stores
+    return _structured_calendar_archive("timed_activities", activities)
 
 
 async def test_start_persists_opaque_account_key_and_reuses_it() -> None:

@@ -1190,17 +1190,11 @@ class GarminHistorySource:
                     for item in page_items:
                         if not isinstance(item, dict):
                             continue
-                        raw_start = _first_non_null(
+                        _, parsed_start = _timestamp_from_aliases(
                             item, ("startTime", "startTimeGMT", "startTimeLocal")
                         )
-                        if raw_start is _MISSING:
-                            raw_start = None
-                        parsed_start = _timestamp(raw_start)
                         if parsed_start is not None:
-                            if "startTime" not in item and "startTimeGMT" not in item and isinstance(raw_start, str):
-                                page_dates.append(datetime.fromisoformat(raw_start.replace("Z", "+00:00")).date())
-                            else:
-                                page_dates.append(parsed_start.date())
+                            page_dates.append(parsed_start.date())
                     if page_dates and all(page_date < target_date for page_date in page_dates):
                         break
                     if len(page_items) < 100:

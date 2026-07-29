@@ -1119,6 +1119,36 @@ async def test_sleep_streams_write_distinct_statistics_and_calendar_stays_bounde
 
 
 @pytest.mark.asyncio
+async def test_sleep_calendar_prefilter_uses_utc_source_instant_dates() -> None:
+    target = date(2026, 7, 24)
+    session = parse_sleep_sessions(
+        {
+            "sleepStartTimestampGMT": "2026-07-24T23:30:00+14:00",
+            "sleepEndTimestampGMT": "2026-07-25T01:00:00+14:00",
+        },
+        target,
+    )[0]
+
+    class Source:
+        async def async_fetch_details(self, _target: date, metric: str) -> object:
+            return (session,) if metric == "sleep_sessions" else ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = _partition_archive(Source(), recorder, {})
+    await archive.async_start()
+    await archive.async_sync_range(target, target)
+
+    assert len(await archive.async_get_calendar_events("sleep", target, target)) == 1
+    assert (
+        await archive.async_get_calendar_events(
+            "sleep", date(2026, 7, 25), date(2026, 7, 25)
+        )
+        == ()
+    )
+
+
+@pytest.mark.asyncio
 async def test_disabled_archive_keeps_retained_calendar_query_available():
     """Disablement leaves already persisted Calendar records queryable."""
     fixture = json.loads((Path(__file__).parent / "fixtures" / "garmin_sleep_streams.json").read_text())
@@ -1363,8 +1393,8 @@ async def test_activity_calendar_derives_end_from_duration_without_changing_sour
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("duration", [0.0, -1.0, float("nan"), float("inf")])
-async def test_activity_calendar_rejects_non_positive_or_non_finite_duration(
+@pytest.mark.parametrize("duration", [-1.0, float("nan"), float("inf")])
+async def test_activity_calendar_rejects_negative_or_non_finite_duration(
     duration: float,
 ) -> None:
     activity = normalize_activities(
@@ -1398,6 +1428,47 @@ async def test_activity_calendar_rejects_non_positive_or_non_finite_duration(
     )
 
     assert events == []
+
+
+@pytest.mark.asyncio
+async def test_activity_calendar_projects_zero_duration_without_changing_source_record() -> None:
+    activity = normalize_activities(
+        [
+            {
+                "activityId": 126,
+                "activityType": "running",
+                "startTime": "2026-07-24T10:00:00Z",
+                "durationInSeconds": 0.0,
+            }
+        ],
+        date(2026, 7, 24),
+    )[0]
+    assert activity.end is None
+
+    class Source:
+        async def async_fetch_details(self, _target: date, metric: str) -> object:
+            return (activity,) if metric == "timed_activities" else ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    stores = {"garmin_connect.e.history_catalog": _NamedStore()}
+    archive = _partition_archive(Source(), recorder, stores)
+    await archive.async_start()
+    await archive.async_sync_range(date(2026, 7, 24), date(2026, 7, 24))
+
+    stored = stores["garmin_connect.e.sleep_2026"].data["activities"][activity.logical_id]
+    assert stored["end"] is None
+
+    calendar = GarminActivityCalendar(archive, "e")
+    events = await calendar.async_get_events(
+        MagicMock(),
+        datetime(2026, 7, 24, tzinfo=UTC),
+        datetime(2026, 7, 25, tzinfo=UTC),
+    )
+
+    assert [(event.start, event.end) for event in events] == [
+        (activity.start, activity.start + timedelta(seconds=1))
+    ]
 
 
 @pytest.mark.asyncio

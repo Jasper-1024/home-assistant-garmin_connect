@@ -1786,9 +1786,9 @@ class GarminHistoryArchive:
                             isinstance(duration, int | float)
                             and not isinstance(duration, bool)
                             and isfinite(duration)
-                            and duration > 0
+                            and duration >= 0
                         ):
-                            end = start + timedelta(seconds=duration)
+                            end = start + timedelta(seconds=max(duration, 1.0))
                     if end is None:
                         continue
                     summary = str(
@@ -1850,7 +1850,10 @@ class GarminHistoryArchive:
             for logical_id, record in records.items():
                 start = datetime.fromisoformat(record["start"])
                 end = datetime.fromisoformat(record["end"])
-                if start.date() <= end_date and end.date() >= start_date:
+                if (
+                    start.astimezone(UTC).date() <= end_date
+                    and end.astimezone(UTC).date() >= start_date
+                ):
                     summary = "Sleep" if record["kind"] == "main" else "Nap"
                     events[(logical_id, start, end, summary)] = HistoryCalendarEvent(start, end, summary)
         return tuple(sorted(events.values(), key=lambda event: event.start))

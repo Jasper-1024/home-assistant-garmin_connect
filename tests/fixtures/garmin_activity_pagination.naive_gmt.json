@@ -1,0 +1,18 @@
+{
+  "target_activity": {
+    "activityId": "target-1",
+    "activityType": "running",
+    "activityName": "Target run",
+    "startTimeGMT": "2026-07-24T23:30:00.000",
+    "endTimeGMT": "2026-07-25T00:30:00.000",
+    "durationInSeconds": 3600
+  },
+  "older_activity": {
+    "activityId": "older-1",
+    "activityType": "walking",
+    "activityName": "Older walk",
+    "startTimeGMT": "2026-07-23T23:30:00.000",
+    "endTimeGMT": "2026-07-24T00:30:00.000",
+    "durationInSeconds": 3600
+  }
+}
