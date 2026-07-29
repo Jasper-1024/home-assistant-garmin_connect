@@ -627,6 +627,87 @@ async def test_sleep_stream_failure_recovery_requires_unchanged_confirmation() -
 
 
 @pytest.mark.asyncio
+async def test_sleep_stream_failure_survives_restart_and_settles_after_unchanged_confirmation() -> None:
+    """A persisted sleep-stream failure remains Open through restart and recovery."""
+    target = date(2026, 8, 4)
+    store = _reconciliation_store(target)
+    sleep_details = (
+        SleepSession(
+            "sleep-id",
+            "main_sleep",
+            datetime(2026, 8, 4, 0, tzinfo=UTC),
+            datetime(2026, 8, 4, 8, tzinfo=UTC),
+            target,
+            "sleep-revision",
+            {},
+            (),
+            (),
+            (),
+            streams=(
+                SleepStream(
+                    "heart_rate",
+                    (
+                        SleepStreamPoint(
+                            datetime(2026, 8, 4, 1, tzinfo=UTC),
+                            "2026-08-04T01:00:00Z",
+                            60.0,
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    class SleepFailureSource(ReconciliationSource):
+        async def async_fetch_details(self, target_date: date, metric: str) -> object:
+            if metric == "sleep_sessions" and target_date == target:
+                return sleep_details
+            return await super().async_fetch_details(target_date, metric)
+
+    source = SleepFailureSource({})
+    failed = True
+
+    async def write(statistic_id: str, metadata: Any, samples: object) -> RecorderWriteOutcome:
+        nonlocal failed
+        if failed and ":sleep_" in statistic_id:
+            failed = False
+            return RecorderWriteOutcome(0, "failed", "writer")
+        return RecorderWriteOutcome(0)
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(side_effect=write)
+    now = [datetime(2026, 8, 5, tzinfo=UTC)]
+    timer = DeterministicTimer()
+    archive = _enabled_reconciliation_archive(
+        store, source, now, timer, recorder=recorder
+    )
+
+    await archive.async_start()
+    await _wait_for_remote_requests(source, 19)
+    await _run_reconciliation_cycle(archive, timer, source)
+    await _wait_for_archive_state(archive, HistoryArchiveState.FAILED)
+    assert store.data["reconciliation_family_presence"][target.isoformat()][
+        "sleep_stream"
+    ] == "failed"
+    await archive.async_stop()
+
+    restarted_timer = DeterministicTimer()
+    restarted = _enabled_reconciliation_archive(
+        store, source, now, restarted_timer, recorder=recorder
+    )
+    await restarted.async_start()
+    assert restarted.status.state is HistoryArchiveState.IDLE
+    await _wait_for_remote_requests(source, len(source.requested) + 19)
+
+    await _run_reconciliation_cycle(restarted, restarted_timer, source)
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
+
+    await _run_reconciliation_cycle(restarted, restarted_timer, source)
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "settled"
+    await restarted.async_stop()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("failure_metric", "failure_kind"),
     (("heart_rate", "http"), ("health_events_daily", "schema"), ("body_battery", "family")),

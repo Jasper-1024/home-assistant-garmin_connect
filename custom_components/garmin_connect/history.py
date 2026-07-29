@@ -165,6 +165,9 @@ _STRUCTURED_FAMILIES = (
 _FROZEN_ARCHIVE_FAMILIES = tuple(
     family for family, _metadata in _NUMERIC_FAMILY_METADATA
 ) + _STRUCTURED_FAMILIES
+# Sleep stream writes are a structured reconciliation family, but remain an
+# internal ledger concern rather than a new public archive catalog export.
+_RECONCILIATION_FAMILIES = _FROZEN_ARCHIVE_FAMILIES + ("sleep_stream",)
 _RECONCILIATION_EXPLICIT_EMPTY_STATES = frozenset(
     {"empty", "all-null", "null", "returned-empty", "absent"}
 )
@@ -3192,7 +3195,7 @@ class GarminHistoryArchive:
             for family, state in families.items():
                 if (
                     not isinstance(family, str)
-                    or family not in _FROZEN_ARCHIVE_FAMILIES
+                    or family not in _RECONCILIATION_FAMILIES
                     or state not in _PRESENCE_STATES
                 ):
                     raise ValueError("Store reconciliation family presence is invalid")
