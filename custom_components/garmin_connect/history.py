@@ -1222,6 +1222,7 @@ class GarminHistoryArchive:
         """Publish one observation and the structured records it made durable."""
         self._remember_date_reconciliation_observation(target_key, accumulator)
         await self._async_persist_observed_structured_records(checkpoint)
+        await self._async_save_reconciliation_state(presence=checkpoint.presence)
         if outcome != "written":
             await self._async_update_reconciliation_state(
                 target,
@@ -1257,7 +1258,9 @@ class GarminHistoryArchive:
         if changed:
             await self._async_save_reconciliation_state()
 
-    async def _async_save_reconciliation_state(self) -> None:
+    async def _async_save_reconciliation_state(
+        self, *, presence: Mapping[str, Mapping[str, str]] | None = None
+    ) -> None:
         """Atomically persist the private reconciliation ledger."""
         if self._store is None:
             return
@@ -1273,6 +1276,10 @@ class GarminHistoryArchive:
             key: dict(value)
             for key, value in self._reconciliation_family_presence.items()
         }
+        if presence is not None:
+            updated["presence"] = {
+                key: dict(value) for key, value in presence.items()
+            }
         await self._store.async_save(updated)
 
     def _schedule_next_cycle(self) -> None:

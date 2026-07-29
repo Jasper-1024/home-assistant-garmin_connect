@@ -2094,6 +2094,75 @@ async def test_full_numeric_presence_catalog_survives_restart() -> None:
 
 
 @pytest.mark.asyncio
+async def test_numeric_checkpoint_survives_restart_without_gap() -> None:
+    """A numeric observation is durable before structured work can finish."""
+    target = date(2026, 8, 4)
+    store = _reconciliation_store(target)
+    now = [datetime(2026, 8, 4, tzinfo=UTC)]
+    initial_source = ReconciliationSource({})
+    initial_timer = DeterministicTimer()
+    initial = _enabled_reconciliation_archive(
+        store, initial_source, now, initial_timer
+    )
+
+    await initial.async_start()
+    await _wait_for_remote_requests(initial_source, 19)
+    await _wait_for_archive_state(initial, HistoryArchiveState.IDLE)
+    assert store.data is not None
+    assert store.data["reconciliation_family_presence"][target.isoformat()][
+        "heart_rate"
+    ] == "empty"
+    await initial.async_stop()
+
+    sleep_started = asyncio.Event()
+    release_sleep = asyncio.Event()
+
+    class InterruptedNumericSource(ReconciliationSource):
+        async def async_fetch_details(self, target_date: date, metric: str) -> object:
+            if target_date == target and metric == "sleep_sessions":
+                sleep_started.set()
+                await release_sleep.wait()
+            return await super().async_fetch_details(target_date, metric)
+
+    interrupted_source = InterruptedNumericSource({target: (72.0,)})
+    interrupted_timer = DeterministicTimer()
+    interrupted = _enabled_reconciliation_archive(
+        store, interrupted_source, now, interrupted_timer
+    )
+    await interrupted.async_start()
+    await sleep_started.wait()
+
+    assert store.data is not None
+    assert store.data["reconciliation_family_presence"][target.isoformat()][
+        "heart_rate"
+    ] == "present"
+
+    release_sleep.set()
+    await interrupted.async_stop()
+
+    now[0] = datetime(2026, 8, 12, tzinfo=UTC)
+    restarted_source = ReconciliationSource({})
+    restarted_timer = DeterministicTimer()
+    restarted = _enabled_reconciliation_archive(
+        store, restarted_source, now, restarted_timer
+    )
+    await restarted.async_start()
+    await _wait_for_remote_requests(restarted_source, 19)
+    await _wait_for_archive_state(restarted, HistoryArchiveState.IDLE)
+    await _run_reconciliation_cycle(restarted, restarted_timer, restarted_source)
+
+    assert store.data is not None
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
+    assert store.data["reconciliation"][target.isoformat()][
+        "outcome"
+    ] != "continuity_gap"
+    assert restarted.get_history_presence(target, target)[target.isoformat()][
+        "heart_rate"
+    ] == "present"
+    await restarted.async_stop()
+
+
+@pytest.mark.asyncio
 async def test_segmented_totals_are_written_with_provenance_and_revisions() -> None:
     target = date(2026, 7, 24)
     hass = _hass()
