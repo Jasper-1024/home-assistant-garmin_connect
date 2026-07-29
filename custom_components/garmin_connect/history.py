@@ -1813,6 +1813,10 @@ class GarminHistoryArchive:
                 invalid_sleep_sessions = {
                     session_id for session_id, _metric in invalid_sleep_streams
                 }
+                if invalid_sleep_streams:
+                    family_observations.record_failure(
+                        "sleep_stream", "sleep_stream_invalid"
+                    )
                 observed_sleep_sessions: dict[str, dict[str, dict[str, Any]]] = {}
                 for session in sleep_details:
                     if session.logical_id in invalid_sleep_sessions:
@@ -1825,6 +1829,9 @@ class GarminHistoryArchive:
                     for stream in session.streams:
                         metadata_for_stream = _SLEEP_STREAM_METADATA.get(stream.metric)
                         if metadata_for_stream is None:
+                            family_observations.record_failure(
+                                "sleep_stream", "sync_failed"
+                            )
                             raise SleepSchemaError("sleep stream metric is unsupported")
                         samples = tuple(
                             NormalizedSample(point.timestamp, session.calendar_date, point.raw_timestamp, point.value)
@@ -1848,11 +1855,17 @@ class GarminHistoryArchive:
                         except (AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError):
                             failed_families.add("sleep_stream")
                             failed_family_error = "sync_failed"
+                            family_observations.record_failure(
+                                "sleep_stream", failed_family_error
+                            )
                             numeric_write_failed = True
                             continue
                         if stream_outcome.outcome != "written":
                             failed_families.add("sleep_stream")
                             failed_family_error = stream_outcome.error_type or "sleep_stream_write_failed"
+                            family_observations.record_failure(
+                                "sleep_stream", failed_family_error
+                            )
                             numeric_write_failed = True
                             continue
                         await self._async_confirm_numeric_source_dates(
@@ -1872,7 +1885,11 @@ class GarminHistoryArchive:
                     events_by_year.setdefault(year, {})[event.logical_id] = health_event_record(event)
                 health_events.clear()
                 await self._async_checkpoint_observation(
-                    target, target_key, family_observations, checkpoint
+                    target,
+                    target_key,
+                    family_observations,
+                    checkpoint,
+                    outcome="failed" if "sleep_stream" in failed_families else "written",
                 )
                 for event_metric in ("health_events_daily", "health_events_body_battery"):
                     event_observation = await _async_observe_family(
@@ -1986,7 +2003,11 @@ class GarminHistoryArchive:
                         self._fit_archives.setdefault(year, {})[activity.logical_id] = fit_result
                         fit_count += 1
                 await self._async_checkpoint_observation(
-                    target, target_key, family_observations, checkpoint
+                    target,
+                    target_key,
+                    family_observations,
+                    checkpoint,
+                    outcome="failed" if "sleep_stream" in failed_families else "written",
                 )
                 self._remember_date_reconciliation_observation(target_key, family_observations)
                 if failed_families:

@@ -550,6 +550,83 @@ async def test_partial_structured_failure_retains_observed_records_and_stays_ope
 
 
 @pytest.mark.asyncio
+async def test_sleep_stream_failure_recovery_requires_unchanged_confirmation() -> None:
+    """A recovered sleep stream needs one later unchanged observation."""
+    target = date(2026, 8, 4)
+    store = _reconciliation_store(target)
+    sleep_details = (
+        SleepSession(
+            "sleep-id",
+            "main_sleep",
+            datetime(2026, 8, 4, 0, tzinfo=UTC),
+            datetime(2026, 8, 4, 8, tzinfo=UTC),
+            target,
+            "sleep-revision",
+            {},
+            (),
+            (),
+            (),
+            streams=(
+                SleepStream(
+                    "heart_rate",
+                    (
+                        SleepStreamPoint(
+                            datetime(2026, 8, 4, 1, tzinfo=UTC),
+                            "2026-08-04T01:00:00Z",
+                            60.0,
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    class SleepFailureSource(ReconciliationSource):
+        async def async_fetch_details(self, target_date: date, metric: str) -> object:
+            if metric == "sleep_sessions" and target_date == target:
+                return sleep_details
+            return await super().async_fetch_details(target_date, metric)
+
+    source = SleepFailureSource({})
+    failed = True
+
+    async def write(statistic_id: str, metadata: Any, samples: object) -> RecorderWriteOutcome:
+        nonlocal failed
+        if failed and ":sleep_" in statistic_id:
+            failed = False
+            return RecorderWriteOutcome(0, "failed", "writer")
+        return RecorderWriteOutcome(0)
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(side_effect=write)
+    timer = DeterministicTimer()
+    archive = _enabled_reconciliation_archive(
+        store,
+        source,
+        [datetime(2026, 8, 5, tzinfo=UTC)],
+        timer,
+        recorder=recorder,
+    )
+
+    await archive.async_start()
+    await _wait_for_remote_requests(source, 19)
+    await _run_reconciliation_cycle(archive, timer, source)
+    failed_requests = source.requested.count(target)
+
+    await _run_reconciliation_cycle(archive, timer, source)
+    recovered_requests = source.requested.count(target)
+    assert recovered_requests > failed_requests
+
+    await _run_reconciliation_cycle(archive, timer, source)
+    confirmed_requests = source.requested.count(target)
+    assert confirmed_requests > recovered_requests
+
+    await _run_reconciliation_cycle(archive, timer, source)
+    assert source.requested.count(target) == confirmed_requests
+    await archive.async_stop()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("failure_metric", "failure_kind"),
     (("heart_rate", "http"), ("health_events_daily", "schema"), ("body_battery", "family")),
