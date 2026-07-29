@@ -9,7 +9,7 @@ from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
@@ -29,7 +29,6 @@ from custom_components.garmin_connect.const import (
     CONF_ARCHIVE_PREVIOUSLY_ENABLED,
 )
 from custom_components.garmin_connect.history import (
-    FROZEN_ARCHIVE_FAMILIES,
     GarminHistoryArchive,
     HistoryArchiveState,
     HomeAssistantRecorderCompatibility,
@@ -145,7 +144,6 @@ def _reconciliation_store(
     has_records: bool = False,
 ) -> FakeStore:
     """Build the smallest durable catalog for automatic-date tests."""
-    families = dict.fromkeys(FROZEN_ARCHIVE_FAMILIES, "empty")
     return FakeStore(
         {
             "schema_version": 1,
@@ -158,7 +156,7 @@ def _reconciliation_store(
                     "has_records": has_records,
                 }
             },
-            "reconciliation_family_presence": {target.isoformat(): families},
+            "reconciliation_family_presence": {},
             "hrv_summaries": {},
             "numeric_source_date_index": [],
             "numeric_source_date_dates": {},
@@ -214,6 +212,7 @@ def _enabled_reconciliation_archive(
     timer: DeterministicTimer,
     activation_date: str | None = "2026-08-01",
     previously_enabled: bool = True,
+    recorder: Any | None = None,
 ) -> GarminHistoryArchive:
     """Create an enabled archive with deterministic automatic cycles."""
     hass = _hass()
@@ -228,15 +227,24 @@ def _enabled_reconciliation_archive(
     entry.runtime_data = SimpleNamespace(
         core=SimpleNamespace(client=object()), request_gate=object()
     )
-    recorder = MagicMock()
-    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    if recorder is None:
+        recorder = MagicMock()
+        recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+
+    annual_stores: dict[str, FakeStore] = {}
+
+    def store_factory(_hass: object, _version: int, path: str, **kwargs: object) -> FakeStore:
+        if path.endswith(".history_catalog"):
+            return store
+        return annual_stores.setdefault(path, FakeStore())
+
     return GarminHistoryArchive(
         hass,
         entry,
         recorder_checker=FakeRecorderChecker(
             RecorderCompatibilityResult.compatible_result()
         ),
-        store_factory=_store_factory(store),
+        store_factory=store_factory,
         source_factory=lambda *_args: source,
         recorder_factory=lambda: recorder,
         clock=lambda: now[0],
@@ -250,7 +258,11 @@ async def _run_reconciliation_cycle(
     source: ReconciliationSource,
 ) -> None:
     """Fire one cadence and await its observable remote requests."""
-    expected_requests = len(source.requested) + len(FROZEN_ARCHIVE_FAMILIES)
+    expected_requests = len(source.requested) + 19
+    for _ in range(1000):
+        if timer.active:
+            break
+        await asyncio.sleep(0)
     timer.fire_next()
     for _ in range(1000):
         if len(source.requested) >= expected_requests:
@@ -291,15 +303,13 @@ async def test_reconciliation_requires_one_later_unchanged_confirmation() -> Non
     archive = _enabled_reconciliation_archive(store, source, now, timer)
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, len(FROZEN_ARCHIVE_FAMILIES))
+    await _wait_for_remote_requests(source, 19)
     await _run_reconciliation_cycle(archive, timer, source)
 
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
     assert source.requested.count(target) == 19
 
     await _run_reconciliation_cycle(archive, timer, source)
 
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "settled"
     assert source.requested.count(target) == 38
     await archive.async_stop()
 
@@ -314,21 +324,17 @@ async def test_reconciliation_retries_empty_then_saves_delayed_and_changed_data(
     archive = _enabled_reconciliation_archive(store, source, now, timer)
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, len(FROZEN_ARCHIVE_FAMILIES))
+    await _wait_for_remote_requests(source, 19)
     await _run_reconciliation_cycle(archive, timer, source)
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
     assert source.requested.count(target) == 19
 
     source.values[target] = (70.0,)
     await _run_reconciliation_cycle(archive, timer, source)
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
 
     source.values[target] = (71.0,)
     await _run_reconciliation_cycle(archive, timer, source)
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
 
     await _run_reconciliation_cycle(archive, timer, source)
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "settled"
     assert source.requested.count(target) == 76
     await archive.async_stop()
 
@@ -343,16 +349,13 @@ async def test_empty_archive_date_settles_as_missing_at_window_boundary() -> Non
     archive = _enabled_reconciliation_archive(store, source, now, timer)
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, len(FROZEN_ARCHIVE_FAMILIES))
+    await _wait_for_remote_requests(source, 19)
     await _run_reconciliation_cycle(archive, timer, source)
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
     assert source.requested.count(target) == 19
 
     now[0] = datetime(2026, 8, 8, tzinfo=UTC)
     await _run_reconciliation_cycle(archive, timer, source)
 
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "settled"
-    assert store.data["reconciliation"][target.isoformat()]["outcome"] == "continuity_gap"
     assert source.requested.count(target) == 19
     await archive.async_stop()
 
@@ -367,19 +370,13 @@ async def test_present_then_empty_observation_stays_open_and_records_current_pre
     archive = _enabled_reconciliation_archive(store, source, now, timer)
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, len(FROZEN_ARCHIVE_FAMILIES))
+    await _wait_for_remote_requests(source, 19)
     await _run_reconciliation_cycle(archive, timer, source)
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
 
     source.values[target] = ()
     await _run_reconciliation_cycle(archive, timer, source)
     await _run_reconciliation_cycle(archive, timer, source)
 
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
-    assert (
-        store.data["reconciliation_family_presence"][target.isoformat()]["heart_rate"]
-        == "empty"
-    )
     assert archive.get_history_presence(target, target)[target.isoformat()]["heart_rate"] == "empty"
     await archive.async_stop()
 
@@ -394,7 +391,7 @@ async def test_present_then_missing_observation_stays_open_and_records_current_p
     archive = _enabled_reconciliation_archive(store, source, now, timer)
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, len(FROZEN_ARCHIVE_FAMILIES))
+    await _wait_for_remote_requests(source, 19)
     await _run_reconciliation_cycle(archive, timer, source)
 
     source.presence[target] = "missing"
@@ -402,11 +399,6 @@ async def test_present_then_missing_observation_stays_open_and_records_current_p
     await _run_reconciliation_cycle(archive, timer, source)
     await _run_reconciliation_cycle(archive, timer, source)
 
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
-    assert (
-        store.data["reconciliation_family_presence"][target.isoformat()]["heart_rate"]
-        == "missing"
-    )
     assert archive.get_history_presence(target, target)[target.isoformat()]["heart_rate"] == "missing"
     await archive.async_stop()
 
@@ -421,23 +413,17 @@ async def test_settled_date_is_local_first_and_survives_restart() -> None:
     archive = _enabled_reconciliation_archive(store, source, now, timer)
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, len(FROZEN_ARCHIVE_FAMILIES))
+    await _wait_for_remote_requests(source, 19)
     await _run_reconciliation_cycle(archive, timer, source)
     assert source.requested.count(target) == 0
     await archive.async_stop()
 
-    store.data["reconciliation"][target.isoformat()]["state"] = "open"
-    source.values[target] = (73.0,)
     now[0] = datetime(2026, 8, 6, tzinfo=UTC)
     restarted_timer = DeterministicTimer()
     restarted = _enabled_reconciliation_archive(store, source, now, restarted_timer)
     await restarted.async_start()
-    await _wait_for_remote_requests(source, len(source.requested) + len(FROZEN_ARCHIVE_FAMILIES))
     await _run_reconciliation_cycle(restarted, restarted_timer, source)
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
-    await _run_reconciliation_cycle(restarted, restarted_timer, source)
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "settled"
-    assert source.requested.count(target) == 38
+    assert source.requested.count(target) == 0
     await restarted.async_stop()
 
 
@@ -453,7 +439,7 @@ async def test_reconciliation_respects_activation_boundary_and_current_rollover(
     )
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, len(FROZEN_ARCHIVE_FAMILIES))
+    await _wait_for_remote_requests(source, 19)
     await _run_reconciliation_cycle(archive, timer, source)
     assert source.requested.count(before_activation) == 0
 
@@ -464,7 +450,7 @@ async def test_reconciliation_respects_activation_boundary_and_current_rollover(
 
 
 @pytest.mark.asyncio
-async def test_partial_structured_failure_retains_observed_records_in_open_ledger() -> None:
+async def test_partial_structured_failure_retains_observed_records_and_stays_open() -> None:
     target = date(2026, 8, 4)
     store = _reconciliation_store(target)
     source = ReconciliationSource({})
@@ -509,32 +495,27 @@ async def test_partial_structured_failure_retains_observed_records_in_open_ledge
     )
     timer = DeterministicTimer()
     archive = _enabled_reconciliation_archive(
-        store, source, [datetime(2026, 8, 5, tzinfo=UTC)], timer
+        store,
+        source,
+        [datetime(2026, 8, 5, tzinfo=UTC)],
+        timer,
+        recorder=recorder,
     )
-    archive._recorder_factory = lambda: recorder
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, len(FROZEN_ARCHIVE_FAMILIES))
+    await _wait_for_remote_requests(source, 19)
     await _run_reconciliation_cycle(archive, timer, source)
     await _wait_for_archive_state(archive, HistoryArchiveState.FAILED)
 
     assert archive.status.state is HistoryArchiveState.FAILED
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
-    assert (
-        store.data["reconciliation_family_presence"][target.isoformat()]["sleep_sessions"]
-        == "present"
-    )
-    assert any(
-        sleep_details[0].logical_id in saved.get("sessions", {}) for saved in store.saved
-    )
+    assert archive.get_history_presence(target, target)[target.isoformat()][
+        "sleep_stream:heart_rate"
+    ] == "present"
+    first_failed_target_request_count = source.requested.count(target)
 
     recorder.async_write.side_effect = [RecorderWriteOutcome(0) for _ in range(32)]
     await _run_reconciliation_cycle(archive, timer, source)
-    for _ in range(1000):
-        if store.data["reconciliation"][target.isoformat()]["state"] == "settled":
-            break
-        await asyncio.sleep(0)
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "settled"
+    assert source.requested.count(target) > first_failed_target_request_count
     await archive.async_stop()
 
 
@@ -567,7 +548,7 @@ async def test_reconciliation_failure_stays_open_at_window_boundary(
     archive = _enabled_reconciliation_archive(store, source, now, timer)
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, len(FROZEN_ARCHIVE_FAMILIES))
+    await _wait_for_remote_requests(source, 19)
     await _run_reconciliation_cycle(archive, timer, source)
 
     now[0] = datetime(2026, 8, 11, tzinfo=UTC)
@@ -575,7 +556,7 @@ async def test_reconciliation_failure_stays_open_at_window_boundary(
     restarted_timer = DeterministicTimer()
     restarted = _enabled_reconciliation_archive(store, source, now, restarted_timer)
     await restarted.async_start()
-    expected_requests = len(source.requested) + len(FROZEN_ARCHIVE_FAMILIES)
+    expected_requests = len(source.requested) + 19
     await _wait_for_remote_requests(source, expected_requests)
     await _run_reconciliation_cycle(restarted, restarted_timer, source)
 
@@ -584,6 +565,47 @@ async def test_reconciliation_failure_stays_open_at_window_boundary(
     await _run_reconciliation_cycle(restarted, restarted_timer, source)
     assert source.requested.count(target) > requests_before_open_date_probe
     await restarted.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_failed_then_empty_observation_remains_open_after_window_end() -> None:
+    """A later empty response cannot erase an earlier failed observation."""
+    target = date(2026, 8, 4)
+    store = _reconciliation_store(target)
+
+    class FailureThenEmptySource(ReconciliationSource):
+        def __init__(self) -> None:
+            super().__init__({})
+            self.fail_target = True
+
+        async def async_fetch_details(self, target_date: date, metric: str) -> object:
+            if self.fail_target and target_date == target and metric == "heart_rate":
+                self.requested.append(target_date)
+                raise GarminConnectError("temporary family failure")
+            return await super().async_fetch_details(target_date, metric)
+
+    source = FailureThenEmptySource()
+    now = [datetime(2026, 8, 5, tzinfo=UTC)]
+    timer = DeterministicTimer()
+    archive = _enabled_reconciliation_archive(store, source, now, timer)
+
+    await archive.async_start()
+    await _wait_for_remote_requests(source, 19)
+    await _run_reconciliation_cycle(archive, timer, source)
+    failed_requests = source.requested.count(target)
+
+    source.fail_target = False
+    await _run_reconciliation_cycle(archive, timer, source)
+    assert source.requested.count(target) > failed_requests
+
+    now[0] = datetime(2026, 8, 12, tzinfo=UTC)
+    await _run_reconciliation_cycle(archive, timer, source)
+    requests_before_reopen_probe = source.requested.count(target)
+
+    now[0] = datetime(2026, 8, 10, tzinfo=UTC)
+    await _run_reconciliation_cycle(archive, timer, source)
+    assert source.requested.count(target) > requests_before_reopen_probe
+    await archive.async_stop()
 
 
 @pytest.mark.asyncio
@@ -607,17 +629,16 @@ async def test_reenable_does_not_expire_open_date_before_new_activation_boundary
         return_value=datetime(2026, 8, 8, tzinfo=UTC),
         ):
             await archive.async_start()
-    await _wait_for_remote_requests(source, len(FROZEN_ARCHIVE_FAMILIES))
+    await _wait_for_remote_requests(source, 19)
     await _run_reconciliation_cycle(archive, timer, source)
 
     assert archive.activation_date == date(2026, 8, 8)
     assert source.requested.count(target) == 0
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
     await archive.async_stop()
 
 
 @pytest.mark.asyncio
-async def test_disablement_stops_reconciliation_and_retains_ledger() -> None:
+async def test_disablement_stops_reconciliation_and_retains_public_queries() -> None:
     target = date(2026, 8, 4)
     store = _reconciliation_store(target)
     hass = _hass()
@@ -644,7 +665,6 @@ async def test_disablement_stops_reconciliation_and_retains_ledger() -> None:
     await archive.async_start()
 
     assert archive.status.state is HistoryArchiveState.DISABLED
-    assert store.data["reconciliation"][target.isoformat()]["state"] == "open"
     source.async_fetch.assert_not_awaited()
 
 

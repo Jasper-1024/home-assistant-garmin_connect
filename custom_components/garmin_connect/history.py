@@ -162,9 +162,7 @@ _STRUCTURED_FAMILIES = (
     "health_events_body_battery",
     "timed_activities",
 )
-# Public catalog seam for release tests and adapters. Reconciliation is an
-# internal consumer of the same frozen family set, not its owner.
-FROZEN_ARCHIVE_FAMILIES = tuple(
+_FROZEN_ARCHIVE_FAMILIES = tuple(
     family for family, _metadata in _NUMERIC_FAMILY_METADATA
 ) + _STRUCTURED_FAMILIES
 _RECONCILIATION_EXPLICIT_EMPTY_STATES = frozenset(
@@ -302,6 +300,9 @@ class _FamilyObservationAccumulator:
         return cls({})
 
     def record(self, family: str, observation: _FamilyObservation) -> None:
+        previous = self.observations.get(family)
+        if previous is not None and previous.presence == "failed":
+            return
         self.observations[family] = observation
 
     def record_failure(self, family: str, error_type: str) -> _FamilyObservation:
@@ -389,13 +390,15 @@ def _safe_family_error_type(error: BaseException) -> str:
 
 def _date_reconciliation_observation(
     accumulator: _FamilyObservationAccumulator,
+    *,
+    family_presence: Mapping[str, str] | None = None,
 ) -> _ReconciliationObservation:
     """Build the date observation used for complete and partial attempts."""
-    family_presence = accumulator.presence
+    family_presence = accumulator.presence if family_presence is None else family_presence
     complete = all(
         family in family_presence
         and family_presence[family] not in _RECONCILIATION_UNAVAILABLE_STATES
-        for family in FROZEN_ARCHIVE_FAMILIES
+        for family in _FROZEN_ARCHIVE_FAMILIES
     )
     return _ReconciliationObservation(
         _fingerprint_details(accumulator.fingerprints),
@@ -405,7 +408,7 @@ def _date_reconciliation_observation(
         and not accumulator.has_records
         and all(
             family_presence[family] in _RECONCILIATION_EXPLICIT_EMPTY_STATES
-            for family in FROZEN_ARCHIVE_FAMILIES
+            for family in _FROZEN_ARCHIVE_FAMILIES
         ),
     )
 
@@ -524,6 +527,17 @@ class _NumericImportResult:
     updated_count: int
     skipped_count: int
     observation: _FamilyObservation
+
+
+@dataclass(slots=True)
+class _StructuredCheckpoint:
+    """Mutable annual structured state carried through one sync date."""
+
+    presence: dict[str, dict[str, str]]
+    sessions_by_year: dict[str, dict[str, dict[str, Any]]]
+    events_by_year: dict[str, dict[str, dict[str, Any]]]
+    activities_by_year: dict[str, dict[str, dict[str, Any]]]
+    dirty_years: set[str]
 
 
 HistoryArchiveClock = Callable[[], datetime]
@@ -1034,9 +1048,12 @@ class GarminHistoryArchive:
         prior_fingerprint = previous.fingerprint if previous else None
         prior_has_records = previous.has_records if previous else False
         if observation is None:
+            outcome = "failed" if report.outcome != "written" else "incomplete"
+            if previous is not None and previous.outcome in {"failed", "incomplete"}:
+                outcome = previous.outcome
             self._reconciliation[key] = _ReconciliationEntry(
                 "open", prior_fingerprint, prior_has_records,
-                "failed" if report.outcome != "written" else "incomplete",
+                cast(Literal["records", "empty", "incomplete", "failed", "continuity_gap"], outcome),
             )
         else:
             has_records = observation.has_records or prior_has_records
@@ -1051,9 +1068,16 @@ class GarminHistoryArchive:
                 outcome = "empty"
             else:
                 outcome = "records"
+            if previous is not None:
+                if previous.outcome == "failed" or outcome == "failed":
+                    outcome = "failed"
+                elif previous.outcome == "incomplete" or outcome == "incomplete":
+                    outcome = "incomplete"
+            evidence_requires_open = outcome in {"failed", "incomplete"}
             if (
                 report.outcome != "written"
                 or is_current_date
+                or evidence_requires_open
                 or not observation.complete
                 or observation.explicit_empty
                 or not observation.has_records
@@ -1080,9 +1104,28 @@ class GarminHistoryArchive:
         target_key: str,
         accumulator: _FamilyObservationAccumulator,
     ) -> None:
-        """Store one date observation and its exact family presence snapshot."""
-        self._reconciliation_family_presence[target_key] = accumulator.presence
-        self._last_reconciliation_observation[target_key] = accumulator.as_date_observation()
+        """Store one observation while retaining prior failure evidence."""
+        previous = self._reconciliation_family_presence.get(target_key, {})
+        current = accumulator.presence
+        merged = dict(previous)
+        merged.update(current)
+        for family, state in previous.items():
+            if state == "failed":
+                merged[family] = state
+        self._reconciliation_family_presence[target_key] = merged
+        self._last_reconciliation_observation[target_key] = _date_reconciliation_observation(
+            accumulator, family_presence=merged
+        )
+
+    async def _async_finalize_observation(
+        self,
+        target_key: str,
+        accumulator: _FamilyObservationAccumulator,
+        checkpoint: _StructuredCheckpoint,
+    ) -> None:
+        """Publish one observation and the structured records it made durable."""
+        self._remember_date_reconciliation_observation(target_key, accumulator)
+        await self._async_persist_observed_structured_records(checkpoint)
 
     async def _async_expire_empty_reconciliation_dates(self, current: date) -> None:
         """Settle empty Open Archive Dates that reached the window boundary."""
@@ -1098,11 +1141,11 @@ class GarminHistoryArchive:
                 and not record.has_records
                 and isinstance(record.fingerprint, str)
                 and set(self._reconciliation_family_presence.get(key, {}))
-                == set(FROZEN_ARCHIVE_FAMILIES)
+                == set(_FROZEN_ARCHIVE_FAMILIES)
                 and all(
                     self._reconciliation_family_presence[key][family]
                     in _RECONCILIATION_EXPLICIT_EMPTY_STATES
-                    for family in FROZEN_ARCHIVE_FAMILIES
+                    for family in _FROZEN_ARCHIVE_FAMILIES
                 )
                 and current - target >= _RECONCILIATION_WINDOW
             ):
@@ -1524,9 +1567,22 @@ class GarminHistoryArchive:
         inserted = 0
         updated = 0
         health_events: list[NormalizedHealthEvent] = []
-        presence = {key: dict(value) for key, value in self._presence.items()}
-        sleep_sessions = {year: dict(records) for year, records in self._sleep_sessions.items()}
-        structured_dirty_years: set[str] = set()
+        checkpoint = _StructuredCheckpoint(
+            presence={key: dict(value) for key, value in self._presence.items()},
+            sessions_by_year={
+                year: dict(records) for year, records in self._sleep_sessions.items()
+            },
+            events_by_year={
+                year: dict(records) for year, records in self._health_events.items()
+            },
+            activities_by_year={
+                year: dict(records) for year, records in self._activities.items()
+            },
+            dirty_years=set(),
+        )
+        presence = checkpoint.presence
+        sleep_sessions = checkpoint.sessions_by_year
+        structured_dirty_years = checkpoint.dirty_years
         self._status = HistoryStatus(HistoryArchiveState.SYNCING, **self._backfill_status_fields())
         for offset in range((end_date - start_date).days + 1):
             target = start_date.fromordinal(start_date.toordinal() + offset)
@@ -1546,8 +1602,14 @@ class GarminHistoryArchive:
                 failed_family_error = "sync_failed"
                 numeric_write_failed = False
                 family_observations = _FamilyObservationAccumulator.create()
-                events_by_year = {year: dict(records) for year, records in self._health_events.items()}
-                activities_by_year = {year: dict(records) for year, records in self._activities.items()}
+                events_by_year = {
+                    year: dict(records) for year, records in self._health_events.items()
+                }
+                activities_by_year = {
+                    year: dict(records) for year, records in self._activities.items()
+                }
+                checkpoint.events_by_year = events_by_year
+                checkpoint.activities_by_year = activities_by_year
                 for metric, metadata in metrics:
                     try:
                         metric_result = await self._async_import_numeric_metric(
@@ -1688,13 +1750,8 @@ class GarminHistoryArchive:
                     structured_dirty_years.add(year)
                     events_by_year.setdefault(year, {})[event.logical_id] = health_event_record(event)
                 health_events.clear()
-                self._remember_date_reconciliation_observation(target_key, family_observations)
-                await self._async_persist_observed_structured_records(
-                    presence=presence,
-                    sessions_by_year=sleep_sessions,
-                    events_by_year=events_by_year,
-                    activities_by_year=activities_by_year,
-                    dirty_years=structured_dirty_years,
+                await self._async_finalize_observation(
+                    target_key, family_observations, checkpoint
                 )
                 for event_metric in ("health_events_daily", "health_events_body_battery"):
                     event_observation = await _async_observe_family(
@@ -1719,13 +1776,8 @@ class GarminHistoryArchive:
                         year = str((event.start or event.occurrence or datetime.combine(event.calendar_date, time.min, tzinfo=UTC)).year)
                         structured_dirty_years.add(year)
                         events_by_year.setdefault(year, {})[event.logical_id] = health_event_record(event)
-                    self._remember_date_reconciliation_observation(target_key, family_observations)
-                    await self._async_persist_observed_structured_records(
-                        presence=presence,
-                        sessions_by_year=sleep_sessions,
-                        events_by_year=events_by_year,
-                        activities_by_year=activities_by_year,
-                        dirty_years=structured_dirty_years,
+                    await self._async_finalize_observation(
+                        target_key, family_observations, checkpoint
                     )
                 activity_observation = await _async_observe_family(
                     structured_fetch
@@ -1763,13 +1815,8 @@ class GarminHistoryArchive:
                         "end": activity.end.isoformat() if activity.end else None, "duration_seconds": activity.duration_seconds,
                         "training_effect": activity.training_effect, "load": activity.load, "recovery": activity.recovery,
                     }
-                self._remember_date_reconciliation_observation(target_key, family_observations)
-                await self._async_persist_observed_structured_records(
-                    presence=presence,
-                    sessions_by_year=sleep_sessions,
-                    events_by_year=events_by_year,
-                    activities_by_year=activities_by_year,
-                    dirty_years=structured_dirty_years,
+                await self._async_finalize_observation(
+                    target_key, family_observations, checkpoint
                 )
                 for activity in activity_details:
                     if activity.calendar_date != target:
@@ -1967,13 +2014,7 @@ class GarminHistoryArchive:
                 )
             except (GarminConnectError, AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError) as error:
                 try:
-                    await self._async_persist_observed_structured_records(
-                        presence=presence,
-                        sessions_by_year=sleep_sessions,
-                        events_by_year=events_by_year,
-                        activities_by_year=activities_by_year,
-                        dirty_years=structured_dirty_years,
-                    )
+                    await self._async_persist_observed_structured_records(checkpoint)
                 except (AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError):
                     _LOGGER.warning(
                         "Garmin structured history could not be checkpointed after %s for %s",
@@ -2363,34 +2404,34 @@ class GarminHistoryArchive:
             )
 
     async def _async_persist_observed_structured_records(
-        self,
-        *,
-        presence: Mapping[str, Any],
-        sessions_by_year: Mapping[str, Mapping[str, dict[str, Any]]],
-        events_by_year: Mapping[str, Mapping[str, dict[str, Any]]],
-        activities_by_year: Mapping[str, Mapping[str, dict[str, Any]]],
-        dirty_years: Collection[str],
+        self, checkpoint: _StructuredCheckpoint
     ) -> None:
         """Persist structured records already observed before the next fetch."""
-        if self._store is None or not dirty_years:
+        if self._store is None or not checkpoint.dirty_years:
             return
-        self._sleep_sessions = {year: dict(records) for year, records in sessions_by_year.items()}
-        self._health_events = {year: dict(records) for year, records in events_by_year.items()}
-        self._activities = {year: dict(records) for year, records in activities_by_year.items()}
+        self._sleep_sessions = {
+            year: dict(records) for year, records in checkpoint.sessions_by_year.items()
+        }
+        self._health_events = {
+            year: dict(records) for year, records in checkpoint.events_by_year.items()
+        }
+        self._activities = {
+            year: dict(records) for year, records in checkpoint.activities_by_year.items()
+        }
         await self._async_save_sleep_partitions(
-            sessions_by_year,
-            events_by_year,
-            activities_by_year,
+            checkpoint.sessions_by_year,
+            checkpoint.events_by_year,
+            checkpoint.activities_by_year,
             self._fit_archives,
-            years=dirty_years,
+            years=checkpoint.dirty_years,
         )
         await self._store.async_save(
             self._catalog_record(
                 completed_dates=self._completed_dates,
-                presence=presence,
-                sessions_by_year=sessions_by_year,
-                events_by_year=events_by_year,
-                activities_by_year=activities_by_year,
+                presence=checkpoint.presence,
+                sessions_by_year=checkpoint.sessions_by_year,
+                events_by_year=checkpoint.events_by_year,
+                activities_by_year=checkpoint.activities_by_year,
             )
         )
 
@@ -2950,7 +2991,7 @@ class GarminHistoryArchive:
             for family, state in families.items():
                 if (
                     not isinstance(family, str)
-                    or family not in FROZEN_ARCHIVE_FAMILIES
+                    or family not in _FROZEN_ARCHIVE_FAMILIES
                     or state not in _PRESENCE_STATES
                 ):
                     raise ValueError("Store reconciliation family presence is invalid")
