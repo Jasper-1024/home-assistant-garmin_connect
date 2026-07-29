@@ -36,6 +36,8 @@ from custom_components.garmin_connect.history_sensor import GarminHistoryStatusS
 from custom_components.garmin_connect.history_source import (
     GarminHistorySource,
     NormalizedSample,
+    SegmentedData,
+    SnapshotData,
     SourceSeries,
 )
 from custom_components.garmin_connect.request_gate import (
@@ -246,6 +248,220 @@ async def test_numeric_source_calendar_dates_are_durable_across_restart_and_upse
     assert numeric_store.data["dates"][statistic_id] == {
         "2026-07-24T23:30:00+00:00": "2026-07-25"
     }
+
+
+@pytest.mark.asyncio
+async def test_full_numeric_presence_catalog_survives_restart() -> None:
+    """All current numeric families remain durable, including duplicate totals."""
+    target = date(2026, 7, 24)
+    hass = _hass()
+    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
+    checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
+    store = FakeStore()
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    training_fields = {
+        "acute_load": ("absent", None),
+        "chronic_load": ("absent", None),
+        "load_balance": ("absent", None),
+        "acwr": ("absent", None),
+        "vo2_max": ("absent", None),
+        "fitness_trend": ("absent", None),
+        "recovery_time": ("absent", None),
+    }
+
+    class Source:
+        async def async_fetch_details(self, _request_date: date, metric: str) -> object:
+            if metric in {"sleep_sessions", "health_events_daily", "health_events_body_battery", "timed_activities"}:
+                return ()
+            if metric in {"steps", "floors", "intensity_moderate", "intensity_vigorous"}:
+                total_keys = {
+                    "steps": ("totalSteps",),
+                    "floors": ("floorsAscended", "floorsDescended", "floorsAscendedInMeters", "floorsDescendedInMeters", "totalFloors"),
+                    "intensity_moderate": ("moderateIntensityMinutes", "vigorousIntensityMinutes", "totalIntensityMinutes"),
+                    "intensity_vigorous": ("moderateIntensityMinutes", "vigorousIntensityMinutes", "totalIntensityMinutes"),
+                }[metric]
+                return SegmentedData((), presence="empty", total_presence=dict.fromkeys(total_keys, "absent"))
+            if metric == "daily_summary":
+                return SnapshotData({"abnormal_heart_rate_alerts": ("absent", None)}, datetime.combine(target, datetime.min.time(), tzinfo=UTC), target.isoformat())
+            if metric == "training_status":
+                return SnapshotData(training_fields, datetime.combine(target, datetime.min.time(), tzinfo=UTC), target.isoformat())
+            return SourceSeries((), "empty")
+
+    def make_archive() -> GarminHistoryArchive:
+        return GarminHistoryArchive(
+            hass,
+            entry,
+            recorder_checker=checker,
+            store_factory=_store_factory(store),
+            source_factory=lambda _client, _gate: Source(),
+            recorder_factory=lambda: recorder,
+        )
+
+    archive = make_archive()
+    await archive.async_start()
+    assert (await archive.async_sync_range(target, target)).outcome == "written"
+    assert len(store.data["presence"][target.isoformat()]) == 33
+
+    restarted = make_archive()
+    await restarted.async_start()
+    assert restarted.status.state is HistoryArchiveState.DISABLED
+    assert restarted.get_history_presence(target, target) == archive.get_history_presence(target, target)
+
+
+@pytest.mark.asyncio
+async def test_segmented_totals_are_written_with_provenance_and_revisions() -> None:
+    target = date(2026, 7, 24)
+    hass = _hass()
+    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
+    store = FakeStore()
+    checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
+    writes: list[tuple[str, object, tuple[NormalizedSample, ...]]] = []
+    recorder = MagicMock()
+
+    async def write(statistic_id, metadata, samples):
+        writes.append((statistic_id, metadata, tuple(samples)))
+        return RecorderWriteOutcome(len(samples))
+
+    recorder.async_write = AsyncMock(side_effect=write)
+
+    class Source:
+        def __init__(self) -> None:
+            self.revised = False
+
+        async def async_fetch_details(self, _request_date: date, metric: str) -> object:
+            if metric in {"sleep_sessions", "health_events_daily", "health_events_body_battery", "timed_activities"}:
+                return ()
+            if metric == "steps":
+                return SegmentedData((), {"totalSteps": 0.0}, "empty", {"totalSteps": "present"})
+            if metric == "floors":
+                return SegmentedData((), {"totalFloors": 2.0}, "empty", {"totalFloors": "present"})
+            if metric in {"intensity_moderate", "intensity_vigorous"}:
+                value = 9.0 if self.revised else 7.0
+                return SegmentedData((), {"totalIntensityMinutes": value}, "empty", {"totalIntensityMinutes": "present"})
+            return SourceSeries((), "empty")
+
+    source = Source()
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=checker,
+        store_factory=_store_factory(store),
+        source_factory=lambda _client, _gate: source,
+        recorder_factory=lambda: recorder,
+    )
+    await archive.async_start()
+    assert (await archive.async_sync_range(target, target)).outcome == "written"
+    total_writes = {
+        statistic_id.rsplit(":", 1)[-1]: samples[-1].value
+        for statistic_id, _metadata, samples in writes
+        if samples and statistic_id.rsplit(":", 1)[-1] in {
+            "floors_daily_total", "intensity_daily_total", "steps_daily_total"
+        }
+    }
+    assert total_writes == {
+        "floors_daily_total": 2.0,
+        "intensity_daily_total": 7.0,
+        "steps_daily_total": 0.0,
+    }
+    assert archive.get_history_presence(target, target)[target.isoformat()]["floors:totalFloors"] == "present"
+
+    source.revised = True
+    archive._completed_dates.clear()
+    assert (await archive.async_sync_range(target, target)).outcome == "written"
+    assert any(
+        statistic_id.endswith(":intensity_daily_total") and samples[-1].value == 9.0
+        for statistic_id, _metadata, samples in writes
+    )
+
+
+@pytest.mark.asyncio
+async def test_numeric_manifest_recovery_replays_after_partition_failure() -> None:
+    target = date(2026, 12, 31)
+    hass = _hass()
+    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
+    checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
+    stores: dict[str, FakeStore] = {}
+
+    class FlakyStore(FakeStore):
+        fail_saves = True
+
+        async def async_save(self, data):
+            if self.fail_saves and "numeric_source_dates_" in getattr(self, "path", ""):
+                raise OSError("simulated crash")
+            await super().async_save(data)
+
+    def factory(_hass, _version, path, **kwargs):
+        store = stores.setdefault(path, FlakyStore())
+        store.path = path
+        return store
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+
+    class Source:
+        async def async_fetch_details(self, _request_date: date, metric: str) -> object:
+            if metric in {"sleep_sessions", "health_events_daily", "health_events_body_battery", "timed_activities"}:
+                return ()
+            return SourceSeries((NormalizedSample(datetime(2026, 12, 31, tzinfo=UTC), target, target.isoformat(), 1),), "present")
+
+    def make_archive() -> GarminHistoryArchive:
+        return GarminHistoryArchive(
+            hass, entry, recorder_checker=checker, store_factory=factory,
+            source_factory=lambda _client, _gate: Source(), recorder_factory=lambda: recorder,
+        )
+
+    first = make_archive()
+    await first.async_start()
+    assert (await first.async_sync_range(target, target)).outcome == "failed"
+    assert stores["garmin_connect.entry-1.history_catalog"].data["numeric_source_date_pending"]
+
+    stores["garmin_connect.entry-1.numeric_source_dates_2026"].fail_saves = False
+    restarted = make_archive()
+    await restarted.async_start()
+    assert restarted.status.state is HistoryArchiveState.DISABLED
+    assert target.isoformat() not in restarted._completed_dates
+    assert (await restarted.async_sync_range(target, target)).outcome == "written"
+
+
+@pytest.mark.asyncio
+async def test_malformed_numeric_partition_does_not_abort_archive_startup() -> None:
+    target = date(2026, 7, 24)
+    hass = _hass()
+    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
+    catalog = FakeStore({
+        "schema_version": 1,
+        "account_key": "opaque-account-key-123",
+        "completed_dates": [target.isoformat()],
+        "hrv_summaries": {},
+        "numeric_source_date_index": ["2026"],
+        "numeric_source_date_dates": {"2026": [target.isoformat()]},
+        "numeric_source_date_pending": {},
+        "presence": {},
+        "sleep_index": {},
+        "event_index": {},
+        "activity_index": {},
+    })
+    stores = {
+        "garmin_connect.entry-1.history_catalog": catalog,
+        "garmin_connect.entry-1.numeric_source_dates_2026": FakeStore({"corrupt": True}),
+    }
+
+    def factory(_hass, _version, path, **kwargs):
+        return stores.setdefault(path, FakeStore())
+
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=factory,
+    )
+    await archive.async_start()
+
+    assert archive.status.state is HistoryArchiveState.DISABLED
+    assert target.isoformat() not in archive._completed_dates
+    assert target.isoformat() in archive._numeric_source_date_replay_dates
+    assert catalog.data["numeric_source_date_pending"]["2026"] == [target.isoformat()]
 
 
 def test_history_status_and_archive_metadata_use_one_public_contract() -> None:

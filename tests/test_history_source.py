@@ -216,18 +216,17 @@ async def test_top_level_heart_rate_and_stress_lists_are_normalized(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("metric", ["heart_rate", "stress"])
-async def test_null_and_unsupported_intraday_payloads_remain_source_series(metric: str) -> None:
+async def test_null_intraday_payloads_remain_source_series(metric: str) -> None:
     client = MagicMock()
     client._base_url = "https://garmin.example"
     client.get_user_profile = AsyncMock(return_value=MagicMock(display_name="user"))
     source = GarminHistorySource(client, _ImmediateGate())
 
-    for payload, expected_presence in ((None, "null"), ("unsupported", "unsupported")):
-        client._request = AsyncMock(return_value=payload)
-        result = await source.async_fetch_details(date(2026, 7, 24), metric)
-        assert isinstance(result, SourceSeries)
-        assert result.readings == ()
-        assert result.presence == expected_presence
+    client._request = AsyncMock(return_value=None)
+    result = await source.async_fetch_details(date(2026, 7, 24), metric)
+    assert isinstance(result, SourceSeries)
+    assert result.readings == ()
+    assert result.presence == "null"
 
 
 @pytest.mark.asyncio
@@ -247,6 +246,22 @@ async def test_malformed_known_intraday_payload_fails_closed(metric: str, payloa
 
     with pytest.raises(HistorySchemaError):
         await source.async_fetch_details(date(2026, 7, 24), metric)
+
+
+@pytest.mark.parametrize(
+    ("normalizer", "args"),
+    [
+        (normalize_steps, ()),
+        (normalize_floors, ()),
+        (normalize_intensity, ("moderate",)),
+        (normalize_respiration, ()),
+        (normalize_spo2, ("single",)),
+    ],
+)
+def test_known_numeric_scalar_payloads_fail_closed(normalizer, args) -> None:
+    """A malformed scalar cannot become an unsupported completed family."""
+    with pytest.raises(HistorySchemaError):
+        normalizer("malformed", date(2026, 7, 24), *args)
 
 
 def test_snapshot_aliases_prefer_non_null_values() -> None:
@@ -435,7 +450,6 @@ async def test_top_level_list_body_battery_is_present() -> None:
         ([], "empty"),
         ({}, "missing"),
         ({"status": "returned-empty"}, "returned-empty"),
-        ("unsupported", "unsupported"),
     ],
 )
 def test_segmented_payload_presence_states_are_bounded(payload, expected_presence) -> None:
@@ -474,6 +488,20 @@ def test_segmented_rows_are_not_daily_totals_and_total_presence_is_distinct() ->
     assert null_total.total_presence == {"totalSteps": "null"}
     assert zero_total.totals == {"totalSteps": 0.0}
     assert zero_total.total_presence == {"totalSteps": "present"}
+
+
+def test_known_segmented_totals_preserve_zero_null_and_revision_values() -> None:
+    target = date(2026, 7, 24)
+    first = normalize_floors({"summary": {"totalFloors": 0}}, target)
+    intensity = normalize_intensity(
+        {"summary": {"totalIntensityMinutes": None}}, target, "moderate"
+    )
+    revised = normalize_floors({"summary": {"totalFloors": 3}}, target)
+
+    assert first.totals == {"totalFloors": 0.0}
+    assert first.total_presence["totalFloors"] == "present"
+    assert intensity.total_presence["totalIntensityMinutes"] == "null"
+    assert revised.totals == {"totalFloors": 3.0}
 
 
 def test_floors_and_intensity_keep_distinct_semantics() -> None:
@@ -550,7 +578,6 @@ def test_respiration_and_spo2_fixture_variants_preserve_revisions_and_sparse_ser
     assert normalize_respiration({"respirationValuesArray": []}, date(2026, 7, 24)).presence == "empty"
     assert normalize_respiration({}, date(2026, 7, 24)).presence == "missing"
     assert normalize_respiration([], date(2026, 7, 24)).presence == "empty"
-    assert normalize_respiration("unsupported", date(2026, 7, 24)).presence == "unsupported"
     assert normalize_respiration({"status": "returned-empty"}, date(2026, 7, 24)).presence == "returned-empty"
 
 

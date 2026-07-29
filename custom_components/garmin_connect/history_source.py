@@ -532,7 +532,7 @@ def _classify_source_array(payload: Any, aliases: tuple[str, ...]) -> tuple[str,
     if isinstance(payload, list):
         return ("empty" if not payload else "present"), payload, None
     if not isinstance(payload, dict):
-        return "unsupported", None, None
+        raise HistorySchemaError("known numeric payload is not an object or array")
     marker = _nested_value(payload, ("presence", "state", "status", "availability"))
     if marker is not None and isinstance(marker[0], str) and marker[0].lower() == "returned-empty":
         return "returned-empty", None, None
