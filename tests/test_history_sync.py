@@ -13,6 +13,7 @@ from custom_components.garmin_connect import history as history_module
 from custom_components.garmin_connect.calendar import (
     GarminActivityCalendar,
     GarminHealthEventsCalendar,
+    GarminSleepCalendar,
 )
 from custom_components.garmin_connect.const import CONF_ARCHIVE_ENABLED
 from custom_components.garmin_connect.fit_archive import fit_file_name
@@ -597,6 +598,92 @@ async def test_numeric_family_failure_does_not_block_other_families_or_checkpoin
         "steps_daily_total",
         "daily_abnormal_heart_rate_alerts",
     }
+
+
+@pytest.mark.asyncio
+async def test_numeric_failure_still_persists_structured_records_for_calendars() -> None:
+    target = date(2026, 7, 24)
+    session = parse_sleep_sessions(
+        {
+            "startTime": "2026-07-24T23:00:00Z",
+            "endTime": "2026-07-25T07:00:00Z",
+        },
+        target,
+    )[0]
+    health_event = normalize_health_events(
+        {
+            "events": [
+                {
+                    "source": "MOVE_IQ",
+                    "type": "walking",
+                    "category": "activity",
+                    "startTime": "2026-07-24T10:00:00Z",
+                    "endTime": "2026-07-24T10:15:00Z",
+                }
+            ]
+        },
+        target,
+    )[0]
+    activity = normalize_activities(
+        [
+            {
+                "activityId": 321,
+                "activityType": "running",
+                "activityName": "Failure-isolated run",
+                "startTime": "2026-07-24T12:00:00Z",
+                "durationInSeconds": 1800,
+            }
+        ],
+        target,
+    )[0]
+
+    class Source:
+        async def async_fetch_details(self, _target: date, metric: str) -> object:
+            if metric == "heart_rate":
+                raise ValueError("injected numeric family failure")
+            if metric == "sleep_sessions":
+                return (session,)
+            if metric == "health_events_daily":
+                return (health_event,)
+            if metric == "timed_activities":
+                return (activity,)
+            return ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    stores: dict[str, _NamedStore] = {}
+    archive = _partition_archive(Source(), recorder, stores)
+    await archive.async_start()
+
+    report = await archive.async_sync_range(target, target)
+
+    assert report.outcome == "failed"
+    assert report.error_type == "sync_failed"
+    partition = stores["garmin_connect.e.sleep_2026"].data
+    assert session.logical_id in partition["sessions"]
+    assert health_event.logical_id in partition["events"]
+    assert activity.logical_id in partition["activities"]
+    assert len(
+        await GarminSleepCalendar(archive, "e").async_get_events(
+            MagicMock(),
+            datetime(2026, 7, 24, tzinfo=UTC),
+            datetime(2026, 7, 26, tzinfo=UTC),
+        )
+    ) == 1
+    assert len(
+        await GarminHealthEventsCalendar(archive, "e").async_get_events(
+            MagicMock(),
+            datetime(2026, 7, 24, tzinfo=UTC),
+            datetime(2026, 7, 25, tzinfo=UTC),
+        )
+    ) == 1
+    assert len(
+        await GarminActivityCalendar(archive, "e").async_get_events(
+            MagicMock(),
+            datetime(2026, 7, 24, tzinfo=UTC),
+            datetime(2026, 7, 25, tzinfo=UTC),
+        )
+    ) == 1
 
 
 @pytest.mark.asyncio

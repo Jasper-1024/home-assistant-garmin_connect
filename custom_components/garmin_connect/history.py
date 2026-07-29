@@ -1221,13 +1221,20 @@ class GarminHistoryArchive:
                 if failed_families:
                     await self._async_save_numeric_source_manifest()
                     await self._async_save_numeric_source_partitions()
+                    await self._async_save_sleep_partitions(
+                        sleep_sessions,
+                        events_by_year,
+                        activities_by_year,
+                        self._fit_archives,
+                        years=sleep_dirty_years,
+                    )
                     await store.async_save(
                         self._catalog_record(
                             completed_dates=self._completed_dates,
                             presence=presence,
-                            sessions_by_year=self._sleep_sessions,
-                            events_by_year=self._health_events,
-                            activities_by_year=self._activities,
+                            sessions_by_year=sleep_sessions,
+                            events_by_year=events_by_year,
+                            activities_by_year=activities_by_year,
                         )
                     )
                     self._presence = presence
