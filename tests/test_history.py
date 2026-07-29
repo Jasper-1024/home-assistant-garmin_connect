@@ -585,6 +585,96 @@ async def test_empty_numeric_replay_persists_tombstone_before_clearing_pending()
 
 
 @pytest.mark.asyncio
+async def test_cross_year_numeric_source_date_catalog_tombstone_restarts() -> None:
+    """Source-date tombstones are keyed by Source Instant UTC year."""
+    source_date = date(2027, 1, 1)
+    instant_year = "2026"
+    catalog = FakeStore({
+        "schema_version": 1,
+        "account_key": "opaque-account-key-123",
+        "completed_dates": [source_date.isoformat()],
+        "hrv_summaries": {},
+        "numeric_source_date_index": [instant_year],
+        "numeric_source_date_dates": {instant_year: [source_date.isoformat()]},
+        "numeric_source_date_pending": {},
+        "numeric_source_date_outbox": {},
+        "numeric_source_date_tombstones": {instant_year: [source_date.isoformat()]},
+        "presence": {},
+        "sleep_index": {},
+        "event_index": {},
+        "activity_index": {},
+    })
+    stores = {"garmin_connect.entry-1.history_catalog": catalog}
+
+    def factory(_hass, _version, path, **kwargs):
+        return stores.setdefault(path, FakeStore())
+
+    archive = GarminHistoryArchive(
+        _hass(),
+        _entry(data={"history_account_key": "opaque-account-key-123"}),
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=factory,
+    )
+    await archive.async_start()
+
+    assert archive.status.state is HistoryArchiveState.DISABLED
+    assert source_date.isoformat() in archive._completed_dates
+    assert source_date.isoformat() not in archive._numeric_source_date_replay_dates
+
+
+@pytest.mark.asyncio
+async def test_cross_year_numeric_source_date_partition_tombstone_restarts() -> None:
+    """Partition tombstones recover source dates crossing the UTC year boundary."""
+    source_date = date(2027, 1, 1)
+    instant_year = "2026"
+    catalog = FakeStore({
+        "schema_version": 1,
+        "account_key": "opaque-account-key-123",
+        "completed_dates": [source_date.isoformat()],
+        "hrv_summaries": {},
+        "numeric_source_date_index": [instant_year],
+        "numeric_source_date_dates": {instant_year: [source_date.isoformat()]},
+        "numeric_source_date_pending": {instant_year: [source_date.isoformat()]},
+        "numeric_source_date_outbox": {},
+        "presence": {},
+        "sleep_index": {},
+        "event_index": {},
+        "activity_index": {},
+    })
+    partition = FakeStore({
+        "schema_version": 1,
+        "account_key": "opaque-account-key-123",
+        "year": instant_year,
+        "dates": {},
+        "tombstones": [source_date.isoformat()],
+    })
+    stores = {
+        "garmin_connect.entry-1.history_catalog": catalog,
+        f"garmin_connect.entry-1.numeric_source_dates_{instant_year}": partition,
+    }
+
+    def factory(_hass, _version, path, **kwargs):
+        return stores.setdefault(path, FakeStore())
+
+    archive = GarminHistoryArchive(
+        _hass(),
+        _entry(data={"history_account_key": "opaque-account-key-123"}),
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=factory,
+    )
+    await archive.async_start()
+
+    assert archive.status.state is HistoryArchiveState.DISABLED
+    assert source_date.isoformat() in archive._completed_dates
+    assert source_date.isoformat() not in archive._numeric_source_date_replay_dates
+    assert catalog.data is not None
+    assert catalog.data["numeric_source_date_tombstones"] == {
+        instant_year: [source_date.isoformat()]
+    }
+    assert catalog.data["numeric_source_date_pending"] == {}
+
+
+@pytest.mark.asyncio
 async def test_numeric_partition_replay_is_date_scoped_and_empty_retries_settle() -> None:
     first_date = date(2026, 7, 24)
     second_date = date(2026, 7, 25)

@@ -1251,15 +1251,15 @@ class GarminHistoryArchive:
                         pending.difference_update(source_dates)
                         if not pending:
                             self._numeric_source_date_pending.pop(year, None)
-                    statistics = self._numeric_source_date_outbox.get(year)
-                    if statistics is not None:
-                        for statistic_id, instants in tuple(statistics.items()):
+                    outbox_statistics = self._numeric_source_date_outbox.get(year)
+                    if outbox_statistics is not None:
+                        for statistic_id, instants in tuple(outbox_statistics.items()):
                             for instant, source_date in tuple(instants.items()):
                                 if source_date in source_dates:
                                     del instants[instant]
                             if not instants:
-                                del statistics[statistic_id]
-                        if not statistics:
+                                del outbox_statistics[statistic_id]
+                        if not outbox_statistics:
                             self._numeric_source_date_outbox.pop(year, None)
                 self._numeric_source_date_replay_dates.difference_update(
                     source_date
@@ -1506,7 +1506,7 @@ class GarminHistoryArchive:
                     raise ValueError("numeric source-date partition is invalid")
                 for item in raw_tombstones:
                     parsed = date.fromisoformat(item)
-                    if parsed.isoformat() != item or parsed.year != int(year) or parsed < _HISTORY_MIN_DATE:
+                    if parsed.isoformat() != item or parsed < _HISTORY_MIN_DATE:
                         raise ValueError("numeric source-date partition is invalid")
                     self._numeric_source_date_tombstones.setdefault(year, set()).add(item)
                     affected_dates.discard(item)
@@ -1531,6 +1531,7 @@ class GarminHistoryArchive:
                                 or parsed_instant.astimezone(UTC).isoformat() != instant
                                 or parsed_instant.astimezone(UTC).year != int(year)
                                 or parsed_date.isoformat() != source_date
+                                or parsed_date < _HISTORY_MIN_DATE
                             ):
                                 raise ValueError
                         except (TypeError, ValueError):
@@ -1919,6 +1920,7 @@ class GarminHistoryArchive:
                     or parsed_instant.utcoffset() is None
                     or parsed_instant.astimezone(UTC).isoformat() != instant
                     or parsed_date.isoformat() != source_date
+                    or parsed_date < _HISTORY_MIN_DATE
                 ):
                     raise ValueError("Store numeric source-date catalog is invalid")
                 parsed_instants[instant] = source_date
@@ -1970,6 +1972,7 @@ class GarminHistoryArchive:
                         or parsed_instant.astimezone(UTC).isoformat() != instant
                         or parsed_instant.astimezone(UTC).year != int(year)
                         or parsed_date.isoformat() != source_date
+                        or parsed_date < _HISTORY_MIN_DATE
                     ):
                         raise ValueError("Store numeric source-date outbox is invalid")
                     restored_instants[instant] = source_date
@@ -2010,12 +2013,18 @@ class GarminHistoryArchive:
         for year, dates in raw_numeric_pending.items():
             if not isinstance(year, str) or year not in self._numeric_source_date_years or not isinstance(dates, list):
                 raise ValueError("Store numeric source-date pending state is invalid")
-            self._numeric_source_date_pending[year] = {
-                item for item in dates
-                if isinstance(item, str) and date.fromisoformat(item).isoformat() == item
-            }
-            if len(self._numeric_source_date_pending[year]) != len(dates):
+            parsed_pending_dates: set[str] = set()
+            for item in dates:
+                try:
+                    parsed = date.fromisoformat(item)
+                except (TypeError, ValueError) as err:
+                    raise ValueError("Store numeric source-date pending state is invalid") from err
+                if parsed.isoformat() != item or parsed < _HISTORY_MIN_DATE:
+                    raise ValueError("Store numeric source-date pending state is invalid")
+                parsed_pending_dates.add(item)
+            if len(parsed_pending_dates) != len(dates):
                 raise ValueError("Store numeric source-date pending state is invalid")
+            self._numeric_source_date_pending[year] = parsed_pending_dates
         raw_tombstones = catalog.get("numeric_source_date_tombstones", {})
         if not isinstance(raw_tombstones, Mapping):
             raise ValueError("Store numeric source-date tombstones are invalid")
@@ -2028,7 +2037,7 @@ class GarminHistoryArchive:
                     parsed = date.fromisoformat(item)
                 except (TypeError, ValueError) as err:
                     raise ValueError("Store numeric source-date tombstones are invalid") from err
-                if parsed.isoformat() != item or parsed < _HISTORY_MIN_DATE or parsed.year != int(year):
+                if parsed.isoformat() != item or parsed < _HISTORY_MIN_DATE:
                     raise ValueError("Store numeric source-date tombstones are invalid")
                 parsed_tombstones.add(item)
             self._numeric_source_date_tombstones[year] = parsed_tombstones
