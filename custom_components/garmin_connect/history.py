@@ -10,6 +10,7 @@ from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, timezone
 from enum import StrEnum
+from math import isfinite
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -1748,7 +1749,12 @@ class GarminHistoryArchive:
                     end = datetime.fromisoformat(record["end"]) if record.get("end") else None
                     if end is None:
                         duration = record.get("duration_seconds")
-                        if isinstance(duration, int | float) and not isinstance(duration, bool):
+                        if (
+                            isinstance(duration, int | float)
+                            and not isinstance(duration, bool)
+                            and isfinite(duration)
+                            and duration > 0
+                        ):
                             end = start + timedelta(seconds=duration)
                     if end is None:
                         continue
@@ -1774,8 +1780,12 @@ class GarminHistoryArchive:
                     health_start = datetime.fromisoformat(record["start"]) if record.get("start") else None
                     health_end = datetime.fromisoformat(record["end"]) if record.get("end") else None
                     occurrence = datetime.fromisoformat(record["occurrence"]) if record.get("occurrence") else None
-                    health_start = health_start or occurrence or health_end
-                    health_end = health_end or occurrence or health_start
+                    if health_start is None and health_end is None and occurrence is not None:
+                        health_start = occurrence
+                        health_end = occurrence + timedelta(seconds=1)
+                    else:
+                        health_start = health_start or occurrence or health_end
+                        health_end = health_end or occurrence or health_start
                     if health_start is None or health_end is None:
                         continue
                     source_date: date | None = None

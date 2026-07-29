@@ -1,7 +1,7 @@
 """Focused tests for the manual history synchronization slice."""
 
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -10,6 +10,10 @@ import pytest
 from ha_garmin.exceptions import GarminConnectError
 
 from custom_components.garmin_connect import history as history_module
+from custom_components.garmin_connect.calendar import (
+    GarminActivityCalendar,
+    GarminHealthEventsCalendar,
+)
 from custom_components.garmin_connect.const import CONF_ARCHIVE_ENABLED
 from custom_components.garmin_connect.fit_archive import fit_file_name
 from custom_components.garmin_connect.history import (
@@ -1249,6 +1253,50 @@ async def test_health_events_archive_before_checkpoint_and_calendar_restart():
 
 
 @pytest.mark.asyncio
+async def test_occurrence_only_health_event_is_a_positive_calendar_interval() -> None:
+    occurrence = datetime(2026, 7, 24, 10, 0, tzinfo=UTC)
+    event = normalize_health_events(
+        {
+            "events": [
+                {
+                    "source": "GARMIN",
+                    "type": "abnormalHeartRate",
+                    "occurrenceTime": occurrence.isoformat(),
+                }
+            ]
+        },
+        occurrence.date(),
+    )[0]
+
+    class Source:
+        async def async_fetch_details(self, target, metric):
+            return (event,) if metric == "health_events_daily" else ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    stores = {"garmin_connect.e.history_catalog": _NamedStore()}
+    archive = _partition_archive(Source(), recorder, stores)
+    await archive.async_start()
+    await archive.async_sync_range(occurrence.date(), occurrence.date())
+
+    stored = stores["garmin_connect.e.sleep_2026"].data["events"][event.logical_id]
+    assert stored["start"] is None
+    assert stored["end"] is None
+    assert stored["occurrence"] == occurrence.isoformat()
+
+    calendar = GarminHealthEventsCalendar(archive, "e")
+    events = await calendar.async_get_events(
+        MagicMock(),
+        datetime(2026, 7, 24, tzinfo=UTC),
+        datetime(2026, 7, 25, tzinfo=UTC),
+    )
+
+    assert [(item.start, item.end) for item in events] == [
+        (occurrence, occurrence + timedelta(seconds=1))
+    ]
+
+
+@pytest.mark.asyncio
 async def test_corrupt_or_other_account_event_partition_is_ignored():
     catalog_data = {"account_key": "opaque-account-key-1234567890", "schema_version": 1, "completed_dates": ["2026-07-24"], "hrv_summaries": {}, "presence": {}, "sleep_index": {}, "event_index": {"2026": ["a" * 24]}}
     for partition in (
@@ -1315,12 +1363,51 @@ async def test_activity_calendar_derives_end_from_duration_without_changing_sour
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("duration", [0.0, -1.0, float("nan"), float("inf")])
+async def test_activity_calendar_rejects_non_positive_or_non_finite_duration(
+    duration: float,
+) -> None:
+    activity = normalize_activities(
+        [
+            {
+                "activityId": 125,
+                "activityType": "running",
+                "startTime": "2026-07-24T10:00:00Z",
+                "durationInSeconds": duration,
+            }
+        ],
+        date(2026, 7, 24),
+    )[0]
+
+    class Source:
+        async def async_fetch_details(self, target, metric):
+            return (activity,) if metric == "timed_activities" else ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    stores = {"garmin_connect.e.history_catalog": _NamedStore()}
+    archive = _partition_archive(Source(), recorder, stores)
+    await archive.async_start()
+    await archive.async_sync_range(date(2026, 7, 24), date(2026, 7, 24))
+
+    calendar = GarminActivityCalendar(archive, "e")
+    events = await calendar.async_get_events(
+        MagicMock(),
+        datetime(2026, 7, 24, tzinfo=UTC),
+        datetime(2026, 7, 25, tzinfo=UTC),
+    )
+
+    assert events == []
+
+
+@pytest.mark.asyncio
 async def test_activity_calendar_uses_persisted_source_calendar_date_across_utc_midnight():
     activity = normalize_activities(
         [{
             "activityId": 124,
             "activityType": "running",
             "activityName": "New Year Run",
+            "startTime": "2025-12-31T22:30:00Z",
             "startTimeLocal": "2026-01-01T00:30:00+02:00",
             "endTime": "2025-12-31T22:45:00Z",
         }],

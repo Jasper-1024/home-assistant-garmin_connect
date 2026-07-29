@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from ha_garmin import GarminClient
 
 from custom_components.garmin_connect.history_source import (
     DAILY_SUMMARY_FIELDS,
@@ -158,14 +159,15 @@ def test_normalize_activities_rejects_explicit_event_families() -> None:
 
 
 @pytest.mark.asyncio
-async def test_timed_activity_without_local_date_uses_request_date_across_utc_midnight() -> None:
-    client = MagicMock()
-    client.get_activities = AsyncMock(
+async def test_timed_activity_preserves_ha_garmin_local_date_and_gmt_instant() -> None:
+    client = GarminClient(MagicMock())
+    client._request = AsyncMock(
         return_value=[
             {
                 "activityId": 2,
-                "activityType": "walking",
-                "startTime": datetime(2025, 12, 31, 22, 30, tzinfo=UTC),
+                "activityType": {"typeKey": "walking"},
+                "startTimeGMT": "2025-12-31T22:30:00.000",
+                "startTimeLocal": "2026-01-01T00:30:00.000",
                 "durationInSeconds": 60,
             }
         ]
@@ -175,6 +177,33 @@ async def test_timed_activity_without_local_date_uses_request_date_across_utc_mi
     assert len(result) == 1
     assert result[0].calendar_date == date(2026, 1, 1)
     assert result[0].start == datetime(2025, 12, 31, 22, 30, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_unscoped_activity_without_local_date_uses_source_instant_utc_date() -> None:
+    client = MagicMock()
+    client.get_activities = AsyncMock(
+        return_value=[
+            {
+                "activityId": 3,
+                "activityType": "running",
+                "startTime": datetime(2026, 1, 1, 23, 30, tzinfo=UTC),
+                "durationInSeconds": 60,
+            }
+        ]
+    )
+
+    source = GarminHistorySource(client, _ImmediateGate())
+    wrong_day = await source.async_fetch_details(
+        date(2026, 1, 2), "timed_activities"
+    )
+    utc_day = await source.async_fetch_details(
+        date(2026, 1, 1), "timed_activities"
+    )
+
+    assert wrong_day == ()
+    assert len(utc_day) == 1
+    assert utc_day[0].calendar_date == date(2026, 1, 1)
 
 
 def test_health_event_revision_keeps_identity_and_rejects_bounds() -> None:
@@ -195,6 +224,21 @@ def test_health_event_revision_keeps_identity_and_rejects_bounds() -> None:
 def test_normalize_health_events_keeps_empty_structures_absent() -> None:
     """An empty source structure is not converted into a synthetic event."""
     assert normalize_health_events({"events": [{}]}, date(2026, 7, 24)) == ()
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        [None],
+        [],
+        [{"metadata": "only"}],
+    ],
+)
+def test_abnormal_hr_without_aware_time_remains_absent(values: list) -> None:
+    assert normalize_health_events(
+        {"abnormalHRValuesArray": values}, date(2026, 7, 24)
+    ) == ()
+
 
 def test_normalize_pair_series_rejects_incompatible_known_series() -> None:
     """A changed known field fails only this family/date."""

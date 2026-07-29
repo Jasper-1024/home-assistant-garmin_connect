@@ -317,7 +317,7 @@ async def test_calendar_exposes_instantaneous_health_source_record() -> None:
         (
             "abnormal",
             datetime(2026, 7, 23, 22, 34, 56, tzinfo=UTC),
-            datetime(2026, 7, 23, 22, 34, 56, tzinfo=UTC),
+            datetime(2026, 7, 23, 22, 34, 57, tzinfo=UTC),
         )
     ]
 

@@ -131,7 +131,12 @@ def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedAct
     for item in payload:
         if not isinstance(item, dict):
             raise HistorySchemaError("activity has invalid type")
-        activity_type = item.get("activityType", item.get("activityTypeKey"))
+        raw_activity_type = item.get("activityType", item.get("activityTypeKey"))
+        activity_type = (
+            raw_activity_type.get("typeKey")
+            if isinstance(raw_activity_type, Mapping)
+            else raw_activity_type
+        )
         family_markers = (
             item.get("eventType"),
             item.get("eventTypeKey"),
@@ -169,7 +174,11 @@ def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedAct
             duration_raw = None
         if not isinstance(activity_type, str) or len(activity_type) > 64 or not isinstance(activity_id, (str, int)) or not isinstance(start_raw, (str, int, float, datetime)) or (end_raw is None and duration_raw is None):
             raise HistorySchemaError("activity identity has invalid type")
-        start = _timestamp(start_raw)
+        start = (
+            _timestamp_as_utc(start_raw)
+            if start_key == "startTimeGMT"
+            else _timestamp(start_raw)
+        )
         if start is None:
             raise HistorySchemaError("activity timestamp is invalid")
         end = _timestamp(end_raw) if end_raw is not None else None
@@ -188,13 +197,22 @@ def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedAct
         load = numeric(item, "activityTrainingLoad", "trainingLoad")
         recovery = numeric(item, "recoveryTime")
         logical_id, revision = _activity_hashes(activity_type, str(activity_id), start, end, duration, activity_name, training_effect, load, recovery)
-        local_date = (
-            datetime.fromisoformat(start_raw.replace("Z", "+00:00")).date()
-            if isinstance(start_raw, str) and "T" in start_raw and start_key == "startTimeLocal"
-            else start_raw.date()
-            if isinstance(start_raw, datetime) and start_key == "startTimeLocal"
-            else target_date
-        )
+        local_start = item.get("startTimeLocal")
+        if local_start is None:
+            local_date = start.date()
+        elif isinstance(local_start, datetime):
+            local_date = local_start.date()
+        elif isinstance(local_start, str):
+            try:
+                local_date = datetime.fromisoformat(
+                    local_start.replace("Z", "+00:00")
+                ).date()
+            except ValueError as err:
+                raise HistorySchemaError(
+                    "activity local timestamp is invalid"
+                ) from err
+        else:
+            raise HistorySchemaError("activity local timestamp is invalid")
         result[logical_id] = NormalizedActivity(logical_id, str(activity_id), revision, activity_type, activity_name, start, end, duration, training_effect, load, recovery, local_date)
     return tuple(sorted(result.values(), key=lambda item: (item.start, item.logical_id)))
 
@@ -318,7 +336,7 @@ def normalize_health_events(payload: Any, target_date: date) -> tuple[Normalized
         start = event_time(event, ("startTime", "startTimeGMT", "start"))
         end = event_time(event, ("endTime", "endTimeGMT", "end"))
         occurrence = event_time(event, ("occurrenceTime", "occurrenceTimeGMT", "eventTime", "timestamp", "time"))
-        if all(value is None for value in (source, event_type, category, start, end, occurrence)):
+        if all(value is None for value in (start, end, occurrence)):
             continue
         logical_id, revision = _health_identity_revision(event_type, source, category, start, end, occurrence)
         result[logical_id] = NormalizedHealthEvent(logical_id, revision, target_date, source, event_type, category, start, end, occurrence)
@@ -400,6 +418,23 @@ def _timestamp(value: Any, *, allow_date_only: bool = False) -> datetime | None:
                 return None
             parsed = parsed.replace(tzinfo=UTC)
         return parsed.astimezone(UTC)
+    return None
+
+
+def _timestamp_as_utc(value: Any) -> datetime | None:
+    """Parse a Garmin GMT field whose name supplies the UTC timezone."""
+    parsed = _timestamp(value)
+    if parsed is not None:
+        return parsed
+    if isinstance(value, datetime) and value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
     return None
 
 
