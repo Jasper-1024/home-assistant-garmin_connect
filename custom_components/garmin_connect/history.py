@@ -1008,7 +1008,7 @@ class GarminHistoryArchive:
         health_events: list[NormalizedHealthEvent] = []
         presence = {key: dict(value) for key, value in self._presence.items()}
         sleep_sessions = {year: dict(records) for year, records in self._sleep_sessions.items()}
-        sleep_dirty_years: set[str] = set()
+        structured_dirty_years: set[str] = set()
         self._status = HistoryStatus(HistoryArchiveState.SYNCING, **self._backfill_status_fields())
         for offset in range((end_date - start_date).days + 1):
             target = start_date.fromordinal(start_date.toordinal() + offset)
@@ -1081,13 +1081,13 @@ class GarminHistoryArchive:
                     updated += metric_updated
                     skipped += metric_skipped
                 try:
-                    sleep_descriptor = inspect.getattr_static(source, "async_fetch_details")
+                    structured_descriptor = inspect.getattr_static(source, "async_fetch_details")
                 except AttributeError:
-                    sleep_descriptor = None
-                sleep_fetch = getattr(source, "async_fetch_details", None)
+                    structured_descriptor = None
+                structured_fetch = getattr(source, "async_fetch_details", None)
                 sleep_details = (
-                    await sleep_fetch(target, "sleep_sessions")
-                    if callable(sleep_descriptor) and callable(sleep_fetch)
+                    await structured_fetch(target, "sleep_sessions")
+                    if callable(structured_descriptor) and callable(structured_fetch)
                     else ()
                 )
                 if not isinstance(sleep_details, tuple) or any(not isinstance(item, SleepSession) for item in sleep_details):
@@ -1107,7 +1107,7 @@ class GarminHistoryArchive:
                             failed_family_error = "sleep_stream_invalid"
                 for session in sleep_details:
                     year = str(session.start.year)
-                    sleep_dirty_years.add(year)
+                    structured_dirty_years.add(year)
                     sleep_sessions.setdefault(year, {})[session.logical_id] = session_record(session)
                     for stream in session.streams:
                         if (session.logical_id, stream.metric) in invalid_sleep_streams:
@@ -1156,7 +1156,7 @@ class GarminHistoryArchive:
                         del date_presence[key]
                 date_presence.update(_aggregate_sleep_presence(sleep_sessions, target))
                 for event_metric in ("health_events_daily", "health_events_body_battery"):
-                    event_details = await sleep_fetch(target, event_metric) if callable(sleep_descriptor) and callable(sleep_fetch) else ()
+                    event_details = await structured_fetch(target, event_metric) if callable(structured_descriptor) and callable(structured_fetch) else ()
                     if not isinstance(event_details, tuple) or any(not isinstance(item, NormalizedHealthEvent) for item in event_details):
                         raise ValueError("health event result has invalid shape")
                     health_events.extend(event_details)
@@ -1164,9 +1164,9 @@ class GarminHistoryArchive:
                 activities_by_year = {year: dict(records) for year, records in self._activities.items()}
                 for event in health_events:
                     year = str((event.start or event.occurrence or datetime.combine(event.calendar_date, time.min, tzinfo=UTC)).year)
-                    sleep_dirty_years.add(year)
+                    structured_dirty_years.add(year)
                     events_by_year.setdefault(year, {})[event.logical_id] = health_event_record(event)
-                activity_details = await sleep_fetch(target, "timed_activities") if callable(sleep_descriptor) and callable(sleep_fetch) else ()
+                activity_details = await structured_fetch(target, "timed_activities") if callable(structured_descriptor) and callable(structured_fetch) else ()
                 if not isinstance(activity_details, tuple) or any(not isinstance(item, NormalizedActivity) for item in activity_details):
                     raise ValueError("activity result has invalid shape")
                 fit_count = 0
@@ -1175,7 +1175,7 @@ class GarminHistoryArchive:
                     if activity.calendar_date != target:
                         continue
                     year = str(activity.calendar_date.year)
-                    sleep_dirty_years.add(year)
+                    structured_dirty_years.add(year)
                     activities_by_year.setdefault(year, {})[activity.logical_id] = {
                         "logical_id": activity.logical_id, "activity_id": activity.activity_id, "revision": activity.revision, "calendar_date": activity.calendar_date.isoformat(),
                         "activity_type": activity.activity_type, "name": activity.name, "start": activity.start.isoformat(),
@@ -1208,7 +1208,7 @@ class GarminHistoryArchive:
                         events_by_year,
                         activities_by_year,
                         self._fit_archives,
-                        years=sleep_dirty_years,
+                        years=structured_dirty_years,
                     )
                     await store.async_save(
                         self._catalog_record(
@@ -1251,7 +1251,7 @@ class GarminHistoryArchive:
                     events_by_year,
                     activities_by_year,
                     self._fit_archives,
-                    years=sleep_dirty_years,
+                    years=structured_dirty_years,
                 )
                 self._sleep_sessions = sleep_sessions
                 self._health_events = events_by_year
