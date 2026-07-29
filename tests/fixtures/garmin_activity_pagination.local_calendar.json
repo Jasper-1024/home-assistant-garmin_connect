@@ -1,0 +1,20 @@
+{
+  "local_activity": {
+    "activityId": "local-day-1",
+    "activityType": "running",
+    "activityName": "Local calendar activity",
+    "startTime": "2025-12-31T23:30:00Z",
+    "startTimeLocal": "2026-01-01T07:30:00+08:00",
+    "endTime": "2026-01-01T00:30:00Z",
+    "durationInSeconds": 3600
+  },
+  "following_activity": {
+    "activityId": "local-day-2",
+    "activityType": "cycling",
+    "activityName": "Following local calendar activity",
+    "startTime": "2025-12-31T23:45:00Z",
+    "startTimeLocal": "2026-01-01T06:30:00+08:00",
+    "endTime": "2026-01-01T00:45:00Z",
+    "durationInSeconds": 3600
+  }
+}

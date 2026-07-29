@@ -208,6 +208,35 @@ async def test_timed_activity_pagination_parses_naive_gmt_page_dates() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_timed_activity_pagination_prioritizes_raw_local_calendar_date() -> None:
+    fixture = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "garmin_activity_pagination.local_calendar.json"
+        ).read_text()
+    )
+    first_page = [fixture["local_activity"]] * 100
+    second_page = [fixture["following_activity"]] * 100
+    client = MagicMock()
+    client.get_activities = AsyncMock(side_effect=[first_page, second_page, []])
+
+    result = await GarminHistorySource(client, _ImmediateGate()).async_fetch_details(
+        date(2026, 1, 1), "timed_activities"
+    )
+
+    assert [activity.activity_id for activity in result] == [
+        "local-day-1",
+        "local-day-2",
+    ]
+    assert [call.args for call in client.get_activities.call_args_list] == [
+        (0, 100),
+        (100, 100),
+        (200, 100),
+    ]
+
+
 def test_normalize_activities_rejects_explicit_event_families() -> None:
     payload = [
         {"activityId": 1, "activityType": "walking", "eventTypeKey": "dailyEvent", "startTime": "2026-07-24T10:00:00Z", "durationInSeconds": 60},

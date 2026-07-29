@@ -687,6 +687,95 @@ async def test_numeric_failure_still_persists_structured_records_for_calendars()
 
 
 @pytest.mark.asyncio
+async def test_recorder_numeric_failure_still_persists_structured_records_for_calendars() -> None:
+    target = date(2026, 7, 24)
+    session = parse_sleep_sessions(
+        {
+            "startTime": "2026-07-24T23:00:00Z",
+            "endTime": "2026-07-25T07:00:00Z",
+        },
+        target,
+    )[0]
+    health_event = normalize_health_events(
+        {
+            "events": [
+                {
+                    "source": "MOVE_IQ",
+                    "type": "walking",
+                    "category": "activity",
+                    "startTime": "2026-07-24T10:00:00Z",
+                    "endTime": "2026-07-24T10:15:00Z",
+                }
+            ]
+        },
+        target,
+    )[0]
+    activity = normalize_activities(
+        [
+            {
+                "activityId": 654,
+                "activityType": "cycling",
+                "activityName": "Recorder failure-isolated ride",
+                "startTime": "2026-07-24T12:00:00Z",
+                "durationInSeconds": 1800,
+            }
+        ],
+        target,
+    )[0]
+
+    class Source:
+        async def async_fetch_details(self, _target: date, metric: str) -> object:
+            if metric == "sleep_sessions":
+                return (session,)
+            if metric == "health_events_daily":
+                return (health_event,)
+            if metric == "timed_activities":
+                return (activity,)
+            return ()
+
+    async def write(statistic_id, _metadata, _samples):
+        if statistic_id.endswith(":heart_rate"):
+            return RecorderWriteOutcome(0, "failed", "writer")
+        return RecorderWriteOutcome(0)
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(side_effect=write)
+    stores: dict[str, _NamedStore] = {}
+    archive = _partition_archive(Source(), recorder, stores)
+    await archive.async_start()
+
+    report = await archive.async_sync_range(target, target)
+
+    assert report.outcome == "failed"
+    assert report.error_type == "writer"
+    partition = stores["garmin_connect.e.sleep_2026"].data
+    assert session.logical_id in partition["sessions"]
+    assert health_event.logical_id in partition["events"]
+    assert activity.logical_id in partition["activities"]
+    assert len(
+        await GarminSleepCalendar(archive, "e").async_get_events(
+            MagicMock(),
+            datetime(2026, 7, 24, tzinfo=UTC),
+            datetime(2026, 7, 26, tzinfo=UTC),
+        )
+    ) == 1
+    assert len(
+        await GarminHealthEventsCalendar(archive, "e").async_get_events(
+            MagicMock(),
+            datetime(2026, 7, 24, tzinfo=UTC),
+            datetime(2026, 7, 25, tzinfo=UTC),
+        )
+    ) == 1
+    assert len(
+        await GarminActivityCalendar(archive, "e").async_get_events(
+            MagicMock(),
+            datetime(2026, 7, 24, tzinfo=UTC),
+            datetime(2026, 7, 25, tzinfo=UTC),
+        )
+    ) == 1
+
+
+@pytest.mark.asyncio
 async def test_garmin_client_error_becomes_bounded_archive_failure() -> None:
     class Source:
         async def async_fetch_details(self, _target: date, metric: str) -> object:

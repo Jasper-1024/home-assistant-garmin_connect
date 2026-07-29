@@ -1078,6 +1078,7 @@ class GarminHistoryArchive:
                     metrics = tuple(item for item in metrics if item[0] != "training_status")
                 failed_families: set[str] = set()
                 failed_family_error = "sync_failed"
+                numeric_write_failed = False
                 for metric, metadata in metrics:
                     try:
                         metric_inserted, metric_updated, metric_skipped = await self._async_import_numeric_metric(
@@ -1086,14 +1087,15 @@ class GarminHistoryArchive:
                     except asyncio.CancelledError:
                         raise
                     except _NumericFamilyError as error:
-                        if error.write_failure:
-                            raise
                         failed_families.add(metric)
                         failed_family_error = error.error_type
                         presence.setdefault(target_key, {})[metric] = "failed"
                         _LOGGER.warning(
                             "Garmin numeric family failed for %s (%s)", target_key, metric
                         )
+                        if error.write_failure:
+                            numeric_write_failed = True
+                            break
                         continue
                     except GarminConnectError:
                         failed_families.add(metric)
@@ -1127,6 +1129,7 @@ class GarminHistoryArchive:
                 )
                 if not isinstance(sleep_details, tuple) or any(not isinstance(item, SleepSession) for item in sleep_details):
                     raise SleepSchemaError("sleep session result has invalid shape")
+                invalid_sleep_streams: set[tuple[str, str]] = set()
                 for session in sleep_details:
                     for stream in session.streams:
                         sentinels = _SLEEP_NEGATIVE_SENTINELS.get(stream.metric, frozenset())
@@ -1136,12 +1139,16 @@ class GarminHistoryArchive:
                             and point.value not in sentinels
                             for point in stream.points
                         ):
-                            raise _NumericFamilyError("sleep_stream_invalid")
+                            invalid_sleep_streams.add((session.logical_id, stream.metric))
+                            failed_families.add("sleep_stream")
+                            failed_family_error = "sleep_stream_invalid"
                 for session in sleep_details:
                     year = str(session.start.year)
                     sleep_dirty_years.add(year)
                     sleep_sessions.setdefault(year, {})[session.logical_id] = session_record(session)
                     for stream in session.streams:
+                        if (session.logical_id, stream.metric) in invalid_sleep_streams:
+                            continue
                         metadata_for_stream = _SLEEP_STREAM_METADATA.get(stream.metric)
                         if metadata_for_stream is None:
                             raise SleepSchemaError("sleep stream metric is unsupported")
@@ -1158,11 +1165,22 @@ class GarminHistoryArchive:
                             f"{metadata_for_stream.key}:{session.logical_id}",
                         )
                         await self._async_prepare_numeric_source_dates(stream_statistic_id, samples)
-                        stream_outcome = await recorder.async_write(
-                            stream_statistic_id, metadata_for_stream, samples
-                        )
+                        try:
+                            stream_outcome = await recorder.async_write(
+                                stream_statistic_id, metadata_for_stream, samples
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except (AttributeError, ImportError, OSError, TypeError, ValueError, RuntimeError):
+                            failed_families.add("sleep_stream")
+                            failed_family_error = "sync_failed"
+                            numeric_write_failed = True
+                            continue
                         if stream_outcome.outcome != "written":
-                            raise RuntimeError(stream_outcome.error_type or "sleep_stream_write_failed")
+                            failed_families.add("sleep_stream")
+                            failed_family_error = stream_outcome.error_type or "sleep_stream_write_failed"
+                            numeric_write_failed = True
+                            continue
                         await self._async_confirm_numeric_source_dates(
                             stream_statistic_id, samples
                         )
@@ -1220,7 +1238,8 @@ class GarminHistoryArchive:
                         fit_count += 1
                 if failed_families:
                     await self._async_save_numeric_source_manifest()
-                    await self._async_save_numeric_source_partitions()
+                    if not numeric_write_failed:
+                        await self._async_save_numeric_source_partitions()
                     await self._async_save_sleep_partitions(
                         sleep_sessions,
                         events_by_year,

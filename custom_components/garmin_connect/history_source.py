@@ -188,22 +188,7 @@ def normalize_activities(payload: Any, target_date: date) -> tuple[NormalizedAct
         load = numeric(item, "activityTrainingLoad", "trainingLoad")
         recovery = numeric(item, "recoveryTime")
         logical_id, revision = _activity_hashes(activity_type, str(activity_id), start, end, duration, activity_name, training_effect, load, recovery)
-        local_start = item.get("startTimeLocal")
-        if local_start is None:
-            local_date = start.date()
-        elif isinstance(local_start, datetime):
-            local_date = local_start.date()
-        elif isinstance(local_start, str):
-            try:
-                local_date = datetime.fromisoformat(
-                    local_start.replace("Z", "+00:00")
-                ).date()
-            except ValueError as err:
-                raise HistorySchemaError(
-                    "activity local timestamp is invalid"
-                ) from err
-        else:
-            raise HistorySchemaError("activity local timestamp is invalid")
+        local_date = _activity_source_calendar_date(item, start)
         result[logical_id] = NormalizedActivity(logical_id, str(activity_id), revision, activity_type, activity_name, start, end, duration, training_effect, load, recovery, local_date)
     return tuple(sorted(result.values(), key=lambda item: (item.start, item.logical_id)))
 
@@ -442,6 +427,23 @@ def _timestamp_from_aliases(
         )
         return value, parsed
     return _MISSING, None
+
+
+def _activity_source_calendar_date(
+    item: Mapping[str, Any], source_start: datetime
+) -> date:
+    """Prefer an activity's source-local date over its instant's UTC date."""
+    local_start = item.get("startTimeLocal", _MISSING)
+    if local_start is _MISSING or local_start is None:
+        return source_start.date()
+    if isinstance(local_start, datetime):
+        return local_start.date()
+    if isinstance(local_start, str):
+        try:
+            return datetime.fromisoformat(local_start.replace("Z", "+00:00")).date()
+        except ValueError as err:
+            raise HistorySchemaError("activity local timestamp is invalid") from err
+    raise HistorySchemaError("activity local timestamp is invalid")
 
 
 def _snapshot_calendar_date(value: Any, fallback: date) -> date:
@@ -1194,7 +1196,7 @@ class GarminHistorySource:
                             item, ("startTime", "startTimeGMT", "startTimeLocal")
                         )
                         if parsed_start is not None:
-                            page_dates.append(parsed_start.date())
+                            page_dates.append(_activity_source_calendar_date(item, parsed_start))
                     if page_dates and all(page_date < target_date for page_date in page_dates):
                         break
                     if len(page_items) < 100:
