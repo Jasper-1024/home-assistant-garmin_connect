@@ -94,6 +94,21 @@ async def test_writer_uses_absolute_source_instant_for_equivalent_offsets() -> N
 
 
 @pytest.mark.asyncio
+async def test_writer_keeps_source_calendar_date_outside_recorder_statistics() -> None:
+    recorder = FakeRequester()
+    writer = GarminHistoryRecorder(recorder)
+    source_date = date(2026, 7, 24)
+
+    await writer.async_write(
+        statistic_id_for("opaque-account-key-123", "heart_rate"),
+        HEART_RATE_METADATA,
+        (NormalizedSample(datetime(2026, 7, 24, 23, 30, tzinfo=UTC), source_date, "source", 60.0),),
+    )
+
+    assert set(recorder.imports[0][1][0]) == {"start", "mean", "min", "max"}
+
+
+@pytest.mark.asyncio
 async def test_writer_rejects_naive_source_timestamps_before_history_write() -> None:
     recorder = FakeRequester()
     writer = GarminHistoryRecorder(recorder)

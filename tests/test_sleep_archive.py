@@ -187,6 +187,46 @@ def test_sleep_stream_object_rows_use_stream_specific_values() -> None:
     assert [stream.points[0].value for stream in session.streams] == [70.0, 14.0, 1.0]
 
 
+def test_sleep_stream_mixed_null_objects_preserve_valid_points_and_reject_malformed_rows() -> None:
+    payload = {
+        "startTime": "2026-07-24T23:45:00Z", "endTime": "2026-07-25T07:15:00Z",
+        "sleepHeartRate": [
+            None,
+            {"timestamp": "2026-07-25T00:00:00Z", "heartRate": 60},
+            {"timestamp": "2026-07-25T00:01:00Z", "heartRate": None},
+        ],
+    }
+    session = parse_sleep_sessions(payload, date(2026, 7, 24))[0]
+    assert [(point.timestamp.isoformat(), point.value) for point in session.streams[0].points] == [
+        ("2026-07-25T00:00:00+00:00", 60.0),
+        ("2026-07-25T00:01:00+00:00", None),
+    ]
+
+    with pytest.raises(SleepSchemaError):
+        parse_sleep_sessions(
+            {
+                **payload,
+                "sleepHeartRate": [
+                    None,
+                    {"timestamp": "2026-07-25T00:00:00Z"},
+                ],
+            },
+            date(2026, 7, 24),
+        )
+
+
+def test_sleep_measurement_timestamp_without_offset_fails_closed() -> None:
+    with pytest.raises(SleepSchemaError):
+        parse_sleep_sessions(
+            {
+                "startTime": "2026-07-24T23:45:00Z",
+                "endTime": "2026-07-25T07:15:00Z",
+                "sleepHeartRate": [[60, "2026-07-25T00:00:00"]],
+            },
+            date(2026, 7, 24),
+        )
+
+
 def test_sleep_stream_descriptors_reorder_columns_and_deduplicate_timestamps() -> None:
     payload = {
         "startTime": "2026-07-24T23:45:00Z", "endTime": "2026-07-25T07:15:00Z",

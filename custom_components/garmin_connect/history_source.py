@@ -20,6 +20,9 @@ class HistorySchemaError(ValueError):
     """Raised when a known Garmin series has an incompatible shape."""
 
 
+_MISSING = object()
+
+
 @dataclass(frozen=True, slots=True)
 class NormalizedSample:
     """One immutable, normalized intraday measurement."""
@@ -309,7 +312,10 @@ def normalize_snapshot(
         raise HistorySchemaError("snapshot payload is not an object")
     timestamp_key = next((key for key in ("timestamp", "startTime", "calendarDate") if key in payload), None)
     timestamp_value = payload[timestamp_key] if timestamp_key is not None else target_date.isoformat()
-    timestamp = _timestamp(timestamp_value)
+    timestamp = _timestamp(
+        timestamp_value,
+        allow_date_only=timestamp_key in (None, "calendarDate"),
+    )
     if timestamp is None:
         raise HistorySchemaError("snapshot timestamp is invalid")
     fields: dict[str, tuple[str, float | None]] = {}
@@ -338,7 +344,7 @@ TRAINING_STATUS_FIELDS = {
 }
 
 
-def _timestamp(value: Any) -> datetime | None:
+def _timestamp(value: Any, *, allow_date_only: bool = False) -> datetime | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int | float):
@@ -352,7 +358,11 @@ def _timestamp(value: Any) -> datetime | None:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             return None
-        return (parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)).astimezone(UTC)
+        if parsed.tzinfo is None:
+            if not allow_date_only or parsed.time() != datetime.min.time() or value != parsed.date().isoformat():
+                return None
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
     return None
 
 
@@ -457,8 +467,10 @@ def _object_series(
             continue
         if not isinstance(point, dict):
             raise HistorySchemaError("segmented point is not an object")
-        raw_time = next((point[key] for key in ("timestamp", "time", "startTime", "start", "readingTime", "readingTimeGMT") if key in point), None)
-        raw_value = next((point[key] for key in value_keys if key in point), None)
+        raw_time = next((point[key] for key in ("timestamp", "time", "startTime", "start", "readingTime", "readingTimeGMT") if key in point), _MISSING)
+        raw_value = next((point[key] for key in value_keys if key in point), _MISSING)
+        if raw_time is _MISSING or raw_value is _MISSING:
+            raise HistorySchemaError("segmented point lacks required fields")
         if raw_time is None or raw_value is None:
             continue
         if not isinstance(raw_time, str | int | float) or isinstance(raw_time, bool):
@@ -755,10 +767,14 @@ def parse_hrv_data(payload: Any, target_date: date) -> HRVData:
         raise HistorySchemaError("HRV readings are not an array")
     readings: list[NormalizedSample] = []
     for reading in raw_readings:
+        if reading is None:
+            continue
         if not isinstance(reading, dict):
             raise HistorySchemaError("HRV reading is not an object")
-        raw_time = next((reading[key] for key in ("readingTimeGMT", "readingTimeGmt", "readingTime") if key in reading), None)
-        raw_value = next((reading[key] for key in ("hrvValue", "value") if key in reading), None)
+        raw_time = next((reading[key] for key in ("readingTimeGMT", "readingTimeGmt", "readingTime") if key in reading), _MISSING)
+        raw_value = next((reading[key] for key in ("hrvValue", "value") if key in reading), _MISSING)
+        if raw_time is _MISSING or raw_value is _MISSING:
+            raise HistorySchemaError("HRV reading lacks required fields")
         if raw_time is not None and not isinstance(raw_time, str | int | float):
             raise HistorySchemaError("HRV timestamp has an invalid type")
         if raw_value is not None and (isinstance(raw_value, bool) or not isinstance(raw_value, int | float)):

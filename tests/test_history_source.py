@@ -45,7 +45,7 @@ def test_normalize_pair_series_uses_descriptors_and_keeps_ordered_equal_values()
         "heartRateValues": [
             [62, "2026-07-24T01:04:00+02:00", "ignored"],
             [0, 1_784_852_400_000, "ignored"],
-            [59, "2026-07-24T01:02:00", "ignored"],
+            [59, "2026-07-24T01:02:00+00:00", "ignored"],
             [61, "2026-07-24T01:04:00+02:00", "revision"],
         ],
         "unknownField": {"shape": "tolerated"},
@@ -66,6 +66,16 @@ def test_normalize_pair_series_uses_descriptors_and_keeps_ordered_equal_values()
     assert samples[0].request_date.isoformat() == "2026-07-24"
     assert samples[0].raw_timestamp == "2026-07-24T01:04:00+02:00"
     assert samples[1].raw_timestamp == 1_784_852_400_000
+
+
+def test_measurement_timestamp_without_offset_fails_closed() -> None:
+    with pytest.raises(HistorySchemaError):
+        normalize_pair_series(
+            {"heartRateValues": [[60, "2026-07-24T01:00:00", "ignored"]]},
+            values_key="heartRateValues",
+            descriptor_keys=(),
+            value_keys=("heartRate",),
+        )
 
 
 def test_normalize_stress_excludes_negative_quality_codes_but_keeps_zero_and_null() -> None:
@@ -278,6 +288,35 @@ def test_hrv_raw_readings_tolerate_missing_summary_and_keep_zero() -> None:
     )
     assert [sample.value for sample in parsed.readings] == [43.0, 0.0]
     assert parsed.summary is None
+
+
+def test_hrv_mixed_null_rows_preserve_valid_objects_and_reject_malformed_objects() -> None:
+    parsed = parse_hrv_data(
+        {
+            "hrvReadings": [
+                None,
+                {"readingTime": "2026-07-24T01:00:00Z", "hrvValue": 43},
+                {"readingTime": "2026-07-24T01:01:00Z", "hrvValue": None},
+            ]
+        },
+        date(2026, 7, 24),
+    )
+    assert [sample.value for sample in parsed.readings] == [43.0]
+
+    with pytest.raises(HistorySchemaError):
+        parse_hrv_data(
+            {"hrvReadings": [None, {"readingTime": "2026-07-24T01:00:00Z"}]},
+            date(2026, 7, 24),
+        )
+
+
+def test_date_only_calendar_metadata_remains_supported() -> None:
+    snapshot = normalize_snapshot(
+        {"calendarDate": "2026-07-24", "vo2Max": 47.2},
+        date(2026, 7, 24),
+        TRAINING_STATUS_FIELDS,
+    )
+    assert snapshot.timestamp == datetime(2026, 7, 24, tzinfo=UTC)
 
 
 def test_hrv_nested_summary_is_separate_and_typed() -> None:

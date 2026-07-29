@@ -408,6 +408,7 @@ class GarminHistoryArchive:
         self._runtime_sync_failure = False
         self._recorder_adapter: Any | None = None
         self._hrv_summaries: dict[str, dict[str, Any]] = {}
+        self._numeric_source_calendar_dates: dict[str, dict[str, str]] = {}
         self._sleep_sessions: dict[str, dict[str, dict[str, Any]]] = {}
         self._health_events: dict[str, dict[str, dict[str, Any]]] = {}
         self._activities: dict[str, dict[str, dict[str, Any]]] = {}
@@ -897,6 +898,10 @@ class GarminHistoryArchive:
                             )
                             if snapshot_outcome.outcome != "written":
                                 return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome=snapshot_outcome.outcome, error_type=snapshot_outcome.error_type)
+                            self._remember_numeric_source_dates(
+                                statistic_id_for(self._account_key(), metadata_for_field.key),
+                                (snapshot,),
+                            )
                             inserted += getattr(snapshot_outcome, "inserted_count", snapshot_outcome.accepted_count)
                             updated += getattr(snapshot_outcome, "updated_count", 0)
                             skipped += getattr(snapshot_outcome, "skipped_count", 0)
@@ -931,6 +936,10 @@ class GarminHistoryArchive:
                                 self._runtime_sync_failure = True
                                 self._status = HistoryStatus(HistoryArchiveState.FAILED, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, error_type=total_outcome.error_type or "sync_failed", **self._backfill_status_fields())
                                 return HistorySyncReport(tuple(processed), inserted, updated, skipped, outcome=total_outcome.outcome, error_type=total_outcome.error_type)
+                            self._remember_numeric_source_dates(
+                                statistic_id_for(self._account_key(), total_metric.key),
+                                (total_sample,),
+                            )
                             inserted += getattr(total_outcome, "inserted_count", total_outcome.accepted_count)
                             updated += getattr(total_outcome, "updated_count", 0)
                             skipped += getattr(total_outcome, "skipped_count", 0)
@@ -941,6 +950,10 @@ class GarminHistoryArchive:
                     inserted += getattr(outcome, "inserted_count", outcome.accepted_count)
                     updated += getattr(outcome, "updated_count", 0)
                     skipped += getattr(outcome, "skipped_count", 0)
+                    if metadata is not None:
+                        self._remember_numeric_source_dates(
+                            statistic_id_for(self._account_key(), metric), samples
+                        )
                 try:
                     sleep_descriptor = inspect.getattr_static(source, "async_fetch_details")
                 except AttributeError:
@@ -975,6 +988,13 @@ class GarminHistoryArchive:
                         )
                         if stream_outcome.outcome != "written":
                             raise RuntimeError(stream_outcome.error_type or "sleep_stream_write_failed")
+                        self._remember_numeric_source_dates(
+                            statistic_id_for(
+                                self._account_key(),
+                                f"{metadata_for_stream.key}:{session.logical_id}",
+                            ),
+                            samples,
+                        )
                         inserted += getattr(stream_outcome, "inserted_count", stream_outcome.accepted_count)
                         updated += getattr(stream_outcome, "updated_count", 0)
                         skipped += getattr(stream_outcome, "skipped_count", 0)
@@ -1085,11 +1105,30 @@ class GarminHistoryArchive:
             "account_key": self._account_key(),
             "completed_dates": sorted(completed_dates),
             "hrv_summaries": self._hrv_summaries,
+            "numeric_source_calendar_dates": {
+                statistic_id: dict(instants)
+                for statistic_id, instants in self._numeric_source_calendar_dates.items()
+            },
             "presence": presence,
             "sleep_index": {year: sorted(records) for year, records in sessions_by_year.items()},
             "event_index": {year: sorted(records) for year, records in events_by_year.items()},
             "activity_index": {year: sorted(records) for year, records in activities_by_year.items()},
         }
+
+    def _remember_numeric_source_dates(
+        self, statistic_id: str, samples: Collection[NormalizedSample]
+    ) -> None:
+        """Retain source calendar dates outside Recorder's instant/value rows."""
+        if not samples:
+            return
+        dates = self._numeric_source_calendar_dates.setdefault(statistic_id, {})
+        for sample in samples:
+            if sample.timestamp.tzinfo is None or sample.timestamp.utcoffset() is None:
+                raise ValueError("numeric sample timestamp is naive")
+            if not isinstance(sample.request_date, date):
+                raise ValueError("numeric source calendar date is invalid")
+            instant = sample.timestamp.astimezone(UTC).isoformat()
+            dates[instant] = sample.request_date.isoformat()
 
     async def _async_save_sleep_partitions(
         self, sessions_by_year: Mapping[str, Mapping[str, dict[str, Any]]],
@@ -1381,6 +1420,7 @@ class GarminHistoryArchive:
                     "account_key": account_key,
                     "completed_dates": [],
                     "hrv_summaries": {},
+                    "numeric_source_calendar_dates": {},
                     "presence": {},
                     "sleep_index": {},
                     "event_index": {},
@@ -1408,6 +1448,32 @@ class GarminHistoryArchive:
         summaries = catalog.get("hrv_summaries", {})
         if isinstance(summaries, Mapping):
             self._hrv_summaries = {key: dict(value) for key, value in summaries.items() if isinstance(key, str) and isinstance(value, Mapping)}
+        raw_numeric_dates = catalog.get("numeric_source_calendar_dates", {})
+        if not isinstance(raw_numeric_dates, Mapping):
+            raise ValueError("Store numeric source-date catalog is invalid")
+        numeric_dates: dict[str, dict[str, str]] = {}
+        for statistic_id, instants in raw_numeric_dates.items():
+            if not isinstance(statistic_id, str) or not statistic_id or not isinstance(instants, Mapping):
+                raise ValueError("Store numeric source-date catalog is invalid")
+            parsed_instants: dict[str, str] = {}
+            for instant, source_date in instants.items():
+                if not isinstance(instant, str) or not isinstance(source_date, str):
+                    raise ValueError("Store numeric source-date catalog is invalid")
+                try:
+                    parsed_instant = datetime.fromisoformat(instant)
+                    parsed_date = date.fromisoformat(source_date)
+                except ValueError as err:
+                    raise ValueError("Store numeric source-date catalog is invalid") from err
+                if (
+                    parsed_instant.tzinfo is None
+                    or parsed_instant.utcoffset() is None
+                    or parsed_instant.astimezone(UTC).isoformat() != instant
+                    or parsed_date.isoformat() != source_date
+                ):
+                    raise ValueError("Store numeric source-date catalog is invalid")
+                parsed_instants[instant] = source_date
+            numeric_dates[statistic_id] = parsed_instants
+        self._numeric_source_calendar_dates = numeric_dates
         raw_presence = catalog.get("presence", {})
         if not isinstance(raw_presence, Mapping):
             raise ValueError("Store presence catalog is invalid")

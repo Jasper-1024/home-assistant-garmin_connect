@@ -13,6 +13,9 @@ class SleepSchemaError(ValueError):
     """Raised when a known sleep session field changes type."""
 
 
+_MISSING = object()
+
+
 @dataclass(frozen=True, slots=True)
 class SleepStreamPoint:
     """One bounded raw sleep stream point."""
@@ -68,9 +71,11 @@ def _parse_time(value: Any) -> datetime:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as err:
         raise SleepSchemaError("sleep timestamp has invalid value") from err
+    if parsed.tzinfo is None:
+        raise SleepSchemaError("sleep timestamp has no offset")
     # Preserve Garmin's supplied offset for local-date, DST, and cross-midnight
-    # calendar semantics; naive API values are treated as UTC.
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    # calendar semantics.
+    return parsed
 
 
 def _first(mapping: dict[str, Any], names: tuple[str, ...]) -> Any:
@@ -185,12 +190,16 @@ def _sleep_streams(item: dict[str, Any]) -> tuple[SleepStream, ...]:
         points: list[SleepStreamPoint] = []
         by_timestamp: dict[datetime, SleepStreamPoint] = {}
         for row in values:
+            if row is None:
+                continue
             if isinstance(row, dict):
-                raw_time = next((row[name] for name in ("timestamp", "time", "startGMT", "readingTimeGMT") if name in row), None)
-                raw_value = next((row[name] for name in ("value", metric, "heartRate", "hrvValue", "stressLevel", "spO2", "spo2", "bodyBattery", "respirationValue", "movement", "activityLevel") if name in row), None)
+                raw_time = next((row[name] for name in ("timestamp", "time", "startGMT", "readingTimeGMT") if name in row), _MISSING)
+                raw_value = next((row[name] for name in ("value", metric, "heartRate", "hrvValue", "stressLevel", "spO2", "spo2", "bodyBattery", "respirationValue", "movement", "activityLevel") if name in row), _MISSING)
+                if raw_time is _MISSING or raw_value is _MISSING:
+                    raise SleepSchemaError("sleep stream point lacks required fields")
             elif isinstance(row, list) and descriptors is not None:
                 timestamp_index = next((descriptors[key] for key in ("timestamp", "time", "startGMT", "readingTimeGMT") if key in descriptors), None)
-                value_index = next((descriptors[key] for key in ("value", metric, "heartRate", "hrvValue", "stressLevel", "spO2", "spo2") if key in descriptors), None)
+                value_index = next((descriptors[key] for key in ("value", metric, "heartRate", "hrvValue", "stressLevel", "spO2", "spo2", "movement", "activityLevel") if key in descriptors), None)
                 if timestamp_index is None or value_index is None or max(timestamp_index, value_index) >= len(row):
                     raise SleepSchemaError("sleep stream descriptor fields are missing")
                 raw_time, raw_value = row[timestamp_index], row[value_index]

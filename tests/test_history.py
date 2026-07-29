@@ -33,7 +33,11 @@ from custom_components.garmin_connect.history import (
 )
 from custom_components.garmin_connect.history_recorder import RecorderWriteOutcome
 from custom_components.garmin_connect.history_sensor import GarminHistoryStatusSensor
-from custom_components.garmin_connect.history_source import GarminHistorySource, NormalizedSample
+from custom_components.garmin_connect.history_source import (
+    GarminHistorySource,
+    NormalizedSample,
+    SourceSeries,
+)
 from custom_components.garmin_connect.request_gate import (
     GarminRequestGate,
     GarminRequestPriority,
@@ -167,6 +171,74 @@ async def test_start_keeps_historical_backfill_dormant() -> None:
         await archive.async_start()
 
     backfill.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_numeric_source_calendar_dates_are_durable_across_restart_and_upsert() -> None:
+    target = date(2026, 7, 24)
+    hass = _hass()
+    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
+    checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
+    store = FakeStore()
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(1))
+
+    class Source:
+        def __init__(self) -> None:
+            self.source_date = target
+
+        async def async_fetch_details(self, _request_date: date, metric: str) -> object:
+            if metric in {"sleep_sessions", "health_events_daily", "health_events_body_battery", "timed_activities"}:
+                return ()
+            return SourceSeries(
+                (
+                    NormalizedSample(
+                        datetime(2026, 7, 24, 23, 30, tzinfo=UTC),
+                        self.source_date,
+                        (
+                            "2026-07-24T23:30:00+00:00"
+                            if self.source_date == target
+                            else "2026-07-25T07:30:00+08:00"
+                        ),
+                        60.0,
+                    ),
+                ),
+                "present",
+            )
+
+    source = Source()
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=checker,
+        store_factory=_store_factory(store),
+        source_factory=lambda client, gate: source,
+        recorder_factory=lambda: recorder,
+    )
+    await archive.async_start()
+    report = await archive.async_sync_range(target, target)
+    assert report.outcome == "written"
+    dates = store.data["numeric_source_calendar_dates"]
+    assert len(dates) == 13
+    statistic_id = next(key for key in dates if key.endswith(":heart_rate"))
+    assert dates[statistic_id] == {"2026-07-24T23:30:00+00:00": "2026-07-24"}
+
+    restarted = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=checker,
+        store_factory=_store_factory(FakeStore(data=store.data)),
+        source_factory=lambda client, gate: source,
+        recorder_factory=lambda: recorder,
+    )
+    await restarted.async_start()
+    source.source_date = date(2026, 7, 25)
+    report = await restarted.async_sync_range(date(2026, 7, 25), date(2026, 7, 25))
+    assert report.outcome == "written"
+    restarted_store = restarted._store
+    assert restarted_store.data["numeric_source_calendar_dates"][statistic_id] == {
+        "2026-07-24T23:30:00+00:00": "2026-07-25"
+    }
 
 
 def test_history_status_and_archive_metadata_use_one_public_contract() -> None:
