@@ -1550,7 +1550,7 @@ class GarminHistoryArchive:
                 await result
 
     async def async_sync_range(self, start_date: date, end_date: date, *, fit_limit: int | None = None, include_training_status: bool = True) -> HistorySyncReport:
-        """Fetch and import the supported intraday metrics for an inclusive range."""
+        """Manually fetch and import the supported metrics for an inclusive range."""
         validation_error = _validate_sync_range(start_date, end_date)
         if validation_error:
             return HistorySyncReport(outcome="invalid", error_type=validation_error)
@@ -1564,7 +1564,32 @@ class GarminHistoryArchive:
             return HistorySyncReport(outcome="busy", error_type="sync_in_progress")
 
         async with self._sync_lock:
-            return await self._async_sync_range(start_date, end_date, fit_limit=fit_limit, include_training_status=include_training_status)
+            forced_dates = tuple(
+                start_date.fromordinal(start_date.toordinal() + offset)
+                for offset in range((end_date - start_date).days + 1)
+            )
+            reopened: dict[str, _ReconciliationEntry] = {}
+            changed = False
+            for target in forced_dates:
+                entry = self._reconciliation.get(target.isoformat())
+                if entry is not None and entry.state == "settled":
+                    reopened[target.isoformat()] = replace(entry)
+                    entry.state = "open"
+                    changed = True
+            if changed:
+                await self._async_save_reconciliation_state()
+            try:
+                return await self._async_sync_range(
+                    start_date,
+                    end_date,
+                    fit_limit=fit_limit,
+                    include_training_status=include_training_status,
+                    force_dates=frozenset(forced_dates),
+                )
+            finally:
+                if reopened:
+                    self._reconciliation.update(reopened)
+                    await self._async_save_reconciliation_state()
 
     async def _async_fetch_numeric_detail(
         self,
@@ -1758,11 +1783,13 @@ class GarminHistoryArchive:
         include_training_status: bool = True,
         fail_on_fit_limit: bool = True,
         force_date: date | None = None,
+        force_dates: Collection[date] = (),
     ) -> HistorySyncReport:
         """Run one serialized, checkpointed sync.
 
-        ``force_date`` is reserved for the enabled first current-day sync so
-        a Manual Repair checkpoint cannot suppress that enablement request.
+        ``force_date`` is used by automatic current-day work. ``force_dates``
+        is used by Manual Repair so settled checkpoints cannot suppress an
+        explicitly requested bounded range.
         """
 
         runtime_data = getattr(self._entry, "runtime_data", None)
@@ -1811,7 +1838,11 @@ class GarminHistoryArchive:
         for offset in range((end_date - start_date).days + 1):
             target = start_date.fromordinal(start_date.toordinal() + offset)
             target_key = target.isoformat()
-            if target_key in self._completed_dates and target != force_date:
+            if (
+                target_key in self._completed_dates
+                and target != force_date
+                and target not in force_dates
+            ):
                 skipped += 1
                 processed.append(target)
                 self._status = HistoryStatus(HistoryArchiveState.SYNCING, current_date=target_key, processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())

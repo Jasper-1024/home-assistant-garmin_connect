@@ -31,6 +31,7 @@ from custom_components.garmin_connect.const import (
 from custom_components.garmin_connect.history import (
     GarminHistoryArchive,
     HistoryArchiveState,
+    HistorySyncReport,
     HomeAssistantRecorderCompatibility,
     RecorderCompatibilityResult,
 )
@@ -2862,7 +2863,9 @@ async def test_numeric_partition_replay_is_date_scoped_and_empty_retries_settle(
     assert catalog.data["numeric_source_date_pending"]["2026"] == [second_date.isoformat()]
     assert first_date.isoformat() not in archive._numeric_source_date_replay_dates
 
-    assert (await archive.async_sync_range(first_date, first_date)).skipped_count == 1
+    repaired = await archive.async_sync_range(first_date, first_date)
+    assert repaired.outcome == "written"
+    assert repaired.skipped_count == 0
     assert catalog.data["numeric_source_date_pending"]["2026"] == [second_date.isoformat()]
 
 
@@ -3887,6 +3890,94 @@ async def test_disabled_archive_keeps_query_surface_available() -> None:
     sensor = GarminHistoryStatusSensor(archive, "entry-1")
     assert sensor.native_value == "disabled"
     assert sensor.extra_state_attributes["activation_date"] == "2026-07-01"
+
+
+@pytest.mark.asyncio
+async def test_manual_repair_reopens_settled_date_while_archive_is_disabled() -> None:
+    """Manual Repair must force one requested date past its settled checkpoint."""
+    target = date(2026, 7, 24)
+    store = _reconciliation_store(target, state="settled", has_records=True, outcome="records")
+    store.data["completed_dates"] = [target.isoformat()]
+    source = ReconciliationSource({target: (72.0,)})
+    hass = _hass()
+    entry = _entry(
+        data={
+            "history_account_key": "opaque-account-key-1234567890",
+            CONF_ARCHIVE_ACTIVATION_DATE: "2026-08-01",
+            CONF_ARCHIVE_PREVIOUSLY_ENABLED: True,
+        }
+    )
+    entry.options = {CONF_ARCHIVE_ENABLED: False}
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=object()
+    )
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(
+            RecorderCompatibilityResult.compatible_result()
+        ),
+        store_factory=_store_factory(store),
+        source_factory=lambda *_args: source,
+        recorder_factory=lambda: recorder,
+    )
+
+    await archive.async_start()
+    report = await archive.async_sync_range(target, target)
+
+    assert report.outcome == "written"
+    assert source.requested
+    assert set(source.requested) == {target}
+    assert archive.archive_enabled is False
+    assert archive.activation_date == date(2026, 8, 1)
+    assert archive._cycle_timer_cancel is None
+    assert archive._backfill is None
+    assert store.data["reconciliation"][target.isoformat()]["state"] == "settled"
+
+
+@pytest.mark.asyncio
+async def test_manual_repair_accepts_one_and_31_days_but_rejects_32_before_requests() -> None:
+    """Manual Repair validates the inclusive bound before touching Garmin."""
+    source = ReconciliationSource({date(2026, 7, 24): (72.0,)})
+    store = _reconciliation_store(date(2026, 7, 24))
+    hass = _hass()
+    entry = _entry(data={"history_account_key": "opaque-account-key-1234567890"})
+    entry.options = {CONF_ARCHIVE_ENABLED: False}
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=object()), request_gate=object()
+    )
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(
+            RecorderCompatibilityResult.compatible_result()
+        ),
+        store_factory=_store_factory(store),
+        source_factory=lambda *_args: source,
+        recorder_factory=lambda: recorder,
+    )
+    await archive.async_start()
+
+    start = date(2026, 7, 24)
+    too_large = await archive.async_sync_range(start, start + timedelta(days=31))
+    assert too_large == HistorySyncReport(outcome="invalid", error_type="range_too_large")
+    assert source.requested == []
+
+    one_day = await archive.async_sync_range(start, start)
+    assert one_day.outcome == "written"
+    assert set(source.requested) == {start}
+
+    source.requested.clear()
+    thirty_one = await archive.async_sync_range(start, start + timedelta(days=30))
+    assert thirty_one.outcome == "written"
+    assert len(source.requested) == 31 * 19
+    assert set(source.requested) == {
+        start + timedelta(days=offset) for offset in range(31)
+    }
 
 
 async def test_different_entries_get_different_account_keys() -> None:

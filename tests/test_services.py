@@ -179,6 +179,38 @@ async def test_sync_history_returns_processed_iso_dates_without_private_data(
     archive.async_sync_range.assert_awaited_once_with(date(2026, 7, 24), date(2026, 7, 25))
 
 
+async def test_sync_history_returns_bounded_range_error_publicly(
+    mock_hass: MagicMock,
+) -> None:
+    """Manual Repair exposes the bounded validation result without private data."""
+    await async_setup_services(mock_hass)
+    handler = _get_handler(mock_hass, "sync_history")
+    archive = MagicMock()
+    archive.async_sync_range = AsyncMock(
+        return_value=HistorySyncReport(
+            outcome="invalid", error_type="range_too_large"
+        )
+    )
+    call = MagicMock()
+    call.data = {
+        "start_date": date(2026, 7, 24),
+        "end_date": date(2026, 8, 24),
+    }
+
+    with patch(
+        "custom_components.garmin_connect.services._get_archive",
+        return_value=archive,
+    ):
+        response = await handler(call)
+
+    assert response["outcome"] == "invalid"
+    assert response["error_type"] == "range_too_large"
+    assert "account" not in str(response).lower()
+    archive.async_sync_range.assert_awaited_once_with(
+        date(2026, 7, 24), date(2026, 8, 24)
+    )
+
+
 async def test_probe_capability_uses_loaded_runtime_client(
     mock_hass: MagicMock,
 ) -> None:

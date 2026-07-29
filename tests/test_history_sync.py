@@ -1158,8 +1158,9 @@ async def test_snapshot_archive_writes_present_fields_and_restarts_from_checkpoi
     await restarted.async_start()
     assert restarted.get_history_presence(target, target)[target.isoformat()]["daily_summary:abnormal_heart_rate_alerts"] == "present"
     before = recorder.async_write.await_count
-    await restarted.async_sync_range(target, target)
-    assert recorder.async_write.await_count == before
+    repaired = await restarted.async_sync_range(target, target)
+    assert repaired.outcome == "written"
+    assert recorder.async_write.await_count > before
 
 
 @pytest.mark.asyncio
@@ -1193,7 +1194,7 @@ async def test_archive_aggregates_import_classification_counts():
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_persists_each_date_and_restart_skips_it():
+async def test_checkpoint_persists_each_date_and_manual_repair_retries_it():
     source = MagicMock()
     source.async_fetch = AsyncMock(return_value=())
     recorder = MagicMock()
@@ -1209,9 +1210,10 @@ async def test_checkpoint_persists_each_date_and_restart_skips_it():
     await second.async_start()
     report = await second.async_sync_range(date(2026, 1, 1), date(2026, 1, 2))
 
-    assert report.skipped_count == 2
+    assert report.outcome == "written"
+    assert report.skipped_count == 0
     assert report.processed_dates == (date(2026, 1, 1), date(2026, 1, 2))
-    source.async_fetch.assert_not_called()
+    assert source.async_fetch.await_count == 30
 
 
 @pytest.mark.asyncio
@@ -2076,7 +2078,8 @@ async def test_activity_calendar_date_correction_moves_record_between_year_parti
     await archive.async_sync_range(date(2027, 1, 1), date(2027, 1, 1))
     retry = await archive.async_sync_range(date(2027, 1, 1), date(2027, 1, 1))
 
-    assert retry.skipped_count == 1
+    assert retry.outcome == "written"
+    assert retry.skipped_count == 0
     assert stores["garmin_connect.e.sleep_2026"].data["activities"] == {}
     assert set(stores["garmin_connect.e.sleep_2027"].data["activities"]) == {
         corrected.logical_id
