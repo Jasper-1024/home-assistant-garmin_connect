@@ -548,6 +548,50 @@ async def test_segmented_totals_are_written_with_provenance_and_revisions() -> N
 
 
 @pytest.mark.asyncio
+async def test_date_only_segmented_total_uses_cross_year_calendar_bucket() -> None:
+    """Daily totals use the UTC+08:00 bucket while retaining the source date."""
+    target = date(2027, 1, 1)
+    writes: list[tuple[str, tuple[NormalizedSample, ...]]] = []
+    recorder = MagicMock()
+
+    async def write(statistic_id, _metadata, samples):
+        writes.append((statistic_id, tuple(samples)))
+        return RecorderWriteOutcome(len(samples))
+
+    recorder.async_write = AsyncMock(side_effect=write)
+
+    class Source:
+        async def async_fetch_details(self, _request_date: date, metric: str) -> object:
+            if metric == "steps":
+                return SegmentedData(
+                    (), {"totalSteps": 123.0}, "empty", {"totalSteps": "present"}
+                )
+            return ()
+
+    archive = GarminHistoryArchive(
+        _hass(),
+        _entry(data={"history_account_key": "opaque-account-key-123"}),
+        recorder_checker=FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store_factory=_store_factory(FakeStore()),
+        source_factory=lambda _client, _gate: Source(),
+        recorder_factory=lambda: recorder,
+    )
+    await archive.async_start()
+    assert (await archive.async_sync_range(target, target)).outcome == "written"
+
+    samples = next(
+        samples
+        for statistic_id, samples in writes
+        if statistic_id.endswith(":steps_daily_total")
+    )
+    assert samples == (
+        NormalizedSample(
+            datetime(2026, 12, 31, 16, tzinfo=UTC), target, target.isoformat(), 123.0
+        ),
+    )
+
+
+@pytest.mark.asyncio
 async def test_numeric_manifest_recovery_replays_after_partition_failure() -> None:
     target = date(2026, 12, 31)
     hass = _hass()
@@ -604,6 +648,85 @@ async def test_numeric_manifest_recovery_replays_after_partition_failure() -> No
     assert not stores["garmin_connect.entry-1.history_catalog"].data[
         "numeric_source_date_outbox"
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ("partition", "catalog"))
+async def test_confirmed_numeric_provenance_survives_storage_failure_and_empty_replay(
+    failure_kind: str,
+) -> None:
+    """A successful Recorder write keeps its source date through empty recovery."""
+    target = date(2026, 12, 31)
+    instant = datetime(2026, 12, 31, 23, 30, tzinfo=UTC)
+    hass = _hass()
+    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
+    checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
+    stores: dict[str, FakeStore] = {}
+
+    class FlakyStore(FakeStore):
+        fail_partition_save = failure_kind == "partition"
+        fail_catalog_save = False
+        trigger_catalog_failure = failure_kind == "catalog"
+
+        async def async_save(self, data: dict) -> None:
+            if self.fail_catalog_save and self.path.endswith("history_catalog"):
+                self.fail_catalog_save = False
+                raise OSError("simulated catalog failure")
+            if self.fail_partition_save and "numeric_source_dates_" in self.path:
+                raise OSError("simulated partition failure")
+            await super().async_save(data)
+            if (
+                self.trigger_catalog_failure
+                and "numeric_source_dates_" in self.path
+            ):
+                self.trigger_catalog_failure = False
+                catalog = stores["garmin_connect.entry-1.history_catalog"]
+                catalog.fail_catalog_save = True
+
+    def factory(_hass, _version, path, **kwargs):
+        store = stores.setdefault(path, FlakyStore())
+        store.path = path
+        return store
+
+    class SampleSource:
+        async def async_fetch_details(self, _request_date: date, metric: str) -> object:
+            if metric == "heart_rate":
+                return SourceSeries(
+                    (NormalizedSample(instant, target, instant.isoformat(), 60.0),),
+                    "present",
+                )
+            return ()
+
+    class EmptySource:
+        async def async_fetch_details(self, _request_date: date, _metric: str) -> object:
+            return ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(1))
+
+    def make_archive(source: object) -> GarminHistoryArchive:
+        return GarminHistoryArchive(
+            hass,
+            entry,
+            recorder_checker=checker,
+            store_factory=factory,
+            source_factory=lambda _client, _gate: source,
+            recorder_factory=lambda: recorder,
+        )
+
+    first = make_archive(SampleSource())
+    await first.async_start()
+    assert (await first.async_sync_range(target, target)).outcome == "failed"
+
+    partition = stores["garmin_connect.entry-1.numeric_source_dates_2026"]
+    partition.fail_partition_save = False
+    restarted = make_archive(EmptySource())
+    await restarted.async_start()
+    assert (await restarted.async_sync_range(target, target)).outcome == "written"
+
+    statistic_id = statistic_id_for("opaque-account-key-123", "heart_rate")
+    assert partition.data["dates"][statistic_id] == {instant.isoformat(): target.isoformat()}
+    assert partition.data["tombstones"] == []
 
 
 @pytest.mark.asyncio
