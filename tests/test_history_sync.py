@@ -653,6 +653,37 @@ async def test_sleep_numeric_stream_presence_is_sparse_and_valid_points_are_writ
 
 
 @pytest.mark.asyncio
+async def test_negative_sleep_stream_value_fails_the_date_without_silent_filtering() -> None:
+    target = date(2026, 7, 24)
+    session = parse_sleep_sessions(
+        {
+            "startTime": "2026-07-24T23:45:00Z",
+            "endTime": "2026-07-25T07:15:00Z",
+            "sleepHeartRate": [["2026-07-25T00:00:00Z", -2]],
+        },
+        target,
+    )[0]
+
+    class Source:
+        async def async_fetch_details(self, _target: date, metric: str) -> object:
+            return (session,) if metric == "sleep_sessions" else ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+    archive = _partition_archive(Source(), recorder, {})
+    await archive.async_start()
+
+    report = await archive.async_sync_range(target, target)
+
+    assert report.outcome == "failed"
+    assert report.error_type == "sleep_stream_invalid"
+    assert not any(
+        call.args[1].key.startswith("sleep_")
+        for call in recorder.async_write.await_args_list
+    )
+
+
+@pytest.mark.asyncio
 async def test_many_sleep_sessions_keep_stream_presence_in_annual_partition() -> None:
     target = date(2026, 7, 24)
     sessions_payload = {
@@ -713,11 +744,12 @@ async def test_many_sleep_sessions_keep_stream_presence_in_annual_partition() ->
     await archive.async_start()
     assert (await archive.async_sync_range(target, target)).outcome == "written"
     catalog = stores["garmin_connect.e.history_catalog"]
-    assert len(catalog.data["presence"][target.isoformat()]) == 33
+    assert len(catalog.data["presence"][target.isoformat()]) == 40
     assert not any(
-        key.startswith("sleep_") and ":" in key
+        key.startswith(("sleep_heart_rate:", "sleep_hrv:", "sleep_body_battery:", "sleep_stress:", "sleep_respiration:", "sleep_spo2:", "sleep_movement:"))
         for key in catalog.data["presence"][target.isoformat()]
     )
+    assert catalog.data["presence"][target.isoformat()]["sleep_stream:heart_rate"] == "null"
 
     restarted = _partition_archive(Source(), recorder, stores)
     await restarted.async_start()
@@ -792,11 +824,11 @@ async def test_snapshot_archive_writes_present_fields_and_restarts_from_checkpoi
         TRAINING_FITNESS_TREND_METADATA.key,
         TRAINING_RECOVERY_TIME_METADATA.key,
     }
-    assert all(call.args[2][0].timestamp == datetime(2026, 7, 24, tzinfo=UTC) for call in snapshot_calls)
+    assert all(call.args[2][0].timestamp == datetime(2026, 7, 23, 16, tzinfo=UTC) for call in snapshot_calls)
     assert all(call.args[2][0].request_date == target for call in snapshot_calls)
     recovery_call = next(call for call in snapshot_calls if call.args[1].key == TRAINING_RECOVERY_TIME_METADATA.key)
     assert recovery_call.args[0] == statistic_id_for("opaque-account-key-1234567890", TRAINING_RECOVERY_TIME_METADATA.key)
-    assert recovery_call.args[2][0].timestamp == datetime(2026, 7, 24, tzinfo=UTC)
+    assert recovery_call.args[2][0].timestamp == datetime(2026, 7, 23, 16, tzinfo=UTC)
     assert recovery_call.args[1].unit_of_measurement == "s"
     assert all(call.args[0] == statistic_id_for("opaque-account-key-1234567890", call.args[1].key) for call in snapshot_calls)
     assert store.data["presence"][target.isoformat()]["training_status:recovery_time"] == "present"
@@ -1049,6 +1081,12 @@ async def test_sleep_streams_write_distinct_statistics_and_calendar_stays_bounde
         statistic_id_for("opaque-account-key-1234567890", f"sleep_{metric}:" + session.logical_id)
         for metric in ("heart_rate", "hrv", "body_battery", "stress", "respiration", "spo2", "movement")
     }
+    stress_write = next(
+        call
+        for call in recorder.async_write.await_args_list
+        if call.args[1].key == "sleep_stress"
+    )
+    assert [sample.value for sample in stress_write.args[2]] == list(range(31))
     assert report.inserted_count >= 7
     events = await archive.async_get_calendar_events("sleep", date(2026, 7, 24), date(2026, 7, 25))
     assert events[0].summary == "Sleep"

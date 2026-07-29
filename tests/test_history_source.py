@@ -333,7 +333,7 @@ def test_snapshot_all_null_timestamp_aliases_fall_back_to_target_date() -> None:
         TRAINING_STATUS_FIELDS,
     )
 
-    assert snapshot.timestamp == datetime(2026, 7, 24, tzinfo=UTC)
+    assert snapshot.timestamp == datetime(2026, 7, 23, 16, tzinfo=UTC)
     assert snapshot.raw_timestamp == target.isoformat()
     assert snapshot.fields["acute_load"] == ("null", None)
     assert snapshot.fields["vo2_max"] == ("absent", None)
@@ -597,7 +597,7 @@ def test_date_only_calendar_metadata_remains_supported() -> None:
         date(2026, 7, 24),
         TRAINING_STATUS_FIELDS,
     )
-    assert snapshot.timestamp == datetime(2026, 7, 24, tzinfo=UTC)
+    assert snapshot.timestamp == datetime(2026, 7, 23, 16, tzinfo=UTC)
 
 
 def test_hrv_nested_summary_is_separate_and_typed() -> None:
@@ -853,6 +853,33 @@ def test_daily_summary_and_training_snapshot_presence_and_type_drift() -> None:
             date(2026, 7, 24),
             TRAINING_STATUS_FIELDS,
         )
+
+
+def test_date_only_snapshots_use_the_utc_plus_eight_calendar_bucket() -> None:
+    """Calendar summaries retain their source date without inventing a Garmin instant."""
+    calendar_date = date(2027, 1, 1)
+
+    bucketed = normalize_snapshot(
+        {"calendarDate": calendar_date.isoformat(), "acuteLoad": 42},
+        calendar_date,
+        TRAINING_STATUS_FIELDS,
+    )
+    aware = normalize_snapshot(
+        {
+            "calendarDate": calendar_date.isoformat(),
+            "startTime": "2027-01-01T00:00:00+09:00",
+            "acuteLoad": 43,
+        },
+        calendar_date,
+        TRAINING_STATUS_FIELDS,
+    )
+
+    assert bucketed.timestamp == datetime(2026, 12, 31, 16, tzinfo=UTC)
+    assert bucketed.raw_timestamp == calendar_date.isoformat()
+    assert bucketed.calendar_date == calendar_date
+    assert aware.timestamp == datetime(2026, 12, 31, 15, tzinfo=UTC)
+    assert aware.raw_timestamp == "2027-01-01T00:00:00+09:00"
+    assert aware.calendar_date == calendar_date
 
 
 def test_snapshot_normalization_uses_sanitized_fixture() -> None:

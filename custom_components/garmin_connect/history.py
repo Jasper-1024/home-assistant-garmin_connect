@@ -110,12 +110,13 @@ _HISTORY_MAX_DAYS = 31
 _FIRST_SYNC_FIT_LIMIT = 1
 _PROSPECTIVE_CYCLE_INTERVAL = timedelta(minutes=15)
 _PROSPECTIVE_CYCLE_FIT_LIMIT = 0
-_PRESENCE_STATES = frozenset({"null", "empty", "all-null", "missing", "unsupported", "returned-empty", "present", "absent", "failed"})
+_PRESENCE_STATES = frozenset({"null", "empty", "all-null", "missing", "unsupported", "returned-empty", "present", "absent", "failed", "mixed"})
 # The frozen numeric catalog currently produces 33 base presence keys: 13
-# families, 12 segmented total contexts, and 8 snapshot fields. The remaining
-# bounded slots cover sleep-stream states without accepting an unbounded payload.
+# families, 12 segmented total contexts, and 8 snapshot fields. Seven aggregate
+# sleep-stream states retain date-level availability without session-key growth.
 _MAX_PRESENCE_METRICS = 64
 _SLEEP_SCHEMA_VERSION = 1
+_SLEEP_PRESENCE_PREFIX = "sleep_stream:"
 _SLEEP_STREAM_METADATA = {
     "heart_rate": SLEEP_HEART_RATE_METADATA,
     "hrv": SLEEP_HRV_METADATA,
@@ -125,6 +126,35 @@ _SLEEP_STREAM_METADATA = {
     "spo2": SLEEP_SPO2_METADATA,
     "movement": SLEEP_MOVEMENT_METADATA,
 }
+# Garmin documents -1 as the no-data sentinel for sleep stress; it is not a
+# numeric measurement and therefore is not sent to Recorder.
+_SLEEP_NEGATIVE_SENTINELS = {"stress": frozenset({-1.0})}
+
+
+def _aggregate_sleep_presence(
+    sessions_by_year: Mapping[str, Mapping[str, dict[str, Any]]], target: date
+) -> dict[str, str]:
+    """Summarize per-session sleep availability into seven bounded date keys."""
+    states_by_metric: dict[str, list[str]] = {}
+    for records in sessions_by_year.values():
+        for record in records.values():
+            if record.get("calendar_date") != target.isoformat():
+                continue
+            stream_presence = record.get("stream_presence")
+            if not isinstance(stream_presence, Mapping):
+                continue
+            for metric, state in stream_presence.items():
+                if metric in _SLEEP_STREAM_METADATA and state in _PRESENCE_STATES:
+                    states_by_metric.setdefault(metric, []).append(state)
+    aggregate: dict[str, str] = {}
+    for metric, states in states_by_metric.items():
+        distinct = set(states)
+        aggregate[f"{_SLEEP_PRESENCE_PREFIX}{metric}"] = (
+            next(iter(distinct))
+            if len(distinct) == 1
+            else "present" if "present" in distinct else "mixed"
+        )
+    return aggregate
 
 
 class HistoryArchiveState(StrEnum):
@@ -868,7 +898,12 @@ class GarminHistoryArchive:
                 metadata_for_field = snapshot_metadata.get(field)
                 if state != "present" or value is None or metadata_for_field is None:
                     continue
-                snapshot = NormalizedSample(details.timestamp, target, details.raw_timestamp, value)
+                snapshot = NormalizedSample(
+                    details.timestamp,
+                    details.calendar_date or target,
+                    details.raw_timestamp,
+                    value,
+                )
                 statistic_id = statistic_id_for(self._account_key(), metadata_for_field.key)
                 await self._async_prepare_numeric_source_dates(statistic_id, (snapshot,))
                 snapshot_outcome = await recorder.async_write(
@@ -1065,6 +1100,16 @@ class GarminHistoryArchive:
                 if not isinstance(sleep_details, tuple) or any(not isinstance(item, SleepSession) for item in sleep_details):
                     raise SleepSchemaError("sleep session result has invalid shape")
                 for session in sleep_details:
+                    for stream in session.streams:
+                        sentinels = _SLEEP_NEGATIVE_SENTINELS.get(stream.metric, frozenset())
+                        if any(
+                            point.value is not None
+                            and point.value < 0
+                            and point.value not in sentinels
+                            for point in stream.points
+                        ):
+                            raise _NumericFamilyError("sleep_stream_invalid")
+                for session in sleep_details:
                     year = str(session.start.year)
                     sleep_dirty_years.add(year)
                     sleep_sessions.setdefault(year, {})[session.logical_id] = session_record(session)
@@ -1075,7 +1120,10 @@ class GarminHistoryArchive:
                         samples = tuple(
                             NormalizedSample(point.timestamp, session.calendar_date, point.raw_timestamp, point.value)
                             for point in stream.points
-                            if point.value is not None and point.value >= 0
+                            if point.value is not None
+                            and point.value not in _SLEEP_NEGATIVE_SENTINELS.get(
+                                stream.metric, frozenset()
+                            )
                         )
                         stream_statistic_id = statistic_id_for(
                             self._account_key(),
@@ -1091,6 +1139,11 @@ class GarminHistoryArchive:
                         inserted += getattr(stream_outcome, "inserted_count", stream_outcome.accepted_count)
                         updated += getattr(stream_outcome, "updated_count", 0)
                         skipped += getattr(stream_outcome, "skipped_count", 0)
+                date_presence = presence.setdefault(target_key, {})
+                for key in tuple(date_presence):
+                    if key.startswith(_SLEEP_PRESENCE_PREFIX):
+                        del date_presence[key]
+                date_presence.update(_aggregate_sleep_presence(sleep_sessions, target))
                 for event_metric in ("health_events_daily", "health_events_body_battery"):
                     event_details = await sleep_fetch(target, event_metric) if callable(sleep_descriptor) and callable(sleep_fetch) else ()
                     if not isinstance(event_details, tuple) or any(not isinstance(item, NormalizedHealthEvent) for item in event_details):

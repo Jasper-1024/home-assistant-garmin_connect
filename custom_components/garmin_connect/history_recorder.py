@@ -17,6 +17,11 @@ from .history_source import NormalizedSample
 
 _RECORDER_CHUNK_SIZE = 1024
 _RECENT_VALUE_CACHE_SIZE = 4096
+_RECORDER_BARRIER_TIMEOUT = 10
+
+
+class _RecorderBarrierTimeoutError(RuntimeError):
+    """Raised when Recorder does not confirm an enqueued statistics write."""
 
 
 class HistoryMetric(StrEnum):
@@ -157,7 +162,11 @@ class GarminHistoryRecorder:
             loop = asyncio.get_running_loop()
             future = loop.create_future()
             self._recorder.queue_task(SynchronizeTask(future))
-            await future
+            try:
+                async with asyncio.timeout(_RECORDER_BARRIER_TIMEOUT):
+                    await asyncio.shield(future)
+            except TimeoutError as err:
+                raise _RecorderBarrierTimeoutError from err
             chunk_inserted = chunk_updated = chunk_skipped = 0
             for sample in chunk:
                 normalized = sample.timestamp.astimezone(UTC)
@@ -199,8 +208,13 @@ class GarminHistoryRecorder:
                 skipped += counts[2]
         except asyncio.CancelledError:
             raise
-        except (AttributeError, ImportError, TypeError, ValueError, RuntimeError):
-            return RecorderWriteOutcome(0, "failed", "recorder_unavailable")
+        except (AttributeError, ImportError, TypeError, ValueError, RuntimeError) as err:
+            error_type = (
+                "recorder_barrier"
+                if isinstance(err, _RecorderBarrierTimeoutError)
+                else "recorder_unavailable"
+            )
+            return RecorderWriteOutcome(0, "failed", error_type)
         return RecorderWriteOutcome(
             len(samples), inserted_count=inserted, updated_count=updated, skipped_count=skipped
         )

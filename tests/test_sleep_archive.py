@@ -236,6 +236,20 @@ def test_sleep_stream_mixed_null_objects_preserve_valid_points_and_reject_malfor
         )
 
 
+def test_sleep_parser_retains_negative_numeric_points_for_archive_validation() -> None:
+    """The parser must not silently turn a documented value into a gap."""
+    session = parse_sleep_sessions(
+        {
+            "startTime": "2026-07-24T23:45:00Z",
+            "endTime": "2026-07-25T07:15:00Z",
+            "sleepHeartRate": [["2026-07-25T00:00:00Z", -2]],
+        },
+        date(2026, 7, 24),
+    )[0]
+
+    assert session.streams[0].points[0].value == -2.0
+
+
 def test_sleep_measurement_timestamp_without_offset_fails_closed() -> None:
     with pytest.raises(SleepSchemaError):
         parse_sleep_sessions(

@@ -20,6 +20,7 @@ from homeassistant.helpers.recorder import async_initialize_recorder
 from homeassistant.setup import async_setup_component
 
 import custom_components.garmin_connect.const as const
+from custom_components.garmin_connect import history_recorder as history_recorder_module
 from custom_components.garmin_connect.const import (
     CONF_ARCHIVE_ACTIVATION_DATE,
     CONF_ARCHIVE_ENABLED,
@@ -31,7 +32,11 @@ from custom_components.garmin_connect.history import (
     HomeAssistantRecorderCompatibility,
     RecorderCompatibilityResult,
 )
-from custom_components.garmin_connect.history_recorder import RecorderWriteOutcome, statistic_id_for
+from custom_components.garmin_connect.history_recorder import (
+    GarminHistoryRecorder,
+    RecorderWriteOutcome,
+    statistic_id_for,
+)
 from custom_components.garmin_connect.history_sensor import GarminHistoryStatusSensor
 from custom_components.garmin_connect.history_source import (
     GarminHistorySource,
@@ -248,6 +253,173 @@ async def test_numeric_source_calendar_dates_are_durable_across_restart_and_upse
     assert numeric_store.data["dates"][statistic_id] == {
         "2026-07-24T23:30:00+00:00": "2026-07-25"
     }
+
+
+@pytest.mark.asyncio
+async def test_scratch_recorder_archive_confirms_bucket_revision_and_provenance_after_restart() -> None:
+    """Exercise Recorder identity, revisions, restart, and private provenance together."""
+    target = date(2027, 1, 1)
+    bucket = datetime(2026, 12, 31, 16, tzinfo=UTC)
+    hass = _hass()
+    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
+    checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
+    stores: dict[str, FakeStore] = {}
+
+    def store_factory(_hass, _version, path, **kwargs):
+        return stores.setdefault(path, FakeStore())
+
+    class ScratchRecorder:
+        def __init__(self) -> None:
+            self.rows: dict[tuple[str, datetime], dict[str, float | datetime]] = {}
+
+        def async_import_statistics(self, metadata, stats, table) -> None:
+            del table
+            for row in stats:
+                self.rows[(metadata["statistic_id"], row["start"])] = row
+
+        def queue_task(self, task) -> None:
+            task.future.set_result(None)
+
+    class Source:
+        def __init__(self) -> None:
+            self.value = 60.0
+
+        async def async_fetch_details(self, _request_date: date, metric: str) -> object:
+            if metric in {
+                "sleep_sessions",
+                "health_events_daily",
+                "health_events_body_battery",
+                "timed_activities",
+            }:
+                return ()
+            if metric == "daily_summary":
+                return SnapshotData(
+                    {"abnormal_heart_rate_alerts": ("absent", None)},
+                    bucket,
+                    target.isoformat(),
+                    calendar_date=target,
+                )
+            if metric == "training_status":
+                return SnapshotData(
+                    {
+                        "acute_load": ("absent", None),
+                        "chronic_load": ("absent", None),
+                        "load_balance": ("absent", None),
+                        "acwr": ("absent", None),
+                        "vo2_max": ("absent", None),
+                        "fitness_trend": ("absent", None),
+                        "recovery_time": ("absent", None),
+                    },
+                    bucket,
+                    target.isoformat(),
+                    calendar_date=target,
+                )
+            if metric != "heart_rate":
+                return SourceSeries((), "empty")
+            return SourceSeries(
+                (
+                    NormalizedSample(
+                        datetime(2027, 1, 1, tzinfo=ZoneInfo("Asia/Taipei")),
+                        target,
+                        "2027-01-01",
+                        self.value,
+                    ),
+                ),
+                "present",
+            )
+
+    recorder = ScratchRecorder()
+    source = Source()
+
+    def make_archive() -> GarminHistoryArchive:
+        return GarminHistoryArchive(
+            hass,
+            entry,
+            recorder_checker=checker,
+            store_factory=store_factory,
+            source_factory=lambda _client, _gate: source,
+            recorder_factory=lambda: GarminHistoryRecorder(recorder),
+        )
+
+    first = make_archive()
+    await first.async_start()
+    assert (await first.async_sync_range(target, target)).outcome == "written"
+    statistic_id = statistic_id_for("opaque-account-key-123", "heart_rate")
+    assert recorder.rows[(statistic_id, bucket)]["mean"] == 60.0
+    numeric_store = stores["garmin_connect.entry-1.numeric_source_dates_2026"]
+    assert numeric_store.data["dates"][statistic_id] == {bucket.isoformat(): target.isoformat()}
+
+    restarted = make_archive()
+    await restarted.async_start()
+    restarted._completed_dates.clear()
+    source.value = 61.0
+    assert (await restarted.async_sync_range(target, target)).outcome == "written"
+
+    assert list(recorder.rows) == [(statistic_id, bucket)]
+    assert recorder.rows[(statistic_id, bucket)]["mean"] == 61.0
+    assert numeric_store.data["dates"][statistic_id] == {bucket.isoformat(): target.isoformat()}
+
+
+@pytest.mark.asyncio
+async def test_stalled_recorder_barrier_leaves_numeric_provenance_intent_recoverable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = date(2026, 12, 31)
+    instant = datetime(2026, 12, 31, 23, 30, tzinfo=UTC)
+    hass = _hass()
+    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
+    checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
+    stores: dict[str, FakeStore] = {}
+
+    def store_factory(_hass, _version, path, **kwargs):
+        return stores.setdefault(path, FakeStore())
+
+    class StalledRecorder:
+        def async_import_statistics(self, metadata, stats, table) -> None:
+            del metadata, stats, table
+
+        def queue_task(self, task) -> None:
+            del task
+
+    class Source:
+        async def async_fetch_details(self, _request_date: date, metric: str) -> object:
+            if metric in {
+                "sleep_sessions",
+                "health_events_daily",
+                "health_events_body_battery",
+                "timed_activities",
+            }:
+                return ()
+            if metric in {"daily_summary", "training_status"}:
+                return SnapshotData({}, instant, target.isoformat(), calendar_date=target)
+            if metric == "heart_rate":
+                return SourceSeries(
+                    (NormalizedSample(instant, target, instant.isoformat(), 60.0),),
+                    "present",
+                )
+            return SourceSeries((), "empty")
+
+    monkeypatch.setattr(history_recorder_module, "_RECORDER_BARRIER_TIMEOUT", 0)
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=checker,
+        store_factory=store_factory,
+        source_factory=lambda _client, _gate: Source(),
+        recorder_factory=lambda: GarminHistoryRecorder(StalledRecorder()),
+    )
+    await archive.async_start()
+
+    report = await archive.async_sync_range(target, target)
+
+    statistic_id = statistic_id_for("opaque-account-key-123", "heart_rate")
+    catalog = stores["garmin_connect.entry-1.history_catalog"].data
+    assert report.outcome == "failed"
+    assert report.error_type == "recorder_barrier"
+    assert catalog["numeric_source_date_outbox"] == {
+        "2026": {statistic_id: {instant.isoformat(): target.isoformat()}}
+    }
+    assert "garmin_connect.entry-1.numeric_source_dates_2026" not in stores
 
 
 @pytest.mark.asyncio

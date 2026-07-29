@@ -6,7 +6,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from .request_gate import GarminRequestGate, GarminRequestPriority
@@ -21,6 +21,7 @@ class HistorySchemaError(ValueError):
 
 
 _MISSING = object()
+_CALENDAR_BUCKET_TIME_ZONE = timezone(timedelta(hours=8))
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +80,7 @@ class SnapshotData:
     timestamp: datetime
     raw_timestamp: Any
     events: tuple[NormalizedHealthEvent, ...] = ()
+    calendar_date: date | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,24 +328,25 @@ def normalize_snapshot(
 ) -> SnapshotData:
     """Extract known numeric fields without inferring absent or null values."""
     if payload is None:
-        return SnapshotData(dict.fromkeys(field_aliases, ("null", None)), datetime.combine(target_date, datetime.min.time(), tzinfo=UTC), target_date.isoformat())
+        return SnapshotData(
+            dict.fromkeys(field_aliases, ("null", None)),
+            _calendar_bucket(target_date),
+            target_date.isoformat(),
+            calendar_date=target_date,
+        )
     if not isinstance(payload, dict):
         raise HistorySchemaError("snapshot payload is not an object")
-    timestamp_value = _first_non_null(payload, ("timestamp", "startTime", "calendarDate"))
+    calendar_date = _snapshot_calendar_date(payload.get("calendarDate", _MISSING), target_date)
+    timestamp_value = _first_non_null(payload, ("timestamp", "startTime"))
     if timestamp_value is _MISSING or timestamp_value is None:
-        timestamp_key = None
-        timestamp_value = target_date.isoformat()
+        timestamp = _calendar_bucket(calendar_date)
+        raw_timestamp = calendar_date.isoformat()
     else:
-        timestamp_key = next(
-            key for key in ("timestamp", "startTime", "calendarDate")
-            if key in payload and payload[key] is not None
-        )
-    timestamp = _timestamp(
-        timestamp_value,
-        allow_date_only=timestamp_key in (None, "calendarDate"),
-    )
-    if timestamp is None:
-        raise HistorySchemaError("snapshot timestamp is invalid")
+        source_instant = _timestamp(timestamp_value)
+        if source_instant is None:
+            raise HistorySchemaError("snapshot timestamp is invalid")
+        timestamp = source_instant
+        raw_timestamp = timestamp_value
     fields: dict[str, tuple[str, float | None]] = {}
     for name, aliases in field_aliases.items():
         found = _nested_value(payload, aliases)
@@ -358,7 +361,7 @@ def normalize_snapshot(
         else:
             fields[name] = ("present", float(value))
     events = normalize_health_events(payload, target_date) if "abnormalHRValuesArray" in payload or "abnormalHeartRateEvents" in payload else ()
-    return SnapshotData(fields, timestamp, timestamp_value, events)
+    return SnapshotData(fields, timestamp, raw_timestamp, events, calendar_date)
 
 
 DAILY_SUMMARY_FIELDS = {"abnormal_heart_rate_alerts": ("abnormalHeartRateAlertsCount",)}
@@ -390,6 +393,26 @@ def _timestamp(value: Any, *, allow_date_only: bool = False) -> datetime | None:
             parsed = parsed.replace(tzinfo=UTC)
         return parsed.astimezone(UTC)
     return None
+
+
+def _snapshot_calendar_date(value: Any, fallback: date) -> date:
+    """Validate a snapshot calendar date without treating it as an instant."""
+    if value is _MISSING or value is None:
+        return fallback
+    if not isinstance(value, str):
+        raise HistorySchemaError("snapshot calendar date is invalid")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as err:
+        raise HistorySchemaError("snapshot calendar date is invalid") from err
+    if parsed.isoformat() != value:
+        raise HistorySchemaError("snapshot calendar date is invalid")
+    return parsed
+
+
+def _calendar_bucket(calendar_date: date) -> datetime:
+    """Return the canonical UTC+08:00 instant for a date-summary bucket."""
+    return datetime.combine(calendar_date, datetime.min.time(), tzinfo=_CALENDAR_BUCKET_TIME_ZONE).astimezone(UTC)
 
 
 def _descriptors(payload: dict[str, Any], keys: tuple[str, ...]) -> dict[str, int]:
