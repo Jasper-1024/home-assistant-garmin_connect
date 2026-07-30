@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import secrets
+import stat
 from collections.abc import Callable, Collection, Iterator, Mapping
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, timezone
@@ -1183,6 +1184,31 @@ class GarminHistoryArchive:
         validate_private_fit_file(account_path)
         fsync_directory(account_directory)
         return account_path
+
+    def _remove_corrupt_account_fit(self, path: Path | None) -> None:
+        """Remove only a corrupt private FIT copy so the queue can retry.
+
+        Legacy migration deliberately copies the shared source. If decoding
+        that copy fails, leaving the account-owned 0600 file in place makes
+        ``async_archive_fit`` treat it as an existing file forever. Do not
+        remove symlinks, non-regular files, or files outside this account's
+        directory; those remain isolated/quarantined for explicit repair.
+        """
+        if path is None or path.parent != self._fit_directory():
+            return
+        try:
+            file_stat = os.lstat(path)
+        except FileNotFoundError:
+            return
+        if (
+            stat.S_ISREG(file_stat.st_mode)
+            and stat.S_IMODE(file_stat.st_mode) == 0o600
+        ):
+            try:
+                path.unlink()
+                fsync_directory(path.parent)
+            except OSError:
+                _LOGGER.warning("Corrupt Garmin FIT copy could not be removed")
 
     @property
     def hrv_summaries(self) -> Mapping[str, Mapping[str, Any]]:
@@ -3811,6 +3837,7 @@ class GarminHistoryArchive:
             raw_fits = {}
         try:
             for key, value in raw_fits.items():
+                fit_path: Path | None = None
                 try:
                     restored_fit = fit_record(value)
                     if restored_fit["logical_id"] != key or key not in activities:
@@ -3819,12 +3846,17 @@ class GarminHistoryArchive:
                     if fit_path is None:
                         raise FitArchiveError("FIT account directory is unavailable")
                     validate_private_fit_file(fit_path)
-                    inspected = await asyncio.to_thread(inspect_fit, fit_path, 0o600)
+                    try:
+                        inspected = await asyncio.to_thread(inspect_fit, fit_path, 0o600)
+                        safe_summary = validated_fit_summary(inspected)
+                    except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError, FitArchiveError):
+                        self._remove_corrupt_account_fit(fit_path)
+                        raise
                     parsed_fits[key] = fit_record(
                         {
                             "logical_id": key,
                             "path": fit_path.name,
-                            "summary": validated_fit_summary(inspected),
+                            "summary": safe_summary,
                         }
                     )
                 except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError, FitArchiveError):

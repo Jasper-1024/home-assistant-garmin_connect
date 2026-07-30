@@ -243,6 +243,126 @@ async def test_legacy_shared_fit_is_copied_only_for_indexed_account_record(
 
 
 @pytest.mark.asyncio
+async def test_corrupt_legacy_fit_copy_is_removed_and_retried_without_touching_valid_fit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    corrupt_activity = _activity()
+    valid_activity = normalize_activities(
+        [
+            {
+                "activityId": 456,
+                "activityType": "cycling",
+                "startTime": "2026-08-01T11:00:00Z",
+                "durationInSeconds": 120,
+            }
+        ],
+        date(2026, 8, 1),
+    )[0]
+    account_key = "opaque-account-key-1234567890"
+    fit_root = tmp_path / "fit"
+    fit_root.mkdir(mode=0o700)
+    corrupt_legacy_path = fit_root / fit_file_name(corrupt_activity.logical_id)
+    corrupt_legacy_path.write_bytes(b"corrupt legacy FIT")
+    corrupt_legacy_path.chmod(0o600)
+    valid_path = fit_root / account_key / fit_file_name(valid_activity.logical_id)
+    valid_path.parent.mkdir(mode=0o700)
+    valid_path.write_bytes(b"valid account FIT")
+    valid_path.chmod(0o600)
+    summary = _fit_summary()
+    catalog = _Store(
+        {
+            "schema_version": 1,
+            "account_key": account_key,
+            "completed_dates": [],
+            "sleep_index": {
+                "2026": [corrupt_activity.logical_id, valid_activity.logical_id]
+            },
+            "event_index": {},
+            "activity_index": {
+                "2026": [corrupt_activity.logical_id, valid_activity.logical_id]
+            },
+            "fit_queue": [],
+            "fit_queue_quarantine": [],
+            "fit_queue_error": None,
+            "fit_last_eligible_download": None,
+        }
+    )
+    partition = _Store(
+        {
+            "schema_version": 1,
+            "sleep_schema_version": 1,
+            "account_key": account_key,
+            "year": "2026",
+            "sessions": {},
+            "events": {},
+            "activities": {
+                corrupt_activity.logical_id: _activity_record(corrupt_activity),
+                valid_activity.logical_id: _activity_record(valid_activity),
+            },
+            "fits": {
+                corrupt_activity.logical_id: {
+                    "logical_id": corrupt_activity.logical_id,
+                    "path": corrupt_legacy_path.name,
+                    "summary": summary,
+                },
+                valid_activity.logical_id: {
+                    "logical_id": valid_activity.logical_id,
+                    "path": valid_path.name,
+                    "summary": summary,
+                },
+            },
+        }
+    )
+    stores = {
+        "garmin_connect.entry-1.history_catalog": catalog,
+        "garmin_connect.entry-1.sleep_2026": partition,
+    }
+
+    def inspect(path: Path, _mode: int) -> dict:
+        if path.read_bytes() == b"corrupt legacy FIT":
+            raise FitArchiveError("FIT decode failed")
+        return {**summary, "file": {"integrity_ok": True, "decode_ok": True}}
+
+    monkeypatch.setattr(history_module, "inspect_fit", inspect)
+
+    class Source:
+        async def async_fetch(self, _target, _metric):
+            return ()
+
+        async def async_fetch_details(self, _target, metric):
+            return (
+                (corrupt_activity, valid_activity)
+                if metric == "timed_activities"
+                else ()
+            )
+
+    client = MagicMock()
+    client.download_activity = AsyncMock(return_value=b"replacement FIT")
+    archive = _archive(
+        Source(),
+        client,
+        catalog,
+        account_key=account_key,
+        stores=stores,
+        clock=lambda: datetime(2026, 8, 1, 13, tzinfo=UTC),
+    )
+    archive._hass.config.path.return_value = str(fit_root)
+
+    await archive.async_start()
+
+    corrupt_account_path = fit_root / account_key / corrupt_legacy_path.name
+    assert not corrupt_account_path.exists()
+    assert valid_path.read_bytes() == b"valid account FIT"
+
+    await archive.async_sync_range(date(2026, 8, 1), date(2026, 8, 1), fit_limit=1)
+
+    client.download_activity.assert_awaited_once_with(int(corrupt_activity.activity_id), "fit")
+    assert corrupt_account_path.read_bytes() == b"replacement FIT"
+    assert valid_path.read_bytes() == b"valid account FIT"
+    assert corrupt_legacy_path.read_bytes() == b"corrupt legacy FIT"
+
+
+@pytest.mark.asyncio
 async def test_legacy_shared_fit_is_copied_for_duplicate_accounts_without_stealing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

@@ -52,12 +52,14 @@ pytest -q \
   tests/test_history.py::test_manual_repair_accepts_one_and_31_days_but_rejects_32_before_requests \
   tests/test_history.py::test_manual_repair_reopens_settled_date_while_archive_is_disabled \
   tests/test_fit_queue.py::test_fit_queue_paces_downloads_and_recovers_pending_work_after_restart \
+  tests/test_fit_queue.py::test_fit_backlog_over_256_survives_restart_and_is_fully_consumed \
   tests/test_fit_queue.py::test_valid_local_fit_completes_queue_without_download \
   tests/test_fit_queue.py::test_fit_queue_isolated_by_account_and_background_gate \
   tests/test_fit_archive.py::test_fit_archive_validates_privately_and_atomically \
   tests/test_history.py::test_archive_rate_limit_enters_durable_backoff_without_cadence \
   tests/test_history.py::test_archive_rate_limit_backoff_survives_restart_and_expires_once \
   tests/test_history.py::test_first_sync_rate_limit_retries_after_expiry_without_restart \
+  tests/test_history.py::test_successful_archive_status_persists_and_restores_schedule \
   tests/test_history.py::test_archive_auth_classification_requires_genuine_account_failure \
   tests/test_history.py::test_archive_cycle_failure_does_not_break_foreground_request \
   tests/test_history.py::test_malformed_structured_record_fails_archive_without_blocking_foreground_work \
@@ -70,11 +72,14 @@ pytest -q \
 ```
 
 The matrix explicitly covers seven-day reconciliation, Manual Repair, FIT
-pacing/restart/valid-file skip/account isolation, archive-only 429 backoff
-including restart and expiry, genuine reauthentication and failure isolation,
-dormant Historical Backfill, and exact status/privacy output. The fixture,
-Recorder, and optional private replay gates remain part of the same command;
-the replay skips without a local 0600 capture.
+pacing/restart/valid-file skip/account isolation, the >256-item FIT backlog
+across restart and continued consumption, archive-only 429 backoff including
+restart and expiry, genuine reauthentication and failure isolation, dormant
+Historical Backfill, exact status/privacy output, and persistence/restoration
+of the archive success schedule. These tests are executable members of the
+single command, not documentation-only claims. The fixture, Recorder, and
+optional private replay gates remain part of the same command; the replay
+skips without a local 0600 capture.
 
 ## Current-day validation checklist
 

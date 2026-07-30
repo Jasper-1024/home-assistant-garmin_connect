@@ -66,6 +66,7 @@ RELEASE_GATE_GROUPS: dict[str, tuple[str, ...]] = {
     ),
     "fit_pacing_restart_skip_isolation": (
         "tests/test_fit_queue.py::test_fit_queue_paces_downloads_and_recovers_pending_work_after_restart",
+        "tests/test_fit_queue.py::test_fit_backlog_over_256_survives_restart_and_is_fully_consumed",
         "tests/test_fit_queue.py::test_valid_local_fit_completes_queue_without_download",
         "tests/test_fit_queue.py::test_fit_queue_isolated_by_account_and_background_gate",
         "tests/test_fit_archive.py::test_fit_archive_validates_privately_and_atomically",
@@ -74,6 +75,7 @@ RELEASE_GATE_GROUPS: dict[str, tuple[str, ...]] = {
         "tests/test_history.py::test_archive_rate_limit_enters_durable_backoff_without_cadence",
         "tests/test_history.py::test_archive_rate_limit_backoff_survives_restart_and_expires_once",
         "tests/test_history.py::test_first_sync_rate_limit_retries_after_expiry_without_restart",
+        "tests/test_history.py::test_successful_archive_status_persists_and_restores_schedule",
     ),
     "reauth_and_failure_isolation": (
         "tests/test_history.py::test_archive_auth_classification_requires_genuine_account_failure",
