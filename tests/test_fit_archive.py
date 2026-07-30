@@ -117,6 +117,76 @@ async def test_fit_archive_degrades_when_directory_fsync_is_unsupported(
 
 
 @pytest.mark.asyncio
+async def test_fit_archive_uses_path_chmod_without_fchmod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = AsyncMock()
+    client.download_activity.return_value = b"validated fit bytes"
+    monkeypatch.delattr(fit_archive_module.os, "fchmod", raising=False)
+
+    record = await async_archive_fit(
+        client=client,
+        activity_id="12345",
+        logical_id="7" * 24,
+        directory=tmp_path,
+        inspect=_valid_inspector,
+    )
+
+    final = tmp_path / record["path"]
+    assert final.read_bytes() == b"validated fit bytes"
+    assert final.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
+async def test_fit_archive_uses_windows_safe_permission_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = AsyncMock()
+    client.download_activity.return_value = b"validated fit bytes"
+    monkeypatch.setattr(fit_archive_module, "_IS_WINDOWS", True)
+    monkeypatch.delattr(fit_archive_module.os, "fchmod", raising=False)
+
+    record = await async_archive_fit(
+        client=client,
+        activity_id="12345",
+        logical_id="8" * 24,
+        directory=tmp_path,
+        inspect=_valid_inspector,
+    )
+
+    assert (tmp_path / record["path"]).read_bytes() == b"validated fit bytes"
+
+
+@pytest.mark.asyncio
+async def test_fit_archive_does_not_swallow_path_permission_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = AsyncMock()
+    client.download_activity.return_value = b"validated fit bytes"
+    monkeypatch.delattr(fit_archive_module.os, "fchmod", raising=False)
+
+    original_chmod = fit_archive_module.os.chmod
+
+    def fail_file_chmod(path: Path, mode: int) -> None:
+        if Path(path).name.startswith("."):
+            raise OSError("permission update failed")
+        original_chmod(path, mode)
+
+    monkeypatch.setattr(fit_archive_module.os, "chmod", fail_file_chmod)
+
+    with pytest.raises(FitArchiveError):
+        await async_archive_fit(
+            client=client,
+            activity_id="12345",
+            logical_id="9" * 24,
+            directory=tmp_path,
+            inspect=_valid_inspector,
+        )
+
+    assert not (tmp_path / fit_file_name("9" * 24)).exists()
+
+
+@pytest.mark.asyncio
 async def test_fit_archive_validation_failure_leaves_no_partial_file(tmp_path: Path) -> None:
     client = AsyncMock()
     client.download_activity.return_value = b"bad fit"

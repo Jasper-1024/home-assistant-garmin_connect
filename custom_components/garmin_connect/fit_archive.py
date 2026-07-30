@@ -17,6 +17,7 @@ _PRESENCE_KEYS = frozenset({"heart_rate", "temperature", "gps", "cadence", "spee
 _MAX_MESSAGES = 512
 _MAX_FIELDS = 256
 _MAX_NAME = 96
+_IS_WINDOWS = os.name == "nt"
 
 
 class FitArchiveError(ValueError):
@@ -46,6 +47,29 @@ def fsync_directory(directory: Path) -> None:
             pass
 
 
+def _set_private_file_mode(fd: int, path: Path) -> None:
+    """Set a FIT file's private mode, with a safe non-POSIX fallback."""
+    if not _IS_WINDOWS:
+        fchmod = getattr(os, "fchmod", None)
+        if callable(fchmod):
+            try:
+                fchmod(fd, 0o600)
+            except NotImplementedError:
+                pass
+            else:
+                return
+    os.chmod(path, 0o600)
+
+
+def _has_private_mode(path: Path, expected: int) -> bool:
+    """Return whether a path has the requested mode on this platform."""
+    if _IS_WINDOWS:
+        # Windows does not expose POSIX permission bits reliably. The chmod
+        # call still requests the private mode, while ACLs remain authoritative.
+        return True
+    return stat.S_IMODE(os.lstat(path).st_mode) == expected
+
+
 def ensure_private_fit_directory(directory: Path, *, create: bool) -> Path | None:
     """Return an account FIT directory after enforcing its private boundary."""
     try:
@@ -57,13 +81,15 @@ def ensure_private_fit_directory(directory: Path, *, create: bool) -> Path | Non
         directory_stat = os.lstat(directory)
     if stat.S_ISLNK(directory_stat.st_mode) or not stat.S_ISDIR(directory_stat.st_mode):
         raise FitArchiveError("FIT directory is not private")
-    if stat.S_IMODE(directory_stat.st_mode) != 0o700:
+    if _IS_WINDOWS:
+        os.chmod(directory, 0o700)
+    elif not _has_private_mode(directory, 0o700):
         os.chmod(directory, 0o700)
         directory_stat = os.lstat(directory)
         if (
             stat.S_ISLNK(directory_stat.st_mode)
             or not stat.S_ISDIR(directory_stat.st_mode)
-            or stat.S_IMODE(directory_stat.st_mode) != 0o700
+            or not _has_private_mode(directory, 0o700)
         ):
             raise FitArchiveError("FIT directory permissions are invalid")
     return directory
@@ -75,7 +101,7 @@ def validate_private_fit_file(path: Path) -> None:
     if (
         stat.S_ISLNK(file_stat.st_mode)
         or not stat.S_ISREG(file_stat.st_mode)
-        or stat.S_IMODE(file_stat.st_mode) != 0o600
+        or not _has_private_mode(path, 0o600)
     ):
         raise FitArchiveError("FIT file is not private")
 
@@ -182,7 +208,7 @@ async def async_archive_fit(
         fd, temporary_name = tempfile.mkstemp(prefix=f".{logical_id}.", suffix=".fit", dir=directory)
         temporary_path = Path(temporary_name)
         try:
-            os.fchmod(fd, 0o600)
+            _set_private_file_mode(fd, temporary_path)
             with os.fdopen(fd, "wb") as temporary_file:
                 temporary_file.write(content)
                 temporary_file.flush()

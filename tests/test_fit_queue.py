@@ -151,8 +151,12 @@ async def test_activity_discovery_deduplicates_durable_fit_work_without_download
     archive = _archive(Source(), client, store)
     await archive.async_start()
 
-    first = await archive.async_sync_range(activity.calendar_date, activity.calendar_date)
-    second = await archive.async_sync_range(activity.calendar_date, activity.calendar_date)
+    first = await archive.async_sync_range(
+        activity.calendar_date, activity.calendar_date, fit_limit=0
+    )
+    second = await archive.async_sync_range(
+        activity.calendar_date, activity.calendar_date, fit_limit=0
+    )
 
     assert first.outcome == "written"
     assert second.outcome == "written"
@@ -905,6 +909,58 @@ async def test_valid_local_fit_completes_queue_without_download(
         "activity", activity.calendar_date, activity.calendar_date
     )
     assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_corrupt_local_fit_is_removed_and_downloaded_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    activity = _activity()
+
+    class Source:
+        async def async_fetch(self, _target, _metric):
+            return ()
+
+        async def async_fetch_details(self, _target, metric):
+            return (activity,) if metric == "timed_activities" else ()
+
+    account_key = "opaque-account-key-1234567890"
+    fit_root = tmp_path / "fit"
+    corrupt_path = fit_root / account_key / fit_file_name(activity.logical_id)
+    corrupt_path.parent.mkdir(parents=True, mode=0o700)
+    corrupt_path.write_bytes(b"corrupt FIT")
+    corrupt_path.chmod(0o600)
+
+    summary = _fit_summary()
+
+    def inspect(path: Path, _mode: int) -> dict:
+        if path.read_bytes() == b"corrupt FIT":
+            raise FitArchiveError("FIT decode failed")
+        return {**summary, "file": {"integrity_ok": True, "decode_ok": True}}
+
+    monkeypatch.setattr(history_module, "inspect_fit", inspect)
+    client = MagicMock()
+    client.download_activity = AsyncMock(return_value=b"replacement FIT")
+    archive = _archive(
+        Source(),
+        client,
+        _Store(),
+        account_key=account_key,
+        clock=lambda: datetime(2026, 8, 1, 13, tzinfo=UTC),
+    )
+    archive._hass.config.path.return_value = str(fit_root)
+
+    await archive.async_start()
+    report = await archive.async_sync_range(
+        activity.calendar_date, activity.calendar_date, fit_limit=1
+    )
+
+    assert report.fit_count == 1
+    client.download_activity.assert_awaited_once_with(
+        int(activity.activity_id), "fit"
+    )
+    assert corrupt_path.read_bytes() == b"replacement FIT"
+    assert corrupt_path.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.asyncio

@@ -3026,15 +3026,20 @@ class GarminHistoryArchive:
         self, logical_id: str
     ) -> dict[str, Any] | None:
         """Validate an already-owned local FIT without spending pacing budget."""
+        path: Path | None = None
         try:
             directory = ensure_private_fit_directory(self._fit_directory(), create=False)
             if directory is None:
                 return None
             path = directory / fit_file_name(logical_id)
             validate_private_fit_file(path)
+        except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError, FitArchiveError):
+            return None
+        try:
             inspected = await asyncio.to_thread(inspect_fit, path, 0o600)
             safe_summary = validated_fit_summary(inspected)
         except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError, FitArchiveError):
+            self._remove_corrupt_account_fit(path)
             return None
         return {
             "logical_id": logical_id,

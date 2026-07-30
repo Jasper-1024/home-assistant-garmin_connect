@@ -69,7 +69,12 @@ RELEASE_GATE_GROUPS: dict[str, tuple[str, ...]] = {
         "tests/test_fit_queue.py::test_fit_backlog_over_256_survives_restart_and_is_fully_consumed",
         "tests/test_fit_queue.py::test_valid_local_fit_completes_queue_without_download",
         "tests/test_fit_queue.py::test_fit_queue_isolated_by_account_and_background_gate",
+        "tests/test_fit_queue.py::test_runtime_corrupt_local_fit_is_removed_and_downloaded_again",
         "tests/test_fit_archive.py::test_fit_archive_validates_privately_and_atomically",
+        "tests/test_fit_archive.py::test_fit_archive_degrades_when_directory_fsync_is_unsupported",
+        "tests/test_fit_archive.py::test_fit_archive_uses_path_chmod_without_fchmod",
+        "tests/test_fit_archive.py::test_fit_archive_uses_windows_safe_permission_fallback",
+        "tests/test_fit_archive.py::test_fit_archive_does_not_swallow_path_permission_errors",
     ),
     "rate_limit_backoff_restart_expiry": (
         "tests/test_history.py::test_archive_rate_limit_enters_durable_backoff_without_cadence",
