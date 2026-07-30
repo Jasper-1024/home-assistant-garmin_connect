@@ -9,7 +9,7 @@ repos:
         entry: codespell
         args:
           - --quiet-level=2
-          - --ignore-words-list=hass,ba,fo
+          - --ignore-words-list=hass,ba,fo,ptd
           - --skip=tests/fixtures/*,custom_components/garmin_connect/translations/*,www
 
       - id: pyupgrade
@@ -90,4 +90,3 @@ repos:
         entry: mixed-line-ending
         args:
           - --fix=lf
-

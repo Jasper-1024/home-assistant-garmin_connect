@@ -4088,15 +4088,15 @@ async def test_archive_lifecycle_persists_through_reload_restart_and_reenablemen
     entry.options = {CONF_ARCHIVE_ENABLED: True}
     second_now = datetime(2026, 8, 10, 1, 30, tzinfo=UTC)
     with patch("custom_components.garmin_connect.history.dt_util.utcnow", return_value=second_now):
-        reenabled = _archive(hass, entry, checker, FakeStore(data=store.data))
-        await reenabled.async_start()
+        re_enabled = _archive(hass, entry, checker, FakeStore(data=store.data))
+        await re_enabled.async_start()
 
-    reenabled_persisted = hass.config_entries.async_update_entry.call_args.kwargs["data"]
-    assert reenabled.status.state is HistoryArchiveState.IDLE
-    assert reenabled.activation_date == date(2026, 8, 10)
-    assert reenabled_persisted["history_account_key"] == account_key
-    assert reenabled_persisted[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-08-10"
-    assert reenabled_persisted[CONF_ARCHIVE_PREVIOUSLY_ENABLED] is True
+    re_enabled_persisted = hass.config_entries.async_update_entry.call_args.kwargs["data"]
+    assert re_enabled.status.state is HistoryArchiveState.IDLE
+    assert re_enabled.activation_date == date(2026, 8, 10)
+    assert re_enabled_persisted["history_account_key"] == account_key
+    assert re_enabled_persisted[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-08-10"
+    assert re_enabled_persisted[CONF_ARCHIVE_PREVIOUSLY_ENABLED] is True
 
 
 async def test_disablement_preserves_activation_date_and_manual_repair() -> None:

@@ -348,6 +348,7 @@ async def async_probe_capability(
     start_text = (start_date or target_date).isoformat()
     end_text = (end_date or target_date).isoformat()
     base_url = client._base_url
+    payload: Any
 
     try:
         if probe == "daily_summary":

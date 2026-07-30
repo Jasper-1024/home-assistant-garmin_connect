@@ -1722,9 +1722,7 @@ async def async_setup_entry(
     """Set up Garmin Connect sensors."""
     coordinators = entry.runtime_data
 
-    entities: list[
-        GarminConnectSensor | GarminConnectGearSensor | GarminConnectPowerToWeightSensor
-    ] = []
+    entities: list[SensorEntity] = []
 
     for coord_type, descriptions in _COORDINATOR_SENSOR_MAP:
         coordinator = getattr(coordinators, _COORDINATOR_ATTR[coord_type])
