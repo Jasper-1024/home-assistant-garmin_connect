@@ -55,6 +55,67 @@ FAMILY_MARKERS = {
     "garmin_summary_training": "daily_summary",
 }
 
+RELEASE_GATE_GROUPS: dict[str, tuple[str, ...]] = {
+    "seven_day_reconciliation": (
+        "tests/test_history.py::test_reconciliation_failure_stays_open_at_window_boundary",
+        "tests/test_history.py::test_settled_date_stays_terminal_after_confirmation_restart_and_next_scheduler",
+    ),
+    "manual_repair": (
+        "tests/test_history.py::test_manual_repair_accepts_one_and_31_days_but_rejects_32_before_requests",
+        "tests/test_history.py::test_manual_repair_reopens_settled_date_while_archive_is_disabled",
+    ),
+    "fit_pacing_restart_skip_isolation": (
+        "tests/test_fit_queue.py::test_fit_queue_paces_downloads_and_recovers_pending_work_after_restart",
+        "tests/test_fit_queue.py::test_valid_local_fit_completes_queue_without_download",
+        "tests/test_fit_queue.py::test_fit_queue_isolated_by_account_and_background_gate",
+        "tests/test_fit_archive.py::test_fit_archive_validates_privately_and_atomically",
+    ),
+    "rate_limit_backoff_restart_expiry": (
+        "tests/test_history.py::test_archive_rate_limit_enters_durable_backoff_without_cadence",
+        "tests/test_history.py::test_archive_rate_limit_backoff_survives_restart_and_expires_once",
+        "tests/test_history.py::test_first_sync_rate_limit_retries_after_expiry_without_restart",
+    ),
+    "reauth_and_failure_isolation": (
+        "tests/test_history.py::test_archive_auth_classification_requires_genuine_account_failure",
+        "tests/test_history.py::test_archive_cycle_failure_does_not_break_foreground_request",
+        "tests/test_history.py::test_malformed_structured_record_fails_archive_without_blocking_foreground_work",
+    ),
+    "dormant_historical_backfill": (
+        "tests/test_history.py::test_start_keeps_historical_backfill_dormant",
+        "tests/test_init.py::test_real_config_entry_lifecycle_keeps_backfill_dormant_and_surfaces_visible",
+    ),
+    "exact_status_privacy": (
+        "tests/test_release_gates.py::test_release_privacy_snapshots_cover_diagnostics_status_action_and_calendars",
+        "tests/test_history.py::test_status_sensor_exposes_only_privacy_safe_placeholders",
+    ),
+}
+
+REQUIRED_RELEASE_GATE_GROUPS = frozenset(
+    {
+        "seven_day_reconciliation",
+        "manual_repair",
+        "fit_pacing_restart_skip_isolation",
+        "rate_limit_backoff_restart_expiry",
+        "reauth_and_failure_isolation",
+        "dormant_historical_backfill",
+        "exact_status_privacy",
+    }
+)
+
+
+def test_executable_release_gate_matrix_covers_the_archive_contract() -> None:
+    """Keep the single release command's behavior coverage explicit."""
+    assert set(RELEASE_GATE_GROUPS) == REQUIRED_RELEASE_GATE_GROUPS
+    for targets in RELEASE_GATE_GROUPS.values():
+        assert targets
+        for target in targets:
+            path, separator, test_name = target.partition("::")
+            assert separator == "::"
+            assert path.startswith("tests/")
+            assert test_name.startswith("test_")
+            source = (ROOT / path).read_text()
+            assert f"def {test_name}" in source
+
 
 def test_frozen_fixtures_have_provenance_and_redaction_version() -> None:
     for name in FROZEN_FIXTURES:

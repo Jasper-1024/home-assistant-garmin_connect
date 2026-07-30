@@ -1025,6 +1025,8 @@ class GarminHistoryArchive:
         self._activation_date: date | None = None
         self._account_key_value: str | None = None
         self._archive_backoff_until: datetime | None = None
+        self._archive_last_success: datetime | None = None
+        self._archive_next_eligible_run: datetime | None = None
         self._archive_reauth_requested = False
         self._backfill: BackfillScheduler | None = None
         self._backfill_task: asyncio.Task[Any] | None = None
@@ -1076,15 +1078,30 @@ class GarminHistoryArchive:
         archive_backoff = self._archive_backoff_until
         archive_backoff_value = (
             archive_backoff.astimezone(UTC).isoformat()
-            if archive_backoff is not None and self._utc_now() < archive_backoff
+            if (
+                self._archive_enabled
+                and archive_backoff is not None
+                and self._utc_now() < archive_backoff
+            )
             else None
         )
+        next_eligible_run = None
+        if self._archive_enabled:
+            next_eligible_run = archive_backoff_value or (
+                self._archive_next_eligible_run.astimezone(UTC).isoformat()
+                if self._archive_next_eligible_run is not None
+                else self._status.next_eligible_run
+            )
         return {
             "activation_date": self._activation_date.isoformat() if self._activation_date else None,
             "queued_count": self._status.queued_count,
             "completed_count": self._status.completed_count,
-            "next_eligible_run": archive_backoff_value or self._status.next_eligible_run,
-            "last_success": self._status.last_success,
+            "next_eligible_run": next_eligible_run,
+            "last_success": (
+                self._archive_last_success.astimezone(UTC).isoformat()
+                if self._archive_last_success is not None
+                else self._status.last_success
+            ),
             "backoff_until": archive_backoff_value or self._status.backoff_until,
             "safe_error_class": self._status.safe_error_class,
         }
@@ -1281,6 +1298,9 @@ class GarminHistoryArchive:
         if self._archive_enabled:
             if self._archive_backoff_active():
                 self._schedule_next_cycle()
+                await self._async_persist_archive_status_best_effort(
+                    "Garmin archive startup schedule could not be persisted"
+                )
             else:
                 first_sync = self._async_run_first_sync_in_background()
                 if isinstance(self._hass, HomeAssistant):
@@ -1341,6 +1361,9 @@ class GarminHistoryArchive:
                 self._set_failed(report.error_type or "first_sync")
             return
         self._schedule_next_cycle()
+        await self._async_persist_archive_status_best_effort(
+            "Garmin archive schedule could not be persisted"
+        )
 
     def _utc_now(self) -> datetime:
         """Return the injected or Home Assistant UTC clock value."""
@@ -1376,6 +1399,35 @@ class GarminHistoryArchive:
         )
         await self._store.async_save(updated)
 
+    async def _async_save_archive_status(self) -> None:
+        """Persist the public lifecycle timestamps without private ledgers."""
+        if self._store is None:
+            raise ValueError("Store catalog is unavailable")
+        catalog = await self._store.async_load()
+        if not isinstance(catalog, Mapping):
+            raise ValueError("Store catalog is unavailable")
+        updated = dict(catalog)
+        updated["archive_last_success"] = (
+            self._archive_last_success.astimezone(UTC).isoformat()
+            if self._archive_last_success is not None
+            else None
+        )
+        updated["archive_next_eligible_run"] = (
+            self._archive_next_eligible_run.astimezone(UTC).isoformat()
+            if self._archive_next_eligible_run is not None
+            else None
+        )
+        await self._store.async_save(updated)
+
+    async def _async_persist_archive_status_best_effort(self, message: str) -> None:
+        """Persist lifecycle timestamps without masking archive data results."""
+        try:
+            await self._async_save_archive_status()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.warning(message, exc_info=True)
+
     async def _async_enter_archive_backoff(self) -> bool:
         """Persist a 24-hour archive-only rate-limit cooldown."""
         now = self._utc_now()
@@ -1405,7 +1457,11 @@ class GarminHistoryArchive:
         if self._cycle_timer_cancel is not None:
             self._cycle_timer_cancel()
             self._cycle_timer_cancel = None
+        if self._started and self._archive_enabled:
             self._schedule_next_cycle()
+            await self._async_persist_archive_status_best_effort(
+                "Garmin archive rate-limit schedule could not be persisted"
+            )
         return True
 
     async def _async_clear_archive_backoff(self) -> None:
@@ -1424,12 +1480,29 @@ class GarminHistoryArchive:
                 "Expired Garmin archive cooldown could not be cleared",
                 exc_info=True,
             )
-        self._status = replace(
-            self._status,
-            next_eligible_run=None,
-            backoff_until=None,
-            safe_error_class=None,
-            error_type=None,
+        if self._cycle_timer_cancel is None:
+            self._archive_next_eligible_run = None
+            self._status = replace(
+                self._status,
+                next_eligible_run=None,
+                backoff_until=None,
+                safe_error_class=None,
+                error_type=None,
+            )
+        else:
+            self._status = replace(
+                self._status,
+                next_eligible_run=(
+                    self._archive_next_eligible_run.astimezone(UTC).isoformat()
+                    if self._archive_next_eligible_run is not None
+                    else self._status.next_eligible_run
+                ),
+                backoff_until=None,
+                safe_error_class=None,
+                error_type=None,
+            )
+        await self._async_persist_archive_status_best_effort(
+            "Expired Garmin archive lifecycle state could not be persisted"
         )
 
     async def _async_request_archive_reauth_once(self) -> None:
@@ -1691,8 +1764,15 @@ class GarminHistoryArchive:
         ):
             return
         try:
+            delay = self._archive_next_delay()
+            next_eligible_run = (self._utc_now() + delay).astimezone(UTC)
             self._cycle_timer_cancel = self._timer_factory(
-                self._archive_next_delay(), self._async_cycle_tick
+                delay, self._async_cycle_tick
+            )
+            self._archive_next_eligible_run = next_eligible_run
+            self._status = replace(
+                self._status,
+                next_eligible_run=next_eligible_run.isoformat(),
             )
         except asyncio.CancelledError:
             raise
@@ -1728,6 +1808,9 @@ class GarminHistoryArchive:
     async def _async_run_cycle(self) -> None:
         """Synchronize current and durable Open Archive Dates in the background."""
         try:
+            await self._async_persist_archive_status_best_effort(
+                "Garmin archive schedule could not be persisted"
+            )
             if self._archive_backoff_active():
                 self._status = HistoryStatus(
                     HistoryArchiveState.BACKOFF,
@@ -2852,6 +2935,10 @@ class GarminHistoryArchive:
         await self._async_clear_archive_backoff()
         self._archive_reauth_requested = False
         self._runtime_sync_failure = False
+        self._archive_last_success = self._utc_now().astimezone(UTC)
+        await self._async_persist_archive_status_best_effort(
+            "Garmin archive last-success state could not be persisted"
+        )
         self._status = HistoryStatus(self._resting_state(), current_date=end_date.isoformat(), processed_dates=len(processed), record_count=inserted + updated, **self._backfill_status_fields())
         return HistorySyncReport(
             tuple(processed),
@@ -3085,6 +3172,16 @@ class GarminHistoryArchive:
             "archive_backoff_until": (
                 self._archive_backoff_until.astimezone(UTC).isoformat()
                 if self._archive_backoff_until is not None
+                else None
+            ),
+            "archive_last_success": (
+                self._archive_last_success.astimezone(UTC).isoformat()
+                if self._archive_last_success is not None
+                else None
+            ),
+            "archive_next_eligible_run": (
+                self._archive_next_eligible_run.astimezone(UTC).isoformat()
+                if self._archive_next_eligible_run is not None
                 else None
             ),
             "completed_dates": sorted(completed_dates),
@@ -3847,6 +3944,8 @@ class GarminHistoryArchive:
                     "schema_version": HISTORY_STORE_VERSION,
                     "account_key": account_key,
                     "archive_backoff_until": None,
+                    "archive_last_success": None,
+                    "archive_next_eligible_run": None,
                     "completed_dates": [],
                     "reconciliation": {},
                     "hrv_summaries": {},
@@ -3886,6 +3985,26 @@ class GarminHistoryArchive:
             ):
                 raise ValueError("Archive backoff state is invalid")
             self._archive_backoff_until = parsed_archive_backoff.astimezone(UTC)
+        for field_name, attribute_name in (
+            ("archive_last_success", "_archive_last_success"),
+            ("archive_next_eligible_run", "_archive_next_eligible_run"),
+        ):
+            raw_value = catalog.get(field_name)
+            if raw_value is None:
+                continue
+            if not isinstance(raw_value, str):
+                raise ValueError("Archive lifecycle state is invalid")
+            try:
+                parsed_value = datetime.fromisoformat(raw_value)
+            except ValueError as err:
+                raise ValueError("Archive lifecycle state is invalid") from err
+            if (
+                parsed_value.tzinfo is None
+                or parsed_value.utcoffset() is None
+                or parsed_value.astimezone(UTC).isoformat() != raw_value
+            ):
+                raise ValueError("Archive lifecycle state is invalid")
+            setattr(self, attribute_name, parsed_value.astimezone(UTC))
         completed = catalog.get("completed_dates", [])
         if not isinstance(completed, list) or any(not isinstance(item, str) for item in completed):
             raise ValueError("Store checkpoint is invalid")

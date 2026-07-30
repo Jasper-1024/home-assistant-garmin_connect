@@ -41,12 +41,40 @@ No release instruction in this document contacts Garmin production outside the
 operator's explicitly enabled prospective archive, and none starts Historical
 Backfill.
 
-The executable gates are `tests/test_release_gates.py`,
-`tests/test_history_recorder.py::test_release_gate_scratch_recorder_restart_revision_and_no_state_changed`,
-and `tests/test_fit_archive.py::test_optional_private_captured_fit_replay`.
-They assert fixture state coverage and provenance, privacy-safe diagnostics/
-status/action/Calendar shapes, raw timestamp/count/revision behavior, and
-optional private replay integrity without asserting fabricated live counts.
+The executable release-gate command is the following single pytest invocation
+(the matrix is also declared in `tests/test_release_gates.py`):
+
+```text
+pytest -q \
+  tests/test_release_gates.py \
+  tests/test_history.py::test_reconciliation_failure_stays_open_at_window_boundary \
+  tests/test_history.py::test_settled_date_stays_terminal_after_confirmation_restart_and_next_scheduler \
+  tests/test_history.py::test_manual_repair_accepts_one_and_31_days_but_rejects_32_before_requests \
+  tests/test_history.py::test_manual_repair_reopens_settled_date_while_archive_is_disabled \
+  tests/test_fit_queue.py::test_fit_queue_paces_downloads_and_recovers_pending_work_after_restart \
+  tests/test_fit_queue.py::test_valid_local_fit_completes_queue_without_download \
+  tests/test_fit_queue.py::test_fit_queue_isolated_by_account_and_background_gate \
+  tests/test_fit_archive.py::test_fit_archive_validates_privately_and_atomically \
+  tests/test_history.py::test_archive_rate_limit_enters_durable_backoff_without_cadence \
+  tests/test_history.py::test_archive_rate_limit_backoff_survives_restart_and_expires_once \
+  tests/test_history.py::test_first_sync_rate_limit_retries_after_expiry_without_restart \
+  tests/test_history.py::test_archive_auth_classification_requires_genuine_account_failure \
+  tests/test_history.py::test_archive_cycle_failure_does_not_break_foreground_request \
+  tests/test_history.py::test_malformed_structured_record_fails_archive_without_blocking_foreground_work \
+  tests/test_history.py::test_start_keeps_historical_backfill_dormant \
+  tests/test_init.py::test_real_config_entry_lifecycle_keeps_backfill_dormant_and_surfaces_visible \
+  tests/test_release_gates.py::test_release_privacy_snapshots_cover_diagnostics_status_action_and_calendars \
+  tests/test_history.py::test_status_sensor_exposes_only_privacy_safe_placeholders \
+  tests/test_history_recorder.py::test_release_gate_scratch_recorder_restart_revision_and_no_state_changed \
+  tests/test_fit_archive.py::test_optional_private_captured_fit_replay
+```
+
+The matrix explicitly covers seven-day reconciliation, Manual Repair, FIT
+pacing/restart/valid-file skip/account isolation, archive-only 429 backoff
+including restart and expiry, genuine reauthentication and failure isolation,
+dormant Historical Backfill, and exact status/privacy output. The fixture,
+Recorder, and optional private replay gates remain part of the same command;
+the replay skips without a local 0600 capture.
 
 ## Current-day validation checklist
 

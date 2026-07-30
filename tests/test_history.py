@@ -3070,6 +3070,39 @@ async def test_successful_first_sync_starts_fifteen_minute_local_day_cycles() ->
     await archive.async_stop()
 
 
+@pytest.mark.asyncio
+async def test_successful_archive_status_persists_and_restores_schedule() -> None:
+    """A successful sync exposes and restores its lifecycle timestamps."""
+    now = [datetime(2026, 8, 4, 12, tzinfo=UTC)]
+    timer = DeterministicTimer()
+    store = FakeStore()
+    source = ReconciliationSource({})
+    archive = _enabled_reconciliation_archive(store, source, now, timer)
+
+    await archive.async_start()
+    await _wait_for_remote_requests(source, 19)
+
+    expected_last_success = now[0].isoformat()
+    expected_next_run = (now[0] + timedelta(minutes=15)).isoformat()
+    assert archive.status.as_attributes() == {
+        "archive_state": "idle",
+        "activation_date": "2026-08-01",
+        "last_success": expected_last_success,
+        "next_eligible_run": expected_next_run,
+    }
+
+    await archive.async_stop()
+    restarted_timer = DeterministicTimer()
+    restarted = _enabled_reconciliation_archive(
+        store, ReconciliationSource({}), now, restarted_timer
+    )
+    await restarted.async_start()
+
+    assert restarted.status.as_attributes()["last_success"] == expected_last_success
+    assert restarted.status.as_attributes()["next_eligible_run"] == expected_next_run
+    await restarted.async_stop()
+
+
 async def test_recurring_archive_yields_real_shared_gate_to_foreground_refresh() -> None:
     """Foreground work keeps priority and current-value continuity during a cycle."""
     hass = _hass()
@@ -3408,7 +3441,47 @@ async def test_archive_rate_limit_enters_durable_backoff_without_cadence() -> No
         "safe_error_class": "rate_limited",
     }
     assert store.data["archive_backoff_until"] == "2026-08-06T00:00:00+00:00"
-    assert timer.active == []
+    assert [slot[0] for slot in timer.active] == [timedelta(hours=24)]
+
+    now[0] = datetime(2026, 8, 6, tzinfo=UTC)
+    timer.fire_next()
+    await _wait_for_remote_requests(source, 20)
+    assert archive.status.state is HistoryArchiveState.IDLE
+    await archive.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_first_sync_rate_limit_retries_after_expiry_without_restart() -> None:
+    """An initial archive 429 arms an expiry retry without a reload."""
+    now = [datetime(2026, 8, 5, tzinfo=UTC)]
+    timer = DeterministicTimer()
+    store = FakeStore()
+
+    class RateLimitedSource(ReconciliationSource):
+        def __init__(self) -> None:
+            super().__init__({})
+            self.fail_once = True
+
+        async def async_fetch_details(self, target_date: date, metric: str) -> object:
+            if self.fail_once and metric == "heart_rate":
+                self.fail_once = False
+                self.requested.append(target_date)
+                raise GarminRateLimitError("429")
+            return await super().async_fetch_details(target_date, metric)
+
+    source = RateLimitedSource()
+    archive = _enabled_reconciliation_archive(store, source, now, timer)
+
+    await archive.async_start()
+    await _wait_for_archive_state(archive, HistoryArchiveState.BACKOFF)
+    assert [slot[0] for slot in timer.active] == [timedelta(hours=24)]
+
+    now[0] = datetime(2026, 8, 6, tzinfo=UTC)
+    timer.fire_next()
+    await _wait_for_remote_requests(source, 20)
+
+    assert archive.status.state is HistoryArchiveState.IDLE
+    assert "safe_error_class" not in archive.status.as_attributes()
     await archive.async_stop()
 
 
