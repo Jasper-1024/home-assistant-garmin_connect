@@ -1,4 +1,5 @@
-homeassistant>=2026.2.3
+homeassistant>=2026.7.4
 ha-garmin==0.1.31
+garmin-fit-sdk==21.208.0
 colorlog==6.10.1
 setuptools==83.0.0

@@ -2,9 +2,17 @@
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in this integration, please report it privately by creating a [security advisory](https://github.com/cyberjunky/home-assistant-garmin_connect/security/advisories) on GitHub.
+If you discover a security vulnerability in this integration, please report it
+privately by creating a [security advisory](https://github.com/Jasper-1024/home-assistant-garmin_connect/security/advisories)
+on GitHub.
 
 **Please do NOT open a public issue for security vulnerabilities.** This allows us to address the issue before it becomes public knowledge.
+
+This maintained fork originated from
+[cyberjunky/home-assistant-garmin_connect](https://github.com/cyberjunky/home-assistant-garmin_connect).
+The [ha-garmin](https://github.com/cyberjunky/ha-garmin) dependency remains its
+upstream Garmin API library. This advisory flow covers this fork; report
+vulnerabilities in upstream projects to their respective maintainers.
 
 ## Security Considerations
 

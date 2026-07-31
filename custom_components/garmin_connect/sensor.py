@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date as dt_date
@@ -456,6 +457,21 @@ BODY_BATTERY_SENSORS: tuple[GarminConnectSensorEntityDescription, ...] = (
 )
 
 # Intensity & Activity Time Sensors — ha_garmin computes *Minutes from *Seconds
+
+
+def _non_negative_sedentary_minutes(data: dict[str, Any]) -> int | float | None:
+    """Reject Garmin's negative sedentary-time sentinels."""
+    value = data.get("sedentaryMinutes")
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    ):
+        return value
+    return None
+
+
 INTENSITY_SENSORS: tuple[GarminConnectSensorEntityDescription, ...] = (
     GarminConnectSensorEntityDescription(
         key="activeMinutes",
@@ -478,6 +494,7 @@ INTENSITY_SENSORS: tuple[GarminConnectSensorEntityDescription, ...] = (
         device_class=SensorDeviceClass.DURATION,
         state_class=SensorStateClass.TOTAL_INCREASING,
         native_unit_of_measurement=UnitOfTime.MINUTES,
+        value_fn=_non_negative_sedentary_minutes,
     ),
     GarminConnectSensorEntityDescription(
         key="moderateIntensityMinutes",

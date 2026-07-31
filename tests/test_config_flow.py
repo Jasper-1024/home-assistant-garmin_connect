@@ -195,7 +195,7 @@ async def test_reauth_preserves_history_account_key() -> None:
 
     from custom_components.garmin_connect.config_flow import GarminConnectConfigFlow
 
-    mock_entry = MagicMock()
+    mock_entry = MagicMock(entry_id="test_entry_id")
     mock_entry.options = {}
     mock_entry.data = {"history_account_key": "opaque-account-key-123456"}
     flow = GarminConnectConfigFlow()
@@ -212,6 +212,33 @@ async def test_reauth_preserves_history_account_key() -> None:
     updated_data = flow.hass.config_entries.async_update_entry.call_args.kwargs["data"]
     assert updated_data["history_account_key"] == "opaque-account-key-123456"
     assert updated_data["token"] == flow._auth.di_token
+    flow.hass.config_entries.async_reload.assert_awaited_once_with("test_entry_id")
+
+
+async def test_reconfigure_reloads_once_after_replacing_tokens() -> None:
+    """Reconfiguration owns one explicit reload after its entry update."""
+    from homeassistant.config_entries import SOURCE_RECONFIGURE
+
+    from custom_components.garmin_connect.config_flow import GarminConnectConfigFlow
+
+    mock_entry = MagicMock(entry_id="test_entry_id")
+    mock_entry.options = {}
+    mock_entry.data = {"history_account_key": "opaque-account-key-123456"}
+    flow = GarminConnectConfigFlow()
+    flow.hass = MagicMock()
+    flow.hass.config_entries.async_get_known_entry.return_value = mock_entry
+    flow.hass.config_entries.async_update_entry = MagicMock()
+    flow.hass.config_entries.async_reload = AsyncMock()
+    flow.context = {"source": SOURCE_RECONFIGURE, "entry_id": "test_entry_id"}
+    flow._auth = _make_auth_mock()
+    flow._is_cn = True
+
+    await flow._async_finish_reconfigure()
+
+    updated_data = flow.hass.config_entries.async_update_entry.call_args.kwargs["data"]
+    assert updated_data["history_account_key"] == "opaque-account-key-123456"
+    assert updated_data["token"] == flow._auth.di_token
+    flow.hass.config_entries.async_reload.assert_awaited_once_with("test_entry_id")
 
 
 # ── Implementation constraints ────────────────────────────────────────────────

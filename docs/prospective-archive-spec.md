@@ -262,7 +262,7 @@ account-wide reauthentication flow.
 - Fifteen-minute freshness, seven-day reconciliation, and one-hour FIT pacing
   are operating policies rather than guarantees of Garmin availability,
   network success, or uninterrupted Home Assistant runtime.
-- The beta version remains `3.1.0-beta.1` until these behaviors and release
+- The beta version remains `3.1.0-beta.2` until these behaviors and release
   gates are implemented and reviewed.
 
 ## Testing Decisions

@@ -1,128 +1,205 @@
 """Tests for Garmin Connect diagnostics."""
 
+from datetime import timedelta
 from unittest.mock import MagicMock
 
+from custom_components.garmin_connect.coordinator import (
+    BaseGarminCoordinator,
+    CoreCoordinator,
+    GarminConnectCoordinators,
+)
 from custom_components.garmin_connect.diagnostics import (
     TO_REDACT,
     async_get_config_entry_diagnostics,
 )
+from custom_components.garmin_connect.history import (
+    GarminHistoryArchive,
+    HistoryArchiveState,
+    HistoryStatus,
+)
+from custom_components.garmin_connect.request_gate import GarminRequestGate
 
 
-async def test_diagnostics_redacts_sensitive_data() -> None:
-    """Test that diagnostics redacts tokens, names, and email."""
-    mock_coordinator = MagicMock()
-    mock_coordinator.data = {"totalSteps": 10000, "restingHeartRate": 60}
-    mock_coordinator.last_update_success = True
-    mock_coordinator.update_interval.total_seconds.return_value = 300
+def _runtime_data(
+    core: BaseGarminCoordinator | None = None,
+    history_archive: GarminHistoryArchive | None = None,
+) -> GarminConnectCoordinators:
+    """Build the production runtime dataclass with its heterogeneous fields."""
+    return GarminConnectCoordinators(
+        core=core,
+        activity=None,
+        training=None,
+        body=None,
+        goals=None,
+        gear=None,
+        blood_pressure=None,
+        menstrual=None,
+        nutrition=None,
+        request_gate=GarminRequestGate(),
+        history_archive=history_archive,
+    )
 
-    mock_coordinators = MagicMock()
-    # Make dataclasses.fields work by providing _fields on the spec
-    mock_field = MagicMock()
-    mock_field.name = "core"
 
-    entry_data = {
+def _core(data: dict[str, object], *, update_interval: timedelta | None) -> CoreCoordinator:
+    """Build a concrete coordinator with diagnostics-relevant state."""
+    core = object.__new__(CoreCoordinator)
+    core.data = data
+    core.last_update_success = True
+    core.update_interval = update_interval
+    return core
+
+
+def _archive(status: HistoryStatus) -> GarminHistoryArchive:
+    """Build an archive instance exposing a real public status snapshot."""
+    archive = object.__new__(GarminHistoryArchive)
+    archive._status = status
+    return archive
+
+
+async def test_diagnostics_handles_real_runtime_data_and_redacts_nested_sensitive_data() -> None:
+    """Diagnostics safely handles the real heterogeneous runtime dataclass."""
+    core = _core(
+        {"totalSteps": 10000, "restingHeartRate": 60},
+        update_interval=timedelta(seconds=300),
+    )
+
+    entry = MagicMock()
+    entry.data = {
         "token": "secret_token",
         "refresh_token": "secret_refresh",
         "client_id": "secret_client_id",
-        "username": "test@example.com",
+        "history_account_key": "secret_account_key",
+        "username": "legacy@example.com",
+        "userName": "profile@example.com",
+        "user_name": "older@example.com",
+        "email": "email@example.com",
+        "emailAddress": "older-email@example.com",
+        "access_token": "secret_access_token",
+        "nested": {
+            "token": "nested_token",
+            "refresh_token": "nested_refresh",
+            "client_id": "nested_client_id",
+            "accessToken": "nested_access_token",
+            "history_account_key": "nested_account_key",
+            "username": "nested_legacy@example.com",
+            "userName": "nested_profile@example.com",
+            "user_name": "nested_older@example.com",
+            "email": "nested_email@example.com",
+            "email_address": "nested_older_email@example.com",
+        },
+    }
+    entry.runtime_data = _runtime_data(core)
+
+    result = await async_get_config_entry_diagnostics(MagicMock(), entry)
+
+    assert result["entry_data"] == {
+        "token": "**REDACTED**",
+        "refresh_token": "**REDACTED**",
+        "client_id": "**REDACTED**",
+        "history_account_key": "**REDACTED**",
+        "username": "**REDACTED**",
+        "userName": "**REDACTED**",
+        "user_name": "**REDACTED**",
+        "email": "**REDACTED**",
+        "emailAddress": "**REDACTED**",
+        "access_token": "**REDACTED**",
+        "nested": {
+            "token": "**REDACTED**",
+            "refresh_token": "**REDACTED**",
+            "client_id": "**REDACTED**",
+            "accessToken": "**REDACTED**",
+            "history_account_key": "**REDACTED**",
+            "username": "**REDACTED**",
+            "userName": "**REDACTED**",
+            "user_name": "**REDACTED**",
+            "email": "**REDACTED**",
+            "email_address": "**REDACTED**",
+        },
+    }
+    assert result["coordinators"] == {
+        "core": {
+            "last_update_success": True,
+            "update_interval_seconds": 300,
+            "data_keys_count": 2,
+            "data_keys_sample": ["totalSteps", "restingHeartRate"],
+        }
     }
 
-    mock_entry = MagicMock()
-    mock_entry.data = entry_data
-    mock_entry.runtime_data = mock_coordinators
-    mock_entry.runtime_data.core = mock_coordinator
 
-    mock_hass = MagicMock()
+async def test_diagnostics_includes_archive_public_status_only() -> None:
+    """Diagnostics preserves the archive's public status contract."""
+    entry = MagicMock()
+    entry.data = {}
+    entry.runtime_data = _runtime_data(
+        history_archive=_archive(
+            HistoryStatus(
+                HistoryArchiveState.BACKOFF,
+                activation_date="2026-01-01",
+                last_success="2026-01-02T00:00:00+00:00",
+                safe_error_class="rate_limited",
+            )
+        )
+    )
 
-    # Patch dataclass fields to return our mock field
-    from unittest.mock import patch
+    result = await async_get_config_entry_diagnostics(MagicMock(), entry)
 
-    with patch(
-        "custom_components.garmin_connect.diagnostics.fields",
-        return_value=[mock_field],
-    ):
-        result = await async_get_config_entry_diagnostics(mock_hass, mock_entry)
-
-    assert "entry_data" in result
-    assert "coordinators" in result
-    # Redacted fields should be replaced
-    assert result["entry_data"]["token"] == "**REDACTED**"
-    assert result["entry_data"]["refresh_token"] == "**REDACTED**"
-    assert result["entry_data"]["client_id"] == "**REDACTED**"
-    # Non-redacted fields should remain
-    assert result["entry_data"]["username"] == "test@example.com"
-
-
-async def test_diagnostics_coordinator_info() -> None:
-    """Test that diagnostics includes coordinator info."""
-    mock_coordinator = MagicMock()
-    mock_coordinator.data = {"key1": "val", "key2": "val"}
-    mock_coordinator.last_update_success = True
-    mock_coordinator.update_interval.total_seconds.return_value = 300
-
-    mock_field = MagicMock()
-    mock_field.name = "core"
-
-    mock_entry = MagicMock()
-    mock_entry.data = {}
-    mock_entry.runtime_data = MagicMock()
-    mock_entry.runtime_data.core = mock_coordinator
-
-    mock_hass = MagicMock()
-
-    from unittest.mock import patch
-
-    with patch(
-        "custom_components.garmin_connect.diagnostics.fields",
-        return_value=[mock_field],
-    ):
-        result = await async_get_config_entry_diagnostics(mock_hass, mock_entry)
-
-    core_info = result["coordinators"]["core"]
-    assert core_info["last_update_success"] is True
-    assert core_info["update_interval_seconds"] == 300
-    assert core_info["data_keys_count"] == 2
-    assert core_info["data_keys_sample"] == ["key1", "key2"]
+    assert result["coordinators"] == {
+        "history_archive": {
+            "archive_state": "backoff",
+            "activation_date": "2026-01-01",
+            "last_success": "2026-01-02T00:00:00+00:00",
+            "safe_error_class": "rate_limited",
+        }
+    }
 
 
 async def test_diagnostics_handles_none_update_interval() -> None:
-    """Test that diagnostics handles coordinator with no update interval."""
-    mock_coordinator = MagicMock()
-    mock_coordinator.data = {}
-    mock_coordinator.last_update_success = False
-    mock_coordinator.update_interval = None
+    """Diagnostics handles a coordinator without an update interval."""
+    core = _core({}, update_interval=None)
+    core.last_update_success = False
 
-    mock_field = MagicMock()
-    mock_field.name = "core"
+    entry = MagicMock()
+    entry.data = {}
+    entry.runtime_data = _runtime_data(core)
 
-    mock_entry = MagicMock()
-    mock_entry.data = {}
-    mock_entry.runtime_data = MagicMock()
-    mock_entry.runtime_data.core = mock_coordinator
-
-    mock_hass = MagicMock()
-
-    from unittest.mock import patch
-
-    with patch(
-        "custom_components.garmin_connect.diagnostics.fields",
-        return_value=[mock_field],
-    ):
-        result = await async_get_config_entry_diagnostics(mock_hass, mock_entry)
+    result = await async_get_config_entry_diagnostics(MagicMock(), entry)
 
     assert result["coordinators"]["core"]["update_interval_seconds"] is None
 
 
+async def test_diagnostics_handles_unloaded_entry_without_runtime_data() -> None:
+    """Diagnostics for an unloaded entry returns only redacted persisted data."""
+    entry = MagicMock()
+    entry.data = {"token": "secret_token", "name": "Garmin"}
+    entry.runtime_data = _runtime_data()
+    del entry.runtime_data
+
+    result = await async_get_config_entry_diagnostics(MagicMock(), entry)
+
+    assert result == {
+        "entry_data": {"token": "**REDACTED**", "name": "Garmin"},
+        "coordinators": {},
+    }
+
+
 def test_to_redact_contains_expected_keys() -> None:
-    """Test that the redaction set covers all sensitive fields."""
+    """Test that the redaction set covers known sensitive config fields."""
     expected = {
         "history_account_key",
         "token",
         "refresh_token",
+        "access_token",
+        "accessToken",
+        "auth_token",
+        "authToken",
         "client_id",
         "displayName",
         "fullName",
+        "username",
         "userName",
+        "user_name",
+        "emailAddress",
+        "email_address",
         "email",
         "profileImageUrlMedium",
         "profileImageUrlSmall",

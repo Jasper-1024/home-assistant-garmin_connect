@@ -4,17 +4,28 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta, timezone
 from math import isfinite
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from .request_gate import GarminRequestGate, GarminRequestPriority
 from .sleep_archive import SleepSession, parse_sleep_sessions
 
 if TYPE_CHECKING:
     from ha_garmin import GarminClient
+
+
+class GarminRequestExecutor(Protocol):
+    """The account lifecycle required by a history cloud request."""
+
+    async def async_request(
+        self,
+        priority: GarminRequestPriority,
+        requester: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        """Run one request under an account-scoped priority slot."""
 
 
 class HistorySchemaError(ValueError):
@@ -1203,7 +1214,11 @@ def parse_hrv_data(payload: Any, target_date: date) -> HRVData:
 class GarminHistorySource:
     """Small serialized adapter for Garmin intraday endpoints."""
 
-    def __init__(self, client: GarminClient, request_gate: GarminRequestGate | None = None) -> None:
+    def __init__(
+        self,
+        client: GarminClient,
+        request_gate: GarminRequestExecutor | None = None,
+    ) -> None:
         self.client = client
         self.request_gate = request_gate or GarminRequestGate()
 

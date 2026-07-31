@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
+import stat
 import tempfile
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
@@ -21,12 +24,15 @@ from ha_garmin.exceptions import (
     GarminRateLimitError,
 )
 from homeassistant import loader
+from homeassistant.components.recorder.tasks import RecorderTask
 from homeassistant.config_entries import ConfigEntries
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.recorder import async_initialize_recorder
 from homeassistant.setup import async_setup_component
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 import custom_components.garmin_connect.const as const
+from custom_components.garmin_connect import history as history_module
 from custom_components.garmin_connect import history_recorder as history_recorder_module
 from custom_components.garmin_connect.const import (
     CONF_ARCHIVE_ACTIVATION_DATE,
@@ -1397,6 +1403,208 @@ async def test_start_persists_opaque_account_key_and_reuses_it() -> None:
     assert hass.config_entries.async_update_entry.call_count == 1
 
 
+async def test_downgrade_reauth_recovers_bound_archive_identity() -> None:
+    """A 3.0.14-style token replacement reconnects only its original archive."""
+    hass = _hass()
+    checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
+    entry = _entry(data={"token": "beta-token"})
+    # Older config flows could retain the login username when the initial
+    # profile lookup failed.  A later authenticated profile is still the
+    # account authority; this fallback must not prevent its own archive from
+    # surviving 3.0.14's token-only entry.data replacement.
+    entry.unique_id = "legacy-account@example.invalid"
+    client = SimpleNamespace(
+        get_user_profile=AsyncMock(return_value=SimpleNamespace(profile_id=123456789))
+    )
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=client), request_gate=None
+    )
+    stores: dict[str, FakeStore] = {}
+
+    def store_factory(_hass: object, _version: int, path: str, **_kwargs: object) -> FakeStore:
+        return stores.setdefault(path, FakeStore())
+
+    first = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=checker,
+        store_factory=store_factory,
+    )
+    await first.async_start()
+    original_key = first._account_key()
+    catalog = stores["garmin_connect.entry-1.history_catalog"]
+    assert catalog.data[const.HISTORY_OWNER_FINGERPRINT] == hmac.new(
+        original_key.encode(),
+        b"garmin_connect:history-owner:v2:123456789",
+        hashlib.sha256,
+    ).hexdigest()
+
+    activity = normalize_activities(
+        [
+            {
+                "activityId": 123,
+                "activityType": "running",
+                "startTime": "2026-08-01T10:00:00Z",
+                "durationInSeconds": 60,
+            }
+        ],
+        date(2026, 8, 1),
+    )[0]
+    stores["garmin_connect.entry-1.sleep_2026"] = FakeStore(
+        {
+            "schema_version": 1,
+            "sleep_schema_version": 1,
+            "account_key": original_key,
+            "year": "2026",
+            "sessions": {},
+            "events": {},
+            "activities": {
+                activity.logical_id: {
+                    "logical_id": activity.logical_id,
+                    "activity_id": activity.activity_id,
+                    "revision": activity.revision,
+                    "calendar_date": activity.calendar_date.isoformat(),
+                    "activity_type": activity.activity_type,
+                    "name": activity.name,
+                    "start": activity.start.isoformat(),
+                    "end": activity.end.isoformat() if activity.end else None,
+                    "duration_seconds": activity.duration_seconds,
+                    "training_effect": activity.training_effect,
+                    "load": activity.load,
+                    "recovery": activity.recovery,
+                }
+            },
+            "fits": {},
+        }
+    )
+
+    # Simulate a downgrade where 3.0.14 reauth/reconfigure replaces entry.data
+    # with token_data, then re-upgrade with the same authenticated Garmin user.
+    entry.data = {"token": "downgrade-reauth-token"}
+    restored = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=checker,
+        store_factory=store_factory,
+    )
+    await restored.async_start()
+
+    restored_data = hass.config_entries.async_update_entry.call_args.kwargs["data"]
+    assert restored_data["history_account_key"] == original_key
+    assert restored._account_key() == original_key
+    assert statistic_id_for(restored._account_key(), "heart_rate") == statistic_id_for(
+        original_key, "heart_rate"
+    )
+    assert restored._fit_directory().name == original_key
+    events = await restored.async_get_calendar_events(
+        "activity", date(2026, 8, 1), date(2026, 8, 1)
+    )
+    assert [event.summary for event in events] == ["running"]
+    assert client.get_user_profile.await_count == 2
+    assert len(catalog.saved) == 1
+
+
+@pytest.mark.parametrize("binding", ["missing", "damaged", "cross_account"])
+async def test_missing_key_never_adopts_mismatched_or_unbound_archive(
+    binding: str,
+) -> None:
+    """A different Garmin token cannot take over retained Store or FIT paths."""
+    hass = _hass()
+    account_key = "opaque-account-key-1234567890"
+    entry = _entry(data={"token": "downgrade-reauth-token"})
+    entry.unique_id = "legacy-account@example.invalid"
+    client = SimpleNamespace(
+        get_user_profile=AsyncMock(return_value=SimpleNamespace(profile_id=987654321))
+    )
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=client), request_gate=None
+    )
+    catalog_data = {"schema_version": 1, "account_key": account_key}
+    if binding == "damaged":
+        catalog_data[const.HISTORY_OWNER_FINGERPRINT] = "invalid"
+    elif binding == "cross_account":
+        catalog_data[const.HISTORY_OWNER_FINGERPRINT] = hmac.new(
+            account_key.encode(),
+            b"garmin_connect:history-owner:v2:123456789",
+            hashlib.sha256,
+        ).hexdigest()
+    catalog = FakeStore(catalog_data)
+    annual = FakeStore(
+        {"account_key": account_key, "year": "2026", "fits": {"unread": {}}}
+    )
+    annual.async_load = AsyncMock(return_value=annual.data)
+    stores = {
+        "garmin_connect.entry-1.history_catalog": catalog,
+        "garmin_connect.entry-1.sleep_2026": annual,
+    }
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(
+            RecorderCompatibilityResult.compatible_result()
+        ),
+        store_factory=lambda _hass, _version, path, **_kwargs: stores.setdefault(
+            path, FakeStore()
+        ),
+    )
+
+    await archive.async_start()
+
+    assert archive.status.state is HistoryArchiveState.FAILED
+    assert archive.status.error_type == "identity_initialization"
+    hass.config_entries.async_update_entry.assert_not_called()
+    assert catalog.data == catalog_data
+    annual.async_load.assert_not_awaited()
+    hass.config.path.assert_not_called()
+    if binding == "cross_account":
+        client.get_user_profile.assert_awaited_once()
+    else:
+        client.get_user_profile.assert_not_awaited()
+
+
+async def test_numeric_legacy_owner_binding_migrates_after_profile_verification() -> None:
+    """A numeric beta entry upgrades its old binding only after profile proof."""
+    hass = _hass()
+    account_key = "opaque-account-key-1234567890"
+    entry = _entry(data={"token": "downgrade-reauth-token"})
+    entry.unique_id = "123456789"
+    client = SimpleNamespace(
+        get_user_profile=AsyncMock(return_value=SimpleNamespace(profile_id=123456789))
+    )
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=client), request_gate=None
+    )
+    legacy_fingerprint = hmac.new(
+        account_key.encode(),
+        b"garmin_connect:history-owner:v1:123456789",
+        hashlib.sha256,
+    ).hexdigest()
+    catalog = FakeStore(
+        {
+            "schema_version": 1,
+            "account_key": account_key,
+            const.HISTORY_OWNER_FINGERPRINT: legacy_fingerprint,
+        }
+    )
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=FakeRecorderChecker(
+            RecorderCompatibilityResult.compatible_result()
+        ),
+        store_factory=lambda _hass, _version, _path, **_kwargs: catalog,
+    )
+
+    await archive.async_start()
+
+    assert archive._account_key() == account_key
+    assert catalog.data[const.HISTORY_OWNER_FINGERPRINT] != legacy_fingerprint
+    assert history_module._is_valid_owner_fingerprint(
+        catalog.data[const.HISTORY_OWNER_FINGERPRINT]
+    )
+    client.get_user_profile.assert_awaited_once()
+
+
 async def test_start_keeps_historical_backfill_dormant() -> None:
     """Normal archive setup must not construct the legacy backfill scheduler."""
     hass = _hass()
@@ -1916,7 +2124,9 @@ async def test_malformed_structured_record_fails_archive_without_blocking_foregr
 
 
 @pytest.mark.asyncio
-async def test_scratch_recorder_archive_confirms_bucket_revision_and_provenance_after_restart() -> None:
+async def test_scratch_recorder_archive_confirms_bucket_revision_and_provenance_after_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Exercise Recorder identity, revisions, restart, and private provenance together."""
     target = date(2027, 1, 1)
     bucket = datetime(2026, 12, 31, 16, tzinfo=UTC)
@@ -1931,14 +2141,29 @@ async def test_scratch_recorder_archive_confirms_bucket_revision_and_provenance_
     class ScratchRecorder:
         def __init__(self) -> None:
             self.rows: dict[tuple[str, datetime], dict[str, float | datetime]] = {}
+            self.tasks: list[object] = []
+            self.instance = SimpleNamespace(
+                hass=hass, recorder=self, queue_task=self.queue_task
+            )
 
         def async_import_statistics(self, metadata, stats, table) -> None:
-            del table
-            for row in stats:
-                self.rows[(metadata["statistic_id"], row["start"])] = row
+            del metadata, stats, table
 
         def queue_task(self, task) -> None:
-            task.future.set_result(None)
+            self.tasks.append(task)
+            task.run(self.instance)
+
+    def import_statistics(instance, metadata, statistics, table) -> bool:
+        del table
+        recorder = instance.recorder
+        for row in statistics:
+            recorder.rows[(metadata["statistic_id"], row["start"])] = row
+        return True
+
+    monkeypatch.setattr(
+        "homeassistant.components.recorder.statistics.import_statistics",
+        import_statistics,
+    )
 
     class Source:
         def __init__(self) -> None:
@@ -2018,6 +2243,153 @@ async def test_scratch_recorder_archive_confirms_bucket_revision_and_provenance_
     assert list(recorder.rows) == [(statistic_id, bucket)]
     assert recorder.rows[(statistic_id, bucket)]["mean"] == 61.0
     assert numeric_store.data["dates"][statistic_id] == {bucket.isoformat(): target.isoformat()}
+    assert all(isinstance(task, RecorderTask) for task in recorder.tasks)
+
+
+@pytest.mark.asyncio
+async def test_downgrade_reauth_preserves_recorder_calendar_and_valid_fit_artifacts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A same-profile 3.0.14 recovery keeps all durable archive surfaces."""
+    from garmin_fit_sdk import Encoder, Profile
+
+    target = date(2026, 8, 1)
+    instant = datetime(2026, 8, 1, 10, tzinfo=UTC)
+    hass = _hass()
+    hass.config.path.side_effect = lambda *parts: str(tmp_path.joinpath(*parts))
+    entry = _entry(data={"token": "before-downgrade"})
+    entry.unique_id = "legacy-account@example.invalid"
+    fit_encoder = Encoder()
+    fit_encoder.write_mesg(
+        {
+            "mesg_num": Profile["mesg_num"]["FILE_ID"],
+            "type": 4,
+            "manufacturer": 1,
+            "product": 1,
+            "serial_number": 1,
+            "time_created": instant,
+        }
+    )
+    fit_encoder.write_mesg(
+        {
+            "mesg_num": Profile["mesg_num"]["RECORD"],
+            "timestamp": instant,
+            "heart_rate": 60,
+        }
+    )
+    fit_bytes = fit_encoder.close()
+    client = SimpleNamespace(
+        get_user_profile=AsyncMock(return_value=SimpleNamespace(profile_id=123456789)),
+        download_activity=AsyncMock(return_value=fit_bytes),
+    )
+    entry.runtime_data = SimpleNamespace(
+        core=SimpleNamespace(client=client), request_gate=None
+    )
+    stores: dict[str, FakeStore] = {}
+
+    def store_factory(_hass: object, _version: int, path: str, **_kwargs: object) -> FakeStore:
+        return stores.setdefault(path, FakeStore())
+
+    class ScratchRecorder:
+        def __init__(self) -> None:
+            self.rows: dict[tuple[str, datetime], dict[str, float | datetime]] = {}
+            self.instance = SimpleNamespace(hass=hass, recorder=self, queue_task=self.queue_task)
+
+        def async_import_statistics(self, metadata, stats, table) -> None:
+            del metadata, stats, table
+
+        def queue_task(self, task: RecorderTask) -> None:
+            task.run(self.instance)
+
+    def import_statistics(instance, metadata, statistics, table) -> bool:
+        del table
+        for row in statistics:
+            instance.recorder.rows[(metadata["statistic_id"], row["start"])] = row
+        return True
+
+    monkeypatch.setattr(
+        "homeassistant.components.recorder.statistics.import_statistics",
+        import_statistics,
+    )
+    activity = normalize_activities(
+        [
+            {
+                "activityId": 123,
+                "activityType": "running",
+                "startTime": instant.isoformat(),
+                "durationInSeconds": 60,
+            }
+        ],
+        target,
+    )[0]
+
+    class Source:
+        async def async_fetch_details(self, _request_date: date, metric: str) -> object:
+            if metric == "timed_activities":
+                return (activity,)
+            if metric in {
+                "sleep_sessions",
+                "health_events_daily",
+                "health_events_body_battery",
+            }:
+                return ()
+            if metric == "daily_summary":
+                return SnapshotData({}, instant, target.isoformat(), calendar_date=target)
+            if metric == "heart_rate":
+                return SourceSeries(
+                    (NormalizedSample(instant, target, instant.isoformat(), 60.0),),
+                    "present",
+                )
+            return SourceSeries((), "empty")
+
+    recorder = ScratchRecorder()
+
+    def make_archive() -> GarminHistoryArchive:
+        return GarminHistoryArchive(
+            hass,
+            entry,
+            recorder_checker=FakeRecorderChecker(
+                RecorderCompatibilityResult.compatible_result()
+            ),
+            store_factory=store_factory,
+            source_factory=lambda _client, _gate: Source(),
+            recorder_factory=lambda: GarminHistoryRecorder(recorder),
+        )
+
+    first = make_archive()
+    await first.async_start()
+    persisted_data = hass.config_entries.async_update_entry.call_args.kwargs["data"]
+    account_key = persisted_data["history_account_key"]
+    assert (await first.async_sync_range(target, target, fit_limit=1, include_training_status=False)).outcome == "written"
+
+    statistic_id = statistic_id_for(account_key, "heart_rate")
+    recorder_row = recorder.rows[(statistic_id, instant)]
+    calendar_events = await first.async_get_calendar_events("activity", target, target)
+    assert [event.summary for event in calendar_events] == ["running"]
+    partition = stores["garmin_connect.entry-1.sleep_2026"].data
+    fit_record = partition["fits"][activity.logical_id]
+    fit_path = tmp_path / "garmin_connect" / "fit" / account_key / fit_record["path"]
+    assert stat.S_IMODE(fit_path.stat().st_mode) == 0o600
+    assert history_module.inspect_fit(fit_path)["file"] == {
+        "integrity_ok": True,
+        "decode_ok": True,
+    }
+    fit_content = fit_path.read_bytes()
+
+    # 3.0.14 replaced entry.data during re-authentication but retained its
+    # config-entry unique_id.  The v2 binding must use the authenticated
+    # profile, not this username fallback.
+    entry.data = {"token": "after-downgrade"}
+    restored = make_archive()
+    await restored.async_start()
+
+    assert restored._account_key() == account_key
+    assert recorder.rows[(statistic_id, instant)] == recorder_row
+    assert await restored.async_get_calendar_events("activity", target, target) == calendar_events
+    assert tmp_path / "garmin_connect" / "fit" / account_key / fit_record["path"] == fit_path
+    assert fit_path.read_bytes() == fit_content
+    assert stat.S_IMODE(fit_path.stat().st_mode) == 0o600
+    assert stores["garmin_connect.entry-1.sleep_2026"].data["fits"][activity.logical_id] == fit_record
 
 
 @pytest.mark.asyncio
@@ -2080,6 +2452,90 @@ async def test_stalled_recorder_barrier_leaves_numeric_provenance_intent_recover
         "2026": {statistic_id: {instant.isoformat(): target.isoformat()}}
     }
     assert "garmin_connect.entry-1.numeric_source_dates_2026" not in stores
+
+
+@pytest.mark.asyncio
+async def test_permanent_recorder_error_does_not_confirm_numeric_provenance(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A wrapped permanent DB error leaves Source Calendar Date intent open."""
+    target = date(2026, 12, 31)
+    instant = datetime(2026, 12, 31, 23, 30, tzinfo=UTC)
+    secret = "INSERT private-garmin-value"
+    hass = _hass()
+    entry = _entry(data={"history_account_key": "opaque-account-key-123"})
+    checker = FakeRecorderChecker(RecorderCompatibilityResult.compatible_result())
+    stores: dict[str, FakeStore] = {}
+
+    def store_factory(_hass, _version, path, **kwargs):
+        return stores.setdefault(path, FakeStore())
+
+    class PermanentFailureRecorder:
+        def __init__(self) -> None:
+            self.tasks: list[object] = []
+            self.recovered_errors: list[SQLAlchemyError] = []
+            self.instance = SimpleNamespace(
+                hass=SimpleNamespace(loop=asyncio.get_running_loop()),
+                engine=SimpleNamespace(dialect=SimpleNamespace(name="sqlite")),
+                queue_task=self.queue_task,
+            )
+
+        def async_import_statistics(self, metadata, stats, table) -> None:
+            del metadata, stats, table
+
+        def queue_task(self, task) -> None:
+            self.tasks.append(task)
+            try:
+                task.run(self.instance)
+            except SQLAlchemyError as err:
+                self.recovered_errors.append(err)
+
+    class Source:
+        async def async_fetch_details(self, _request_date: date, metric: str) -> object:
+            if metric in {
+                "sleep_sessions",
+                "health_events_daily",
+                "health_events_body_battery",
+                "timed_activities",
+            }:
+                return ()
+            if metric in {"daily_summary", "training_status"}:
+                return SnapshotData({}, instant, target.isoformat(), calendar_date=target)
+            return SourceSeries(
+                (NormalizedSample(instant, target, instant.isoformat(), 60.0),),
+                "present",
+            )
+
+    def durable_job(_instance, _metadata, _statistics, _table) -> bool:
+        raise OperationalError(secret, {}, OSError(secret))
+
+    def permanent_error_wrapper(*_args, **_kwargs) -> bool:
+        return True
+
+    permanent_error_wrapper.__wrapped__ = durable_job
+    monkeypatch.setattr(
+        "homeassistant.components.recorder.statistics.import_statistics",
+        permanent_error_wrapper,
+    )
+    recorder = PermanentFailureRecorder()
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=checker,
+        store_factory=store_factory,
+        source_factory=lambda _client, _gate: Source(),
+        recorder_factory=lambda: GarminHistoryRecorder(recorder),
+    )
+    await archive.async_start()
+
+    report = await archive.async_sync_range(target, target)
+
+    catalog = stores["garmin_connect.entry-1.history_catalog"].data
+    assert (report.outcome, report.error_type) == ("failed", "recorder_unavailable")
+    assert catalog["numeric_source_date_outbox"]
+    assert catalog["numeric_source_date_confirmed"] == {}
+    assert len(recorder.recovered_errors) == 1
+    assert secret not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -3130,7 +3586,7 @@ async def test_recurring_archive_yields_real_shared_gate_to_foreground_refresh()
             self.cycle_enabled = False
 
         async def get_user_profile(self):
-            return SimpleNamespace(display_name="athlete")
+            return SimpleNamespace(display_name="athlete", profile_id=123456789)
 
         async def _mark_request(self):
             self.requests += 1
@@ -4444,3 +4900,88 @@ async def test_recorder_compatibility_uses_real_scratch_recorder() -> None:
             await hass.async_stop()
 
     assert result == RecorderCompatibilityResult.compatible_result()
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    (
+        ("2026.7.4", True),
+        ("2026.7.5", True),
+        ("2026.8.0", True),
+        ("2027.0.0", True),
+        ("2026.07.4", False),
+        ("2026.7.04", False),
+        ("2026.07.004", False),
+        ("2026.7.3", False),
+        ("2026.7.4b0", False),
+        ("2026.8.-1", False),
+        ("2027.-1.0", False),
+        ("2026.8. 1", False),
+        ("2026.8.+1", False),
+        ("2026.8.1 ", False),
+        ("2026.7", False),
+        ("2026.7.4.0", False),
+        ("", False),
+        ("２０２６.７.４", False),
+    ),
+)
+def test_has_supported_home_assistant_version(version: str, expected: bool) -> None:
+    """Versions must be stable three-part ASCII numeric releases."""
+    assert history_module._has_supported_home_assistant_version(version) is expected
+
+
+@pytest.mark.parametrize("home_assistant_version", ("2026.7.4", "2026.7.5", "2026.8.0"))
+async def test_recorder_compatibility_accepts_supported_versions_with_a_slow_queue_task(
+    monkeypatch: pytest.MonkeyPatch, home_assistant_version: str
+) -> None:
+    """Supported patches and minors use the Recorder contract, not a whitelist."""
+    loop = asyncio.get_running_loop()
+    hass = SimpleNamespace(loop=loop)
+
+    class SlowRecorder:
+        def __init__(self) -> None:
+            self.tasks: list[object] = []
+
+        def queue_task(self, task: object) -> None:
+            self.tasks.append(task)
+            loop.call_later(0.002, task.run, SimpleNamespace(hass=hass))
+
+    recorder = SlowRecorder()
+    monkeypatch.setattr("homeassistant.const.__version__", home_assistant_version)
+    monkeypatch.setattr("homeassistant.helpers.recorder.get_instance", lambda _hass: recorder)
+    monkeypatch.setattr(history_module, "_RECORDER_BARRIER_TIMEOUT", 0, raising=False)
+    monkeypatch.setattr(history_recorder_module, "_RECORDER_BARRIER_TIMEOUT", 0.01)
+    monkeypatch.setattr(history_recorder_module, "_RECORDER_BARRIER_MAX_TIMEOUT", 0.1)
+
+    result = await HomeAssistantRecorderCompatibility(hass).async_check()
+
+    assert result == RecorderCompatibilityResult.compatible_result()
+    assert isinstance(recorder.tasks[0], RecorderTask)
+
+
+async def test_recorder_compatibility_rejects_versions_below_the_hacs_minimum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A direct install below HACS's minimum stays fail-closed."""
+    monkeypatch.setattr("homeassistant.const.__version__", "2026.7.3")
+
+    result = await HomeAssistantRecorderCompatibility(SimpleNamespace()).async_check()
+
+    assert result == RecorderCompatibilityResult.incompatible_result(
+        "unsupported_home_assistant_version"
+    )
+
+
+async def test_recorder_compatibility_rejects_missing_durable_import_seam(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changed private import seam disables archival before any write."""
+    monkeypatch.setattr("homeassistant.const.__version__", "2026.7.4")
+    monkeypatch.setattr(
+        "homeassistant.components.recorder.statistics.import_statistics",
+        lambda *_args: True,
+    )
+
+    result = await HomeAssistantRecorderCompatibility(SimpleNamespace()).async_check()
+
+    assert result == RecorderCompatibilityResult.incompatible_result("recorder_signature")

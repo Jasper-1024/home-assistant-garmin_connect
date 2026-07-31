@@ -3,10 +3,12 @@
 [![License][license-shield]](LICENSE)
 ![Project Maintenance][maintenance-shield]
 
-[![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg?style=for-the-badge&logo=paypal)](https://www.paypal.me/cyberjunkynl/)
-[![Sponsor on GitHub](https://img.shields.io/badge/Sponsor-GitHub-red.svg?style=for-the-badge&logo=github)](https://github.com/sponsors/cyberjunky)
-
 # Garmin Connect
+
+This is the maintained fork: [Jasper-1024/home-assistant-garmin_connect](https://github.com/Jasper-1024/home-assistant-garmin_connect).
+It originated from [cyberjunky/home-assistant-garmin_connect](https://github.com/cyberjunky/home-assistant-garmin_connect).
+The [ha-garmin](https://github.com/cyberjunky/ha-garmin) dependency remains the
+upstream Garmin API library; this fork does not claim its authorship.
 
 > **v3.0 — Complete rewrite**
 >
@@ -36,7 +38,7 @@ The integration provides **130+ sensors** across the following categories:
 - **Gear tracking** — Dynamic sensors for shoes, bikes, and other equipment
 - **Hydration** — Daily intake, goals, sweat loss
 
-![screenshot](https://github.com/cyberjunky/home-assistant-garmin_connect/blob/main/screenshots/garmin_connect.png?raw=true "Screenshot Garmin Connect")
+![screenshot](https://github.com/Jasper-1024/home-assistant-garmin_connect/blob/main/screenshots/garmin_connect.png?raw=true "Screenshot Garmin Connect")
 
 ## Prerequisites
 
@@ -48,15 +50,16 @@ The integration provides **130+ sensors** across the following categories:
 
 ### HACS (Recommended)
 
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=cyberjunky&repository=home-assistant-garmin_connect&category=integration)
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Jasper-1024&repository=home-assistant-garmin_connect&category=integration)
 
-Alternatively:
+Add this fork as a custom HACS repository if it is not already listed:
 
 1. Install [HACS](https://hacs.xyz) if not already installed
-2. Search for "Garmin Connect" in HACS
-3. Click **Download**
-4. Restart Home Assistant
-5. Add via **Settings** → **Devices & Services**
+2. Open **HACS** → **Integrations** → menu → **Custom repositories**
+3. Enter `https://github.com/Jasper-1024/home-assistant-garmin_connect` and choose the **Integration** category
+4. Search for "Garmin Connect" and click **Download**
+5. Restart Home Assistant
+6. Add via **Settings** → **Devices & Services**
 
 ### Manual Installation
 
@@ -78,11 +81,14 @@ After setup, configure these options via the integration's **Configure** button:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| Scan interval | 900 | How often to fetch data in seconds (60–3600) |
+| Scan interval | 900 seconds (15 minutes) | How often to poll Garmin Connect (60–3600 seconds) |
 
 ## Data updates
 
-The integration uses cloud polling to fetch data from Garmin Connect servers. Data is refreshed based on the configured scan interval (default: 5 minutes). Nine independent coordinators fetch data in parallel:
+The integration uses cloud polling to fetch data from Garmin Connect servers.
+The default scan interval is **900 seconds (15 minutes)**. It is a polling
+cadence, not a guarantee that a device has already synced or that Garmin has
+made new data available. Nine independent coordinators fetch data in parallel:
 
 | Coordinator | Data |
 |-------------|------|
@@ -97,6 +103,29 @@ The integration uses cloud polling to fetch data from Garmin Connect servers. Da
 | Nutrition | Consumed calories & macros, goals, per-meal breakdown (Connect+, disabled by default) |
 
 > **Tip:** Garmin devices sync to Garmin Connect when in Bluetooth range of the paired phone or via WiFi. Sensors update after your device syncs to Garmin Connect **and** the integration polls for new data.
+
+## Prospective Archive (3.1.0-beta.2)
+
+The Prospective Archive is **off by default**. It records eligible data only
+after you explicitly enable **Prospective Archive** in the Garmin config-entry
+options; normal setup never starts Historical Backfill or imports a full year.
+Before enabling it, create a Home Assistant backup that includes the
+configuration directory and Recorder database.
+
+When enabled, use the privacy-safe Archive Status entity to follow progress.
+The archive exposes read-only Calendar entities for sleep, activities, and
+health events; detailed numeric history remains available through Home
+Assistant statistics. Calendar output is intentionally bounded summaries, not
+raw Garmin payloads.
+
+Disable Prospective Archive to stop future automatic archive work. Existing
+Recorder statistics, Store records, Calendar records, and FIT files remain
+retained; this integration provides no archive-deletion action and no automatic
+expiry policy. There is no built-in retention period: the records remain until
+an administrator manages the storage outside this integration. Disabling,
+reloading, upgrading, or rolling back does not remove those records. See the
+[3.1.0-beta.2 release guide](docs/release-3.1.0-beta.2.md) for the current-data
+cadence, retention planning, downgrade, and re-authentication safety guidance.
 
 ## Sensors
 
@@ -305,7 +334,8 @@ Nutrition sensors are disabled by default. Enable them under **Settings → Devi
 
 > **Statistics caveat:** Editing or deleting meals in the Garmin app can decrease daily totals. Long-term statistics may not reflect retroactive changes accurately.
 
-Meals logged via the `add_nutrition_log` service appear after the next poll (default 5 minutes).
+Meals logged via the `add_nutrition_log` service appear after the next poll.
+The default scan interval is **900 seconds (15 minutes)**.
 
 **Automation example** — evening protein reminder:
 
@@ -677,14 +707,14 @@ Then perform any steps to reproduce the issue and disable debug logging again. I
 
 ## Support This Project
 
-If you find this integration useful, please consider supporting its development:
-
-[![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg?style=for-the-badge&logo=paypal)](https://www.paypal.me/cyberjunkynl/)
-[![Sponsor on GitHub](https://img.shields.io/badge/Sponsor-GitHub-red.svg?style=for-the-badge&logo=github)](https://github.com/sponsors/cyberjunky)
-
 - Star this repository
-- [Report issues](https://github.com/cyberjunky/home-assistant-garmin_connect/issues)
+- [Submit public feedback through a pull request](https://github.com/Jasper-1024/home-assistant-garmin_connect/pulls). Fork this repository, create a branch, add a redacted feedback file at `docs/feedback/<topic>.md` using the [feedback template](docs/feedback/README.md), then open a pull request with `Jasper-1024/home-assistant-garmin_connect` as the base. Do not include passwords, tokens, or raw health data.
 - Share with other Home Assistant users
+
+GitHub Issues and Discussions are disabled on this fork. The linked pull-request
+list is the public feedback intake; it requires a GitHub account and a fork
+with a branch. Maintainers triage accepted reports and archive their
+internal implementation record in Plane; Plane is not a public support endpoint.
 
 ## License
 
@@ -692,9 +722,9 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 ---
 
-[releases-shield]: https://img.shields.io/github/release/cyberjunky/home-assistant-garmin_connect.svg?style=for-the-badge
-[releases]: https://github.com/cyberjunky/home-assistant-garmin_connect/releases
-[commits-shield]: https://img.shields.io/github/commit-activity/y/cyberjunky/home-assistant-garmin_connect.svg?style=for-the-badge
-[commits]: https://github.com/cyberjunky/home-assistant-garmin_connect/commits/main
-[license-shield]: https://img.shields.io/github/license/cyberjunky/home-assistant-garmin_connect.svg?style=for-the-badge
-[maintenance-shield]: https://img.shields.io/badge/maintainer-cyberjunky-blue.svg?style=for-the-badge
+[releases-shield]: https://img.shields.io/github/release/Jasper-1024/home-assistant-garmin_connect.svg?style=for-the-badge
+[releases]: https://github.com/Jasper-1024/home-assistant-garmin_connect/releases
+[commits-shield]: https://img.shields.io/github/commit-activity/y/Jasper-1024/home-assistant-garmin_connect.svg?style=for-the-badge
+[commits]: https://github.com/Jasper-1024/home-assistant-garmin_connect/commits/main
+[license-shield]: https://img.shields.io/github/license/Jasper-1024/home-assistant-garmin_connect.svg?style=for-the-badge
+[maintenance-shield]: https://img.shields.io/badge/maintainer-Jasper--1024-blue.svg?style=for-the-badge

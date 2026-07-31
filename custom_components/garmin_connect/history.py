@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import inspect
 import json
 import logging
@@ -38,6 +39,7 @@ from .const import (
     CONF_ARCHIVE_PREVIOUSLY_ENABLED,
     CONF_HISTORY_ACCOUNT_KEY,
     DOMAIN,
+    HISTORY_OWNER_FINGERPRINT,
     HISTORY_STORE_VERSION,
     RECORDER_COMPATIBILITY_TARGET,
 )
@@ -98,6 +100,10 @@ from .history_recorder import (
     VIGOROUS_INTENSITY_DAILY_METADATA,
     VIGOROUS_INTENSITY_METADATA,
     GarminHistoryRecorder,
+    _RecorderBarrierTimeoutError,
+    _require_durable_import_statistics_contract,
+    _require_recorder_task_contract,
+    async_confirm_recorder_queue,
     statistic_id_for,
 )
 from .history_source import (
@@ -124,8 +130,7 @@ _ACCOUNT_KEY_MAX_LENGTH = 128
 _ACCOUNT_KEY_ALPHABET = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
 )
-_RECORDER_SUPPORTED_VERSIONS = frozenset({"2026.7.3", "2026.7.4"})
-_RECORDER_BARRIER_TIMEOUT = 10
+_RECORDER_MINIMUM_HOME_ASSISTANT_VERSION = (2026, 7, 4)
 _HISTORY_MIN_DATE = date(2026, 1, 1)
 _HISTORY_MAX_DAYS = 31
 _FIRST_SYNC_FIT_LIMIT = 1
@@ -230,6 +235,18 @@ def _fingerprint_details(value: Any) -> str:
         _fingerprint_value(value), sort_keys=True, separators=(",", ":")
     )
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _runtime_request_executor(runtime_data: Any) -> Any:
+    """Return the loaded runtime lifecycle, or a legacy injected gate."""
+    # Keep the import local: coordinator imports history for its archive type.
+    from .coordinator import BaseGarminCoordinator, GarminConnectCoordinators
+
+    if isinstance(runtime_data, GarminConnectCoordinators) and isinstance(
+        runtime_data.core, BaseGarminCoordinator
+    ):
+        return runtime_data
+    return getattr(runtime_data, "request_gate", None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -882,11 +899,11 @@ class HomeAssistantRecorderCompatibility:
     """
 
     async def async_check(self) -> RecorderCompatibilityResult:
-        """Validate symbols, signatures, and a real queue barrier."""
+        """Validate symbols, signatures, and a progress-aware queue barrier."""
         try:
             from homeassistant.const import __version__ as home_assistant_version
 
-            if home_assistant_version not in _RECORDER_SUPPORTED_VERSIONS:
+            if not _has_supported_home_assistant_version(home_assistant_version):
                 return RecorderCompatibilityResult.incompatible_result(
                     "unsupported_home_assistant_version"
                 )
@@ -897,15 +914,15 @@ class HomeAssistantRecorderCompatibility:
                 StatisticData,
                 StatisticMetaData,
             )
-            from homeassistant.components.recorder.tasks import SynchronizeTask
             from homeassistant.helpers.recorder import get_instance
 
+            _require_recorder_task_contract()
+            _require_durable_import_statistics_contract()
             _require_parameters(
                 Recorder.async_import_statistics,
                 ("self", "metadata", "stats", "table"),
             )
             _require_parameters(Recorder.queue_task, ("self", "task"))
-            _require_parameters(SynchronizeTask, ("future",))
             _require_typed_dict_keys(StatisticData, ("start", "mean", "min", "max"))
             _require_typed_dict_keys(
                 StatisticMetaData,
@@ -923,14 +940,12 @@ class HomeAssistantRecorderCompatibility:
                 return RecorderCompatibilityResult.incompatible_result("statistics_model")
 
             recorder = get_instance(self.hass)
-            future = self.hass.loop.create_future()
-            recorder.queue_task(SynchronizeTask(future))
-            await asyncio.wait_for(future, timeout=_RECORDER_BARRIER_TIMEOUT)
+            await async_confirm_recorder_queue(recorder)
         except asyncio.CancelledError:
             raise
         except (AttributeError, ImportError, TypeError, ValueError):
             return RecorderCompatibilityResult.incompatible_result("recorder_signature")
-        except TimeoutError:
+        except _RecorderBarrierTimeoutError:
             return RecorderCompatibilityResult.incompatible_result("recorder_barrier")
         except Exception:
             # Do not include exception text: Recorder errors can contain
@@ -949,6 +964,22 @@ def _require_parameters(callable_obj: Any, expected: tuple[str, ...]) -> None:
     parameters = tuple(inspect.signature(callable_obj).parameters)
     if parameters != expected:
         raise TypeError("Recorder signature changed")
+
+
+def _has_supported_home_assistant_version(version: str) -> bool:
+    """Return whether Home Assistant meets the HACS minimum version policy."""
+    if not isinstance(version, str):
+        return False
+    parts = version.split(".")
+    if len(parts) != len(_RECORDER_MINIMUM_HOME_ASSISTANT_VERSION) or any(
+        not part.isascii()
+        or not part.isdecimal()
+        or (len(part) > 1 and part.startswith("0"))
+        for part in parts
+    ):
+        return False
+    parsed = tuple(int(part) for part in parts)
+    return parsed >= _RECORDER_MINIMUM_HOME_ASSISTANT_VERSION
 
 
 def _require_typed_dict_keys(type_obj: Any, expected: tuple[str, ...]) -> None:
@@ -1025,6 +1056,7 @@ class GarminHistoryArchive:
         self._archive_enabled = False
         self._activation_date: date | None = None
         self._account_key_value: str | None = None
+        self._owner_fingerprint_value: str | None = None
         self._archive_backoff_until: datetime | None = None
         self._archive_last_success: datetime | None = None
         self._archive_next_eligible_run: datetime | None = None
@@ -1249,7 +1281,21 @@ class GarminHistoryArchive:
         self._started = True
 
         try:
-            account_key = self._async_ensure_account_key()
+            await self._async_open_store()
+        except asyncio.CancelledError:
+            self._started = False
+            await self.async_stop()
+            raise
+        except Exception:
+            self._set_failed("store_initialization")
+            _LOGGER.warning(
+                "Garmin history archive Store initialization failed for entry %s",
+                self._entry.entry_id,
+            )
+            return
+
+        try:
+            account_key = await self._async_ensure_account_key()
             self._async_update_enablement_state()
         except asyncio.CancelledError:
             self._started = False
@@ -1938,6 +1984,11 @@ class GarminHistoryArchive:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def async_abort_startup(self, error_type: str) -> None:
+        """Fail closed and release archive resources after bounded startup fails."""
+        self._set_failed(error_type)
+        await self.async_stop()
+
     async def _async_load_backfill_state(self) -> Any:
         if self._store is None:
             return None
@@ -2216,12 +2267,15 @@ class GarminHistoryArchive:
 
         runtime_data = getattr(self._entry, "runtime_data", None)
         client = getattr(getattr(runtime_data, "core", None), "client", None)
-        request_gate = getattr(runtime_data, "request_gate", None)
+        request_executor = _runtime_request_executor(runtime_data)
         if client is None:
             self._runtime_sync_failure = True
             self._status = HistoryStatus(HistoryArchiveState.FAILED, error_type="integration_not_loaded", **self._backfill_status_fields())
             return HistorySyncReport(outcome="failed", error_type="integration_not_loaded")
-        source = (self._source_factory or GarminHistorySource)(client, request_gate)
+        # The loaded runtime adapter owns the account gate and persists any
+        # token refresh before releasing it. Test-only source factories and
+        # legacy injected runtimes can still receive a bare gate.
+        source = (self._source_factory or GarminHistorySource)(client, request_executor)
         if self._recorder_adapter is None:
             if self._recorder_factory:
                 self._recorder_adapter = self._recorder_factory()
@@ -2319,7 +2373,10 @@ class GarminHistoryArchive:
                             family_observations.record(metric, error.observation)
                         family_observations.record_failure(metric, error.error_type)
                         _LOGGER.warning(
-                            "Garmin numeric family failed for %s (%s)", target_key, metric
+                            "Garmin numeric family failed for %s (%s: %s)",
+                            target_key,
+                            metric,
+                            failed_family_error,
                         )
                         if error.write_failure:
                             numeric_write_failed = True
@@ -2356,7 +2413,10 @@ class GarminHistoryArchive:
                         failed_family_error = error_type
                         family_observations.record_failure(metric, failed_family_error)
                         _LOGGER.warning(
-                            "Garmin numeric family failed for %s (%s)", target_key, metric
+                            "Garmin numeric family failed for %s (%s: %s)",
+                            target_key,
+                            metric,
+                            failed_family_error,
                         )
                         await self._async_checkpoint_observation(
                             target,
@@ -3056,21 +3116,20 @@ class GarminHistoryArchive:
             return 0
         max_downloads = 1 if limit is None else max(0, limit)
         downloaded = 0
-        request_gate = getattr(
-            getattr(self._entry, "runtime_data", None), "request_gate", None
-        )
+        runtime_data = getattr(self._entry, "runtime_data", None)
+        request_executor = _runtime_request_executor(runtime_data)
 
         async def gated_download(activity_id: int, file_format: str) -> bytes:
             async def request() -> bytes:
                 return cast(bytes, await download_activity(activity_id, file_format))
 
-            if request_gate is None or not callable(
-                getattr(request_gate, "async_request", None)
+            if request_executor is None or not callable(
+                getattr(request_executor, "async_request", None)
             ):
                 return await request()
             return cast(
                 bytes,
-                await request_gate.async_request(
+                await request_executor.async_request(
                     GarminRequestPriority.BACKGROUND, request
                 ),
             )
@@ -3200,6 +3259,11 @@ class GarminHistoryArchive:
             "schema_version": HISTORY_STORE_VERSION,
             "sleep_schema_version": _SLEEP_SCHEMA_VERSION,
             "account_key": self._account_key(),
+            **(
+                {HISTORY_OWNER_FINGERPRINT: self._owner_fingerprint_value}
+                if self._owner_fingerprint_value is not None
+                else {}
+            ),
             "archive_backoff_until": (
                 self._archive_backoff_until.astimezone(UTC).isoformat()
                 if self._archive_backoff_until is not None
@@ -3658,7 +3722,9 @@ class GarminHistoryArchive:
 
     def _account_key(self) -> str:
         """Return the persisted opaque account key."""
-        account_key = self._entry.data.get(CONF_HISTORY_ACCOUNT_KEY)
+        account_key = self._account_key_value or self._entry.data.get(
+            CONF_HISTORY_ACCOUNT_KEY
+        )
         if not isinstance(account_key, str) or not _is_valid_account_key(account_key):
             raise RuntimeError("account identity unavailable")
         return account_key
@@ -3907,18 +3973,218 @@ class GarminHistoryArchive:
             # a catalog write failure must not restore durability or escape.
             return
 
-    def _async_ensure_account_key(self) -> str:
-        """Load or create the opaque identity persisted in the config entry."""
+    async def _async_ensure_account_key(self) -> str:
+        """Load, safely recover, or create the opaque archive identity."""
+        await self._async_open_store()
+        assert self._store is not None
+        catalog = await self._store.async_load()
         current = self._entry.data.get(CONF_HISTORY_ACCOUNT_KEY)
+
         if isinstance(current, str) and _is_valid_account_key(current):
             self._account_key_value = current
+            if catalog is not None:
+                if (
+                    not isinstance(catalog, Mapping)
+                    or catalog.get("account_key") != current
+                ):
+                    raise ValueError("Store identity mismatch")
+                await self._async_bind_catalog_owner(catalog, current)
+            elif self._has_current_profile_source():
+                self._owner_fingerprint_value = (
+                    await self._async_owner_fingerprint_for_current_profile(current)
+                )
             return current
 
+        # A malformed explicit key is not a downgrade artifact. Never replace
+        # it with a catalog value because that could adopt another archive.
+        if current is not None:
+            raise ValueError("account identity is invalid")
+
+        if catalog is not None:
+            account_key = await self._async_restore_account_key(catalog)
+            self._account_key_value = account_key
+            data = {**self._entry.data, CONF_HISTORY_ACCOUNT_KEY: account_key}
+            self._hass.config_entries.async_update_entry(self._entry, data=data)
+            return account_key
+
         account_key = secrets.token_urlsafe(24)
+        self._account_key_value = account_key
+        if self._has_current_profile_source():
+            self._owner_fingerprint_value = (
+                await self._async_owner_fingerprint_for_current_profile(account_key)
+            )
         data = {**self._entry.data, CONF_HISTORY_ACCOUNT_KEY: account_key}
         self._hass.config_entries.async_update_entry(self._entry, data=data)
-        self._account_key_value = account_key
         return account_key
+
+    async def _async_open_store(self) -> None:
+        """Open the private catalog Store without creating or overwriting it."""
+        if self._store is not None:
+            return
+        store_factory = self._store_factory
+        if store_factory is None:
+            from homeassistant.helpers.storage import Store
+
+            store_factory = Store
+        self._store = store_factory(
+            self._hass,
+            HISTORY_STORE_VERSION,
+            f"{DOMAIN}.{self._entry.entry_id}.history_catalog",
+            private=True,
+            atomic_writes=True,
+        )
+
+    async def _async_bind_catalog_owner(
+        self, catalog: Mapping[str, Any], account_key: str
+    ) -> None:
+        """Verify or safely upgrade a catalog owner binding.
+
+        Every archive binding is derived from the profile returned by the
+        current authenticated Garmin client.  The old v1 binding used
+        ``entry.unique_id``; it is migratable only when a legacy numeric ID
+        exactly matches that authenticated profile.  A username fallback has
+        no profile proof and intentionally remains fail-closed.
+        """
+        stored = catalog.get(HISTORY_OWNER_FINGERPRINT)
+        # Direct lifecycle seams without a Garmin client are intentionally
+        # identity-neutral. Production setup always supplies this capability;
+        # do not turn a no-client test adapter into a permissive recovery path.
+        if stored is None and not self._has_current_profile_source():
+            return
+        profile_id = await self._async_current_profile_id()
+        owner_fingerprint = self._owner_fingerprint(account_key, profile_id)
+        if isinstance(stored, str) and _is_valid_owner_fingerprint(stored):
+            if hmac.compare_digest(stored, owner_fingerprint):
+                self._owner_fingerprint_value = stored
+                return
+            if self._legacy_binding_matches_profile(stored, account_key, profile_id):
+                await self._async_save_owner_fingerprint(catalog, owner_fingerprint)
+                return
+        elif stored is None and self._legacy_entry_matches_profile(profile_id):
+            # A pre-binding beta catalog is recoverable only where its config
+            # entry's legacy numeric identity is authenticated again.
+            await self._async_save_owner_fingerprint(catalog, owner_fingerprint)
+            return
+        raise ValueError("Store owner identity mismatch")
+
+    async def _async_restore_account_key(self, catalog: Any) -> str:
+        """Recover only an archive proven to belong to the current profile."""
+        if not isinstance(catalog, Mapping):
+            raise ValueError("Store identity is invalid")
+        account_key = catalog.get("account_key")
+        owner_fingerprint = catalog.get(HISTORY_OWNER_FINGERPRINT)
+        if (
+            not isinstance(account_key, str)
+            or not _is_valid_account_key(account_key)
+            or not isinstance(owner_fingerprint, str)
+            or not _is_valid_owner_fingerprint(owner_fingerprint)
+        ):
+            raise ValueError("Store recovery identity is unavailable")
+
+        profile_id = await self._async_current_profile_id()
+        expected_fingerprint = self._owner_fingerprint(account_key, profile_id)
+        if hmac.compare_digest(owner_fingerprint, expected_fingerprint):
+            self._owner_fingerprint_value = owner_fingerprint
+            return account_key
+        if self._legacy_binding_matches_profile(
+            owner_fingerprint, account_key, profile_id
+        ):
+            await self._async_save_owner_fingerprint(catalog, expected_fingerprint)
+            return account_key
+        raise ValueError("Store owner identity mismatch")
+
+    async def _async_save_owner_fingerprint(
+        self, catalog: Mapping[str, Any], owner_fingerprint: str
+    ) -> None:
+        """Persist a profile HMAC without retaining profile identity data."""
+        updated = dict(catalog)
+        updated[HISTORY_OWNER_FINGERPRINT] = owner_fingerprint
+        assert self._store is not None
+        await self._store.async_save(updated)
+        self._owner_fingerprint_value = owner_fingerprint
+
+    async def _async_owner_fingerprint_for_current_profile(self, account_key: str) -> str:
+        """Return the v2 HMAC binding for the authenticated Garmin profile."""
+        return self._owner_fingerprint(
+            account_key, await self._async_current_profile_id()
+        )
+
+    async def _async_current_profile_id(self) -> str:
+        """Read the authenticated Garmin profile through the request boundary."""
+        runtime_data = getattr(self._entry, "runtime_data", None)
+        client = getattr(getattr(runtime_data, "core", None), "client", None)
+        get_user_profile = getattr(client, "get_user_profile", None)
+        if not callable(get_user_profile):
+            raise ValueError("current account identity is unavailable")
+
+        async def request() -> Any:
+            return await get_user_profile()
+
+        request_executor = _runtime_request_executor(runtime_data)
+        if request_executor is not None and callable(
+            getattr(request_executor, "async_request", None)
+        ):
+            profile = await request_executor.async_request(
+                GarminRequestPriority.FOREGROUND, request
+            )
+        else:
+            profile = await request()
+        profile_id = getattr(profile, "profile_id", None)
+        if not isinstance(profile_id, (str, int)) or isinstance(profile_id, bool):
+            raise ValueError("current account identity is unavailable")
+        return str(profile_id)
+
+    def _has_current_profile_source(self) -> bool:
+        """Return whether this runtime can verify its authenticated profile."""
+        runtime_data = getattr(self._entry, "runtime_data", None)
+        client = getattr(getattr(runtime_data, "core", None), "client", None)
+        try:
+            getter = inspect.getattr_static(client, "get_user_profile")
+        except AttributeError:
+            return False
+        return callable(getter)
+
+    def _owner_identity(self) -> str | None:
+        """Return the bounded immutable identity configured for this Garmin entry."""
+        unique_id = getattr(self._entry, "unique_id", None)
+        if not isinstance(unique_id, str) or not 1 <= len(unique_id) <= 256:
+            return None
+        return unique_id
+
+    def _owner_fingerprint(self, account_key: str, profile_id: str) -> str:
+        """Return a private v2 binding for one immutable Garmin profile."""
+        return hmac.new(
+            account_key.encode(),
+            f"{DOMAIN}:history-owner:v2:{profile_id}".encode(),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _legacy_binding_matches_profile(
+        self, stored: str, account_key: str, profile_id: str
+    ) -> bool:
+        """Accept a v1 binding only after numeric entry/profile verification."""
+        owner_identity = self._owner_identity()
+        if (
+            owner_identity is None
+            or not owner_identity.isdecimal()
+            or not hmac.compare_digest(owner_identity, profile_id)
+        ):
+            return False
+        expected = hmac.new(
+            account_key.encode(),
+            f"{DOMAIN}:history-owner:v1:{owner_identity}".encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(stored, expected)
+
+    def _legacy_entry_matches_profile(self, profile_id: str) -> bool:
+        """Return whether a legacy numeric entry is current-profile verified."""
+        owner_identity = self._owner_identity()
+        return (
+            owner_identity is not None
+            and owner_identity.isdecimal()
+            and hmac.compare_digest(owner_identity, profile_id)
+        )
 
     def _async_update_enablement_state(self) -> None:
         """Persist Archive Enablement transitions without starting sync work."""
@@ -3961,23 +4227,11 @@ class GarminHistoryArchive:
 
     async def _async_initialize_store(self, account_key: str) -> None:
         """Create and validate the per-account Store catalog."""
-        store_factory = self._store_factory
-        if store_factory is None:
-            from homeassistant.helpers.storage import Store
-
-            store_factory = Store
-
-        self._store = store_factory(
-            self._hass,
-            HISTORY_STORE_VERSION,
-            f"{DOMAIN}.{self._entry.entry_id}.history_catalog",
-            private=True,
-            atomic_writes=True,
-        )
+        await self._async_open_store()
+        assert self._store is not None
         catalog = await self._store.async_load()
         if catalog is None:
-            await self._store.async_save(
-                {
+            initial_catalog = {
                     "schema_version": HISTORY_STORE_VERSION,
                     "account_key": account_key,
                     "archive_backoff_until": None,
@@ -4002,7 +4256,11 @@ class GarminHistoryArchive:
                     "fit_queue_error": None,
                     "fit_last_eligible_download": None,
                 }
-            )
+            if self._owner_fingerprint_value is not None:
+                initial_catalog[HISTORY_OWNER_FINGERPRINT] = (
+                    self._owner_fingerprint_value
+                )
+            await self._store.async_save(initial_catalog)
             return
         if not isinstance(catalog, Mapping) or catalog.get("account_key") != account_key:
             raise ValueError("Store identity mismatch")
@@ -4493,6 +4751,11 @@ def _is_valid_account_key(value: str) -> bool:
     return _ACCOUNT_KEY_MIN_LENGTH <= len(value) <= _ACCOUNT_KEY_MAX_LENGTH and not (
         set(value) - _ACCOUNT_KEY_ALPHABET
     )
+
+
+def _is_valid_owner_fingerprint(value: str) -> bool:
+    """Accept only the fixed-width private owner binding format."""
+    return len(value) == 64 and not (set(value) - frozenset("0123456789abcdef"))
 
 
 def _iter_inclusive_dates(start_date: date, end_date: date) -> Iterator[date]:

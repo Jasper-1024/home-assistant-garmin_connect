@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
 import voluptuous as vol
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import (
     HomeAssistant,
     ServiceCall,
@@ -26,11 +29,15 @@ from .intraday_probe import (
     async_probe_capability,
     async_probe_intraday,
 )
+from .request_gate import GarminRequestPriority
 
 if TYPE_CHECKING:
     from ha_garmin import GarminClient
 
     from .coordinator import GarminConnectCoordinators
+
+
+_ServiceResult = TypeVar("_ServiceResult")
 
 # Service names
 SERVICE_SET_ACTIVE_GEAR = "set_active_gear"
@@ -201,20 +208,46 @@ SYNC_HISTORY_SCHEMA = vol.All(
 )
 
 
-def _get_client(
-    hass: HomeAssistant,
-    *,
-    entity_id: str | None = None,
-) -> GarminClient:
-    """Get the Garmin client for a targeted or fallback config entry."""
+@dataclass(frozen=True, slots=True)
+class _LoadedGarminAccount:
+    """One loaded account's guarded Garmin service surface."""
+
+    coordinators: GarminConnectCoordinators
+
+    async def async_call(
+        self, operation: Callable[[GarminClient], Awaitable[_ServiceResult]]
+    ) -> _ServiceResult:
+        """Run foreground cloud work through its gate and token persistence."""
+        return await self.coordinators.async_request(
+            GarminRequestPriority.FOREGROUND,
+            lambda: operation(self.coordinators.core.client),
+        )
+
+
+def _loaded_account(entry: object) -> _LoadedGarminAccount | None:
+    """Return the active runtime only for a loaded config entry."""
+    state = getattr(entry, "state", None)
+    if isinstance(state, ConfigEntryState) and state is not ConfigEntryState.LOADED:
+        return None
+    coordinators = getattr(entry, "runtime_data", None)
+    if (
+        coordinators is None
+        or getattr(getattr(coordinators, "core", None), "client", None) is None
+        or not callable(getattr(coordinators, "async_request", None))
+    ):
+        return None
+    return _LoadedGarminAccount(coordinators)
+
+
+def _resolve_loaded_account(
+    hass: HomeAssistant, entity_id: str | None = None
+) -> _LoadedGarminAccount:
+    """Select the entity account or the first loaded account with a runtime."""
     entries = hass.config_entries.async_entries(DOMAIN)
     if not entries:
         raise HomeAssistantError(
-            translation_domain=DOMAIN,
-            translation_key="no_integration_configured",
+            translation_domain=DOMAIN, translation_key="no_integration_configured"
         )
-
-    entry = entries[0]
 
     if entity_id:
         registry_entry = er.async_get(hass).async_get(entity_id)
@@ -224,44 +257,14 @@ def _get_client(
                 translation_key="entity_not_found",
                 translation_placeholders={"entity_id": entity_id},
             )
-
-        matched = next(
+        entry = next(
             (
-                candidate
-                for candidate in entries
-                if candidate.entry_id == registry_entry.config_entry_id
+                item
+                for item in entries
+                if item.entry_id == registry_entry.config_entry_id
             ),
             None,
         )
-        if matched is None:
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="entity_not_found",
-                translation_placeholders={"entity_id": entity_id},
-            )
-        entry = matched
-
-    if getattr(entry, "runtime_data", None) is None:
-        raise HomeAssistantError(
-            translation_domain=DOMAIN,
-            translation_key="integration_not_loaded",
-        )
-
-    coordinators: GarminConnectCoordinators = entry.runtime_data
-    return coordinators.core.client
-
-
-def _get_archive(hass: HomeAssistant, entity_id: str | None) -> GarminHistoryArchive:
-    """Resolve a history archive by the existing entity account convention."""
-    entries = hass.config_entries.async_entries(DOMAIN)
-    if not entries:
-        raise HomeAssistantError(
-            translation_domain=DOMAIN, translation_key="no_integration_configured"
-        )
-    if entity_id:
-        registry_entry = er.async_get(hass).async_get(entity_id)
-        entry_id = registry_entry.config_entry_id if registry_entry else None
-        entry = next((item for item in entries if item.entry_id == entry_id), None)
         if entry is None:
             raise HomeAssistantError(
                 translation_domain=DOMAIN,
@@ -269,8 +272,25 @@ def _get_archive(hass: HomeAssistant, entity_id: str | None) -> GarminHistoryArc
                 translation_placeholders={"entity_id": entity_id},
             )
     else:
-        entry = entries[0]
-    archive = getattr(getattr(entry, "runtime_data", None), "history_archive", None)
+        entry = next((item for item in entries if _loaded_account(item) is not None), None)
+        if entry is None:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="integration_not_loaded",
+            )
+
+    account = _loaded_account(entry)
+    if account is None:
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="integration_not_loaded",
+        )
+    return account
+
+
+def _get_archive(hass: HomeAssistant, entity_id: str | None) -> GarminHistoryArchive:
+    """Resolve the selected loaded account's already-gated history archive."""
+    archive = _resolve_loaded_account(hass, entity_id).coordinators.history_archive
     if not isinstance(archive, GarminHistoryArchive):
         raise HomeAssistantError(translation_domain=DOMAIN, translation_key="integration_not_loaded")
     return archive
@@ -281,19 +301,21 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def handle_probe_intraday(call: ServiceCall) -> ServiceResponse:
         """Probe Garmin cloud intraday series without persisting data."""
-        client = _get_client(hass, entity_id=call.data.get("entity_id"))
+        account = _resolve_loaded_account(hass, call.data.get("entity_id"))
         target_date = call.data.get("date") or dt_util.now().date()
         if isinstance(target_date, str):
             target_date = date.fromisoformat(target_date)
-        return await async_probe_intraday(
-            client,
-            target_date,
-            call.data.get("metric", "all"),
+        return await account.async_call(
+            lambda client: async_probe_intraday(
+                client,
+                target_date,
+                call.data.get("metric", "all"),
+            )
         )
 
     async def handle_probe_capability(call: ServiceCall) -> ServiceResponse:
         """Run one privacy-minimized Garmin capability request."""
-        client = _get_client(hass, entity_id=call.data.get("entity_id"))
+        account = _resolve_loaded_account(hass, call.data.get("entity_id"))
         target_date = call.data.get("date") or dt_util.now().date()
         start_date = call.data.get("start_date")
         end_date = call.data.get("end_date")
@@ -303,12 +325,14 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             start_date = date.fromisoformat(start_date)
         if isinstance(end_date, str):
             end_date = date.fromisoformat(end_date)
-        return await async_probe_capability(
-            client,
-            call.data["probe"],
-            target_date,
-            start_date,
-            end_date,
+        return await account.async_call(
+            lambda client: async_probe_capability(
+                client,
+                call.data["probe"],
+                target_date,
+                start_date,
+                end_date,
+            )
         )
 
     async def handle_sync_history(call: ServiceCall) -> ServiceResponse:
@@ -320,6 +344,8 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         target_date = call.data.get("date")
         start_date = call.data.get("start_date") or target_date or dt_util.now().date()
         end_date = call.data.get("end_date") or target_date or start_date
+        # GarminHistorySource acquires this account's gate for every cloud
+        # request. Acquiring it here as well would deadlock the nested sync.
         report: HistorySyncReport = await _get_archive(
             hass, call.data.get("entity_id")
         ).async_sync_range(start_date, end_date)
@@ -361,12 +387,14 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     translation_placeholders={"entity_id": entity_id},
                 )
 
-        client = _get_client(hass, entity_id=entity_id)
+        account = _resolve_loaded_account(hass, entity_id)
         try:
-            await client.set_active_gear(
-                activity_type=activity_type,
-                setting=setting,
-                gear_uuid=gear_uuid,
+            await account.async_call(
+                lambda client: client.set_active_gear(
+                    activity_type=activity_type,
+                    setting=setting,
+                    gear_uuid=gear_uuid,
+                )
             )
         except Exception as err:
             raise HomeAssistantError(
@@ -377,25 +405,24 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def handle_add_body_composition(call: ServiceCall) -> None:
         """Handle add_body_composition service call."""
-        client = _get_client(
-            hass,
-            entity_id=call.data.get("entity_id"),
-        )
+        account = _resolve_loaded_account(hass, call.data.get("entity_id"))
         try:
-            await client.add_body_composition(
-                timestamp=call.data.get("timestamp"),
-                weight=call.data["weight"],
-                percent_fat=call.data.get("percent_fat"),
-                percent_hydration=call.data.get("percent_hydration"),
-                visceral_fat_mass=call.data.get("visceral_fat_mass"),
-                bone_mass=call.data.get("bone_mass"),
-                muscle_mass=call.data.get("muscle_mass"),
-                basal_met=call.data.get("basal_met"),
-                active_met=call.data.get("active_met"),
-                physique_rating=call.data.get("physique_rating"),
-                metabolic_age=call.data.get("metabolic_age"),
-                visceral_fat_rating=call.data.get("visceral_fat_rating"),
-                bmi=call.data.get("bmi"),
+            await account.async_call(
+                lambda client: client.add_body_composition(
+                    timestamp=call.data.get("timestamp"),
+                    weight=call.data["weight"],
+                    percent_fat=call.data.get("percent_fat"),
+                    percent_hydration=call.data.get("percent_hydration"),
+                    visceral_fat_mass=call.data.get("visceral_fat_mass"),
+                    bone_mass=call.data.get("bone_mass"),
+                    muscle_mass=call.data.get("muscle_mass"),
+                    basal_met=call.data.get("basal_met"),
+                    active_met=call.data.get("active_met"),
+                    physique_rating=call.data.get("physique_rating"),
+                    metabolic_age=call.data.get("metabolic_age"),
+                    visceral_fat_rating=call.data.get("visceral_fat_rating"),
+                    bmi=call.data.get("bmi"),
+                )
             )
         except Exception as err:
             raise HomeAssistantError(
@@ -406,14 +433,16 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def handle_add_blood_pressure(call: ServiceCall) -> None:
         """Handle add_blood_pressure service call."""
-        client = _get_client(hass, entity_id=call.data.get("entity_id"))
+        account = _resolve_loaded_account(hass, call.data.get("entity_id"))
         try:
-            await client.set_blood_pressure(
-                systolic=call.data["systolic"],
-                diastolic=call.data["diastolic"],
-                pulse=call.data["pulse"],
-                timestamp=call.data.get("timestamp"),
-                notes=call.data.get("notes", ""),
+            await account.async_call(
+                lambda client: client.set_blood_pressure(
+                    systolic=call.data["systolic"],
+                    diastolic=call.data["diastolic"],
+                    pulse=call.data["pulse"],
+                    timestamp=call.data.get("timestamp"),
+                    notes=call.data.get("notes", ""),
+                )
             )
         except Exception as err:
             raise HomeAssistantError(
@@ -424,7 +453,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def handle_create_activity(call: ServiceCall) -> None:
         """Handle create_activity service call."""
-        client = _get_client(hass, entity_id=call.data.get("entity_id"))
+        account = _resolve_loaded_account(hass, call.data.get("entity_id"))
         start_datetime = call.data.get("start_datetime")
         if not start_datetime:
             start_datetime = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.000")
@@ -432,13 +461,15 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             start_datetime = f"{start_datetime}.000"
         time_zone = call.data.get("time_zone") or str(hass.config.time_zone)
         try:
-            await client.create_activity(
-                activity_name=call.data["activity_name"],
-                activity_type=call.data["activity_type"],
-                start_datetime=start_datetime,
-                duration_min=call.data["duration_min"],
-                distance_km=call.data.get("distance_km", 0.0),
-                time_zone=time_zone,
+            await account.async_call(
+                lambda client: client.create_activity(
+                    activity_name=call.data["activity_name"],
+                    activity_type=call.data["activity_type"],
+                    start_datetime=start_datetime,
+                    duration_min=call.data["duration_min"],
+                    distance_km=call.data.get("distance_km", 0.0),
+                    time_zone=time_zone,
+                )
             )
         except Exception as err:
             raise HomeAssistantError(
@@ -449,7 +480,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def handle_upload_activity(call: ServiceCall) -> None:
         """Handle upload_activity service call."""
-        client = _get_client(hass, entity_id=call.data.get("entity_id"))
+        account = _resolve_loaded_account(hass, call.data.get("entity_id"))
         file_path = call.data["file_path"]
         path = Path(file_path)
         if not path.is_absolute():
@@ -461,7 +492,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 translation_placeholders={"file_path": str(path)},
             )
         try:
-            await client.upload_activity(str(path))
+            await account.async_call(lambda client: client.upload_activity(str(path)))
         except Exception as err:
             raise HomeAssistantError(
                 translation_domain=DOMAIN,
@@ -471,7 +502,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def handle_download_activity(call: ServiceCall) -> ServiceResponse:
         """Handle download_activity service call."""
-        client = _get_client(hass, entity_id=call.data.get("entity_id"))
+        account = _resolve_loaded_account(hass, call.data.get("entity_id"))
         activity_id = call.data["activity_id"]
         file_format = call.data["file_format"]
         extension = "zip" if file_format == "original" else file_format
@@ -496,7 +527,9 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             path = Path(hass.config.path("garmin_activities")) / default_name
 
         try:
-            content = await client.download_activity(activity_id, file_format)
+            content = await account.async_call(
+                lambda client: client.download_activity(activity_id, file_format)
+            )
         except Exception as err:
             raise HomeAssistantError(
                 translation_domain=DOMAIN,
@@ -546,11 +579,13 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     translation_placeholders={"entity_id": entity_id},
                 )
 
-        client = _get_client(hass, entity_id=entity_id)
+        account = _resolve_loaded_account(hass, entity_id)
         try:
-            await client.add_gear_to_activity(
-                gear_uuid=gear_uuid,
-                activity_id=activity_id,
+            await account.async_call(
+                lambda client: client.add_gear_to_activity(
+                    gear_uuid=gear_uuid,
+                    activity_id=activity_id,
+                )
             )
         except Exception as err:
             raise HomeAssistantError(
@@ -561,11 +596,13 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def handle_add_hydration(call: ServiceCall) -> None:
         """Handle add_hydration service call."""
-        client = _get_client(hass, entity_id=call.data.get("entity_id"))
+        account = _resolve_loaded_account(hass, call.data.get("entity_id"))
         try:
-            await client.set_hydration(
-                value_in_ml=call.data["value_in_ml"],
-                timestamp=call.data.get("timestamp"),
+            await account.async_call(
+                lambda client: client.set_hydration(
+                    value_in_ml=call.data["value_in_ml"],
+                    timestamp=call.data.get("timestamp"),
+                )
             )
         except Exception as err:
             raise HomeAssistantError(
@@ -576,15 +613,17 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def handle_add_nutrition(call: ServiceCall) -> None:
         """Handle add_nutrition_log service call."""
-        client = _get_client(hass, entity_id=call.data.get("entity_id"))
+        account = _resolve_loaded_account(hass, call.data.get("entity_id"))
         try:
-            await client.add_nutrition_log(
-                calories=call.data["calories"],
-                carbs=call.data.get("carbs"),
-                protein=call.data.get("protein"),
-                fat=call.data.get("fat"),
-                name=call.data.get("name", "Quick Add"),
-                timestamp=call.data.get("timestamp"),
+            await account.async_call(
+                lambda client: client.add_nutrition_log(
+                    calories=call.data["calories"],
+                    carbs=call.data.get("carbs"),
+                    protein=call.data.get("protein"),
+                    fat=call.data.get("fat"),
+                    name=call.data.get("name", "Quick Add"),
+                    timestamp=call.data.get("timestamp"),
+                )
             )
         except Exception as err:
             raise HomeAssistantError(

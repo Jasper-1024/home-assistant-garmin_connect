@@ -5,10 +5,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.garmin_connect.const import DOMAIN
 from custom_components.garmin_connect.history import HistorySyncReport
+from custom_components.garmin_connect.request_gate import GarminRequestPriority
 from custom_components.garmin_connect.services import (
     async_setup_services,
     async_unload_services,
@@ -32,6 +34,13 @@ def _make_entry(entry_id: str, unique_id: str, title: str) -> MagicMock:
     mock_client = AsyncMock()
     mock_coordinators = MagicMock()
     mock_coordinators.core.client = mock_client
+    mock_coordinators.request_priorities = []
+
+    async def async_request(priority, requester):
+        mock_coordinators.request_priorities.append(priority)
+        return await requester()
+
+    mock_coordinators.async_request = async_request
 
     mock_entry = MagicMock()
     mock_entry.entry_id = entry_id
@@ -60,6 +69,14 @@ def _get_client_for_entry(mock_hass: MagicMock, entry_id: str) -> AsyncMock:
     for entry in mock_hass.config_entries.async_entries.return_value:
         if entry.entry_id == entry_id:
             return entry.runtime_data.core.client
+    raise ValueError(f"Entry {entry_id} not configured")
+
+
+def _get_runtime_for_entry(mock_hass: MagicMock, entry_id: str) -> MagicMock:
+    """Get the mock runtime for a specific mock config entry."""
+    for entry in mock_hass.config_entries.async_entries.return_value:
+        if entry.entry_id == entry_id:
+            return entry.runtime_data
     raise ValueError(f"Entry {entry_id} not configured")
 
 
@@ -135,6 +152,55 @@ async def test_probe_intraday_uses_loaded_runtime_client(
     assert probe.await_args.args[0] is client
     assert probe.await_args.args[1].isoformat() == "2026-07-24"
     assert probe.await_args.args[2] == "stress"
+    assert _get_runtime_for_entry(mock_hass, "entry_1").request_priorities == [
+        GarminRequestPriority.FOREGROUND
+    ]
+
+
+async def test_service_fallback_uses_first_loaded_account(
+    mock_hass: MagicMock,
+) -> None:
+    """An unloaded or setup-error account cannot capture an untargeted service."""
+    disabled_entry = mock_hass.config_entries.async_entries.return_value[0]
+    disabled_entry.state = ConfigEntryState.SETUP_ERROR
+    loaded_entry = _make_entry("entry_2", "profile_2", "user2@example.com")
+    mock_hass.config_entries.async_entries.return_value.append(loaded_entry)
+
+    await async_setup_services(mock_hass)
+    handler = _get_handler(mock_hass, "add_hydration")
+    call = MagicMock()
+    call.data = {"value_in_ml": 250.0}
+
+    await handler(call)
+
+    _get_client_for_entry(mock_hass, "entry_1").set_hydration.assert_not_awaited()
+    _get_client_for_entry(mock_hass, "entry_2").set_hydration.assert_awaited_once()
+    assert _get_runtime_for_entry(mock_hass, "entry_2").request_priorities == [
+        GarminRequestPriority.FOREGROUND
+    ]
+
+
+async def test_entity_service_does_not_fallback_from_unloaded_account(
+    mock_hass: MagicMock,
+) -> None:
+    """An entity always selects its own account, even if that entry unloaded."""
+    first_entry = mock_hass.config_entries.async_entries.return_value[0]
+    first_entry.state = ConfigEntryState.NOT_LOADED
+    second_entry = _make_entry("entry_2", "profile_2", "user2@example.com")
+    mock_hass.config_entries.async_entries.return_value.append(second_entry)
+    registry_entry = MagicMock(config_entry_id="entry_1")
+
+    await async_setup_services(mock_hass)
+    handler = _get_handler(mock_hass, "add_hydration")
+    call = MagicMock()
+    call.data = {"entity_id": "sensor.first_garmin_hydration", "value_in_ml": 250.0}
+
+    with patch("custom_components.garmin_connect.services.er.async_get") as async_get:
+        async_get.return_value.async_get.return_value = registry_entry
+        with pytest.raises(HomeAssistantError):
+            await handler(call)
+
+    _get_client_for_entry(mock_hass, "entry_2").set_hydration.assert_not_awaited()
 
 
 async def test_sync_history_returns_processed_iso_dates_without_private_data(
@@ -177,6 +243,7 @@ async def test_sync_history_returns_processed_iso_dates_without_private_data(
     }
     assert "account" not in str(response).lower()
     archive.async_sync_range.assert_awaited_once_with(date(2026, 7, 24), date(2026, 7, 25))
+    assert _get_runtime_for_entry(mock_hass, "entry_1").request_priorities == []
 
 
 async def test_sync_history_returns_bounded_range_error_publicly(

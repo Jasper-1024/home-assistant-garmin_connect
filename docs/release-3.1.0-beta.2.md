@@ -1,18 +1,13 @@
-# Garmin Connect 3.1.0-beta.1 historical release record
-
-> Historical record only. The existing annotated `3.1.0-beta.1` tag resolves
-> to commit `5e25218` and is not the current release candidate. Do not use this
-> document as the candidate guide or as release-gate input; use
-> [the 3.1.0-beta.2 release guide](release-3.1.0-beta.2.md).
-
-The remainder of this file retains the beta.1 historical release record. This
-release cycle adds explicit annotations for historical isolation and
-release-gate guidance; it must not be used as the beta.2 release candidate.
+# Garmin Connect 3.1.0-beta.2 release gate
 
 Minimum Home Assistant Core version: **2026.7.4**. Newer patch and minor
 releases are accepted only after the Recorder capability contract passes; an
 incompatible Recorder API fails closed before history writes. This beta freezes
 the privacy-safe history families and their read-only Calendar surfaces.
+
+> This is the current candidate guide. 3.1.0-beta.1 is a historical release
+> record whose annotated tag resolves to 5e25218; it must never be used as the
+> tag or Release version for this beta.2 candidate.
 
 ## Package source and feedback
 
@@ -22,9 +17,9 @@ For HACS, add that URL as a custom repository in the **Integration** category;
 the [HACS redirect](https://my.home-assistant.io/redirect/hacs_repository/?owner=Jasper-1024&repository=home-assistant-garmin_connect&category=integration)
 opens the same repository. GitHub Issues and Discussions are disabled on this
 fork. To submit public feedback, fork the repository, create a branch, and add
-a redacted feedback file at `docs/feedback/<topic>.md` using the [feedback
+a redacted feedback file at docs/feedback/<topic>.md using the [feedback
 template](feedback/README.md). Then open a [pull request](https://github.com/Jasper-1024/home-assistant-garmin_connect/pulls)
-with `Jasper-1024/home-assistant-garmin_connect` as the base. Do not include
+with Jasper-1024/home-assistant-garmin_connect as the base. Do not include
 passwords, tokens, or raw health data. Maintainers use Plane only for internal
 triage and archival; it is not a public feedback endpoint.
 
@@ -40,21 +35,21 @@ during normal setup and has no full-year enablement switch.
 
 1. Create a Home Assistant backup that includes the configuration directory,
    Recorder database, and Garmin integration Store files.
-2. Upgrade the integration to `3.1.0-beta.1` and restart Home Assistant during
-   a maintenance window.
+2. Upgrade the integration to 3.1.0-beta.2 and restart Home Assistant during a
+   maintenance window.
 3. Before enabling the archive, verify that existing current-value Garmin
    entities refresh normally and that retained Home Assistant history remains
    queryable.
 4. In the Garmin config-entry options, explicitly enable **Prospective
    Archive**. The first run is bounded to the current Home Assistant local
    date; it does not fetch a year of history.
-5. Observe the privacy-safe Archive Status (`syncing`, then `idle` or
-   `failed`) and validate the current-day result through the existing Archive
-   Query Surfaces. Current entity polling defaults to **900 seconds (15
-   minutes)**; it is a polling cadence, not a device-sync or data-availability
-   guarantee. A fifteen-minute freshness target, seven-day reconciliation
-   window, and one-FIT-per-hour pacing are nominal policies, not completeness
-   or real-time guarantees.
+5. Observe the privacy-safe Archive Status (syncing, then idle or failed) and
+   validate the current-day result through the existing Archive Query Surfaces.
+   Current entity polling defaults to **900 seconds (15 minutes)**; it is a
+   polling cadence, not a device-sync or data-availability guarantee. A
+   fifteen-minute freshness target, seven-day reconciliation window, and
+   one-FIT-per-hour pacing are nominal policies, not completeness or real-time
+   guarantees.
 6. Restart Home Assistant once more. Verify that Archive Enablement, retained
    query results, account isolation, FIT files, and the status contract persist.
 
@@ -69,11 +64,9 @@ order of 1–2 GB is an accepted planning estimate.
 Source Instants remain absolute aware timestamps; Source Calendar Date remains
 separate provenance metadata; Home Assistant chooses Display Time from its
 configured timezone. The archive does not rewrite source timestamps to the
-operator's display timezone.
-
-No release instruction in this document contacts Garmin production outside the
-operator's explicitly enabled prospective archive, and none starts Historical
-Backfill.
+operator's display timezone. No release instruction in this document contacts
+Garmin production outside the operator's explicitly enabled prospective archive,
+and none starts Historical Backfill.
 
 ## Downgrade and re-authentication safety
 
@@ -85,7 +78,7 @@ private catalog. The catalog is bound to the configured Garmin profile and is no
 adopted for another account.
 
 Do not re-authenticate a downgraded entry with a different Garmin account. If the
-Archive Status becomes `failed` after re-upgrade, stop there: do not delete or
+Archive Status becomes failed after re-upgrade, stop there: do not delete or
 replace Store files, FIT files, or Recorder statistics. Restore the backup or
 re-authenticate with the original account. A missing, damaged, or owner-mismatched
 catalog intentionally fails closed rather than creating a new archive identity.
@@ -93,9 +86,9 @@ catalog intentionally fails closed rather than creating a new archive identity.
 ## Release prerequisites and offline gate
 
 The candidate must be a clean commit installed in an exact Home Assistant Core
-**2026.7.4** environment. `requirements.txt` is the install input: it carries
-the same exact pins as every manifest requirement, including `ha-garmin` and
-`garmin-fit-sdk`. Run the following from the candidate checkout after creating
+**2026.7.4** environment. requirements.txt is the install input: it carries the
+same exact pins as every manifest requirement, including ha-garmin and
+garmin-fit-sdk. Run the following from the candidate checkout after creating
 the candidate commit, but before creating or moving any remote state:
 
 ```text
@@ -103,27 +96,28 @@ scripts/lint
 .venv/bin/pytest tests/ -q
 .venv/bin/python scripts/release_gate.py --check-installed
 .venv/bin/python scripts/release_gate.py --check-installed \
-  --candidate-sha "$(git rev-parse HEAD)" \
-  --release-tag 3.1.0-beta.1 \
-  --release-version 3.1.0-beta.1
+  --candidate-sha "$(git rev-parse HEAD)"
 ```
 
-The final command is offline. Its candidate SHA must be a full 40- or
-64-character commit SHA and must equal the clean checkout's `HEAD`. It requires
-`3.1.0-beta.1` to be an annotated tag (not a lightweight tag) resolving to that
-same commit, verifies the tag, manifest version, and supplied GitHub Release
-version are the same semantic prerelease, and rejects noncanonical prerelease
-spellings such as `beta1` or `beta-1`.
-`hacs.json` intentionally has no integration-version field: HACS identifies a
-release from the repository tag. The gate instead binds its Home Assistant
-floor to `requirements.txt` and the Recorder floor.
+The identity command reads its default tag and Release version dynamically from
+manifest.json; for this candidate both are 3.1.0-beta.2. A supplied tag or
+Release version must equal that manifest prerelease. Its candidate SHA must be
+a full 40- or 64-character commit SHA and must equal the clean checkout's HEAD.
+It requires 3.1.0-beta.2 to be an annotated tag (not a lightweight tag)
+resolving to that same commit, verifies the tag, manifest version, and supplied
+or defaulted GitHub Release version are the same semantic prerelease, and
+rejects noncanonical prerelease spellings such as beta1 or beta-1. hacs.json
+intentionally has no integration-version field: HACS identifies a release from
+the repository tag. The gate instead binds its Home Assistant floor to
+requirements.txt and the Recorder floor.
 
 GitHub Actions repeats the exact installation/import check in **Offline release
 gates (Home Assistant 2026.7.4)** after the full pytest job. HACS validation
 and Hassfest run in the separate **Validate** workflow. Their hosted actions,
-`scripts/lint`, full pytest, and the release-gate command are all required
-before publication. The HACS and Hassfest actions require GitHub Actions; the
-metadata/import/identity checks above require no network.
+scripts/lint, full pytest, and the release-gate command are all required before
+publication. The HACS and Hassfest actions require GitHub Actions; the
+metadata/import/identity checks above require no network. A passing local gate
+does not publish beta.2 or refresh HACS.
 
 ## Known limitations and observed issues
 
@@ -183,20 +177,20 @@ pytest -q \
 
 The matrix explicitly covers seven-day reconciliation, Manual Repair, FIT
 pacing/restart/valid-file skip/account isolation, runtime recovery from a
-corrupt local FIT, portable directory fsync and file permission fallback, the >256-item FIT backlog
-across restart and continued consumption, archive-only 429 backoff including
-restart and expiry, genuine reauthentication and failure isolation, dormant
-Historical Backfill, exact status/privacy output, and persistence/restoration
-of the archive success schedule. It also covers 3.0.14-style token-data
-replacement: same-profile restoration retains Recorder, Calendar, and valid
-`0600` FIT artifacts, while a different authenticated Garmin account cannot
-adopt the retained archive. The Recorder capability contract uses a real
-scratch Recorder, canonical version parsing, supported patch/minor versions, a
-below-floor fail-closed check, a durable-seam mismatch, and the five-second
-archive-startup isolation boundary. These tests are executable members of the
-single command, not documentation-only claims. The fixture, Recorder, and
-optional private replay gates remain part of the same command; the replay skips
-without a local 0600 capture.
+corrupt local FIT, portable directory fsync and file permission fallback, the
+>256-item FIT backlog across restart and continued consumption, archive-only
+429 backoff including restart and expiry, genuine reauthentication and failure
+isolation, dormant Historical Backfill, exact status/privacy output, and
+persistence/restoration of the archive success schedule. It also covers
+3.0.14-style token-data replacement: same-profile restoration retains Recorder,
+Calendar, and valid 0600 FIT artifacts, while a different authenticated Garmin
+account cannot adopt the retained archive. The Recorder capability contract uses
+a real scratch Recorder, canonical version parsing, supported patch/minor
+versions, a below-floor fail-closed check, a durable-seam mismatch, and the
+five-second archive-startup isolation boundary. These tests are executable
+members of the single command, not documentation-only claims. The fixture,
+Recorder, and optional private replay gates remain part of the same command;
+the replay skips without a local 0600 capture.
 
 ## Current-day validation checklist
 
@@ -207,17 +201,17 @@ without a local 0600 capture.
 - restart preserves Store partitions, checkpoints, and FIT integrity;
 - prospective cadence is nominally fifteen minutes, reconciliation is bounded
   to seven days, and FIT pacing is at most one file per hour;
-- FIT files are valid and mode `0600`;
+- FIT files are valid and mode 0600;
 - logs, diagnostics, status, actions, and Calendar output contain no raw
   measurements, arrays, credentials, account identity, address, or GPS;
 - Recorder/Store growth is bounded and expected.
 
 The validation contract is structural: timestamps remain aware, counts are
 consistent, equal values and revisions converge, and repeated/restarted work
-does not create duplicate points or `state_changed` replay. Live counts must
-be recorded from the current-day run, not copied from this document. Missing
-Garmin data remains missing; the archive does not synthesize values or claim
-forensic completeness.
+does not create duplicate points or state_changed replay. Live counts must be
+recorded from the current-day run, not copied from this document. Missing Garmin
+data remains missing; the archive does not synthesize values or claim forensic
+completeness.
 
 ## Rollback
 
@@ -231,14 +225,14 @@ This list is deliberately manual for remote operations. It must be performed
 by a maintainer with the relevant GitHub/HACS authority; this repository does
 not create tags, push commits, create Releases, or refresh HACS itself.
 
-1. Confirm the candidate SHA and annotated `3.1.0-beta.1` tag with the final
+1. Confirm the candidate SHA and annotated 3.1.0-beta.2 tag with the final
    offline command above. Create/push neither from this gate.
-2. In GitHub, create or inspect the Release named `3.1.0-beta.1`, attached to
+2. In GitHub, create or inspect the Release named 3.1.0-beta.2, attached to
    that tag; record its URL and displayed target SHA in the release evidence.
 3. Run/confirm green **Validate** (Hassfest and HACS validation) and **Tests**
    workflows for the candidate SHA.
 4. After HACS refreshes, verify its integration entry resolves the semantic
-   version `3.1.0-beta.1` and the `2026.7.4` Home Assistant floor. Record the
+   version 3.1.0-beta.2 and the 2026.7.4 Home Assistant floor. Record the
    observed time and URL; do not substitute a commit SHA for the version.
 5. Perform the controlled upgrade/enablement validation above and record only
    redacted observations. Use the fork/branch/feedback-file pull-request path
@@ -248,5 +242,5 @@ not create tags, push commits, create Releases, or refresh HACS itself.
 ## Optional private replay
 
 Private replay is opt-in only. A local 0600 capture may be supplied through an
-environment variable to the inspector tests; the path must be gitignored,
-the test skips when absent, and scalar values are never printed or committed.
+environment variable to the inspector tests; the path must be gitignored, the
+test skips when absent, and scalar values are never printed or committed.

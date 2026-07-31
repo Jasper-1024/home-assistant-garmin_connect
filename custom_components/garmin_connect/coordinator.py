@@ -10,7 +10,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from ha_garmin import GarminAuth, GarminClient
 from ha_garmin.exceptions import GarminAuthError
@@ -35,6 +35,9 @@ if TYPE_CHECKING:
     from .history import GarminHistoryArchive
 
 
+_RequestResult = TypeVar("_RequestResult")
+
+
 @dataclass
 class GarminConnectCoordinators:
     """Container for all Garmin Connect coordinators."""
@@ -50,6 +53,14 @@ class GarminConnectCoordinators:
     nutrition: NutritionCoordinator
     request_gate: GarminRequestGate | None = None
     history_archive: GarminHistoryArchive | None = None
+
+    async def async_request(
+        self,
+        priority: GarminRequestPriority,
+        requester: Callable[[], Awaitable[_RequestResult]],
+    ) -> _RequestResult:
+        """Run account work through the shared gate and token lifecycle."""
+        return await self.core.async_request(priority, requester)
 
 
 class BaseGarminCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -80,20 +91,28 @@ class BaseGarminCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.request_gate = request_gate or GarminRequestGate()
         self._refresh_lock = asyncio.Lock()
 
-    async def _async_fetch(
-        self, requester: Callable[[], Awaitable[dict[str, Any]]]
-    ) -> dict[str, Any]:
-        """Run one current-value fetch through the account request gate."""
+    async def async_request(
+        self,
+        priority: GarminRequestPriority,
+        requester: Callable[[], Awaitable[_RequestResult]],
+    ) -> _RequestResult:
+        """Run account work through the shared gate and token lifecycle."""
 
-        async def request_and_update_tokens() -> dict[str, Any]:
+        async def request_and_update_tokens() -> _RequestResult:
             data = await requester()
             await self._update_tokens_if_changed()
             return data
 
         return await self.request_gate.async_request(
-            GarminRequestPriority.FOREGROUND,
+            priority,
             request_and_update_tokens,
         )
+
+    async def _async_fetch(
+        self, requester: Callable[[], Awaitable[dict[str, Any]]]
+    ) -> dict[str, Any]:
+        """Run one current-value fetch through the account request gate."""
+        return await self.async_request(GarminRequestPriority.FOREGROUND, requester)
 
     async def _update_tokens_if_changed(self) -> None:
         """Update stored tokens if they changed during refresh."""

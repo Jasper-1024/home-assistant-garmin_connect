@@ -25,5 +25,5 @@ updates:
       time: "06:00"
     open-pull-requests-limit: 10
     ignore:
-      # Dependabot should not update Home Assistant as that should match the homeassistant key in hacs.json
+      # Home Assistant's lower bound and HACS floor are released together.
       - dependency-name: "homeassistant"

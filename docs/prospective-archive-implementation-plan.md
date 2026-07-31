@@ -122,7 +122,7 @@ FIT queue bookkeeping remain internal.
 
 ### 9. Release and documentation
 
-- Keep the unreleased version at `3.1.0-beta.1`.
+- Keep the unreleased version at `3.1.0-beta.2`.
 - Replace the fixed `2026-07-24` and post-canary full-backfill instructions
   with backup, upgrade, explicit enablement, first-current-day validation, and
   reversible disablement.

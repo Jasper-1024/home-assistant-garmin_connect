@@ -22,13 +22,17 @@ from custom_components.garmin_connect.coordinator import (
     BloodPressureCoordinator,
     BodyCoordinator,
     CoreCoordinator,
+    GarminConnectCoordinators,
     GearCoordinator,
     GoalsCoordinator,
     MenstrualCoordinator,
     NutritionCoordinator,
     TrainingCoordinator,
 )
-from custom_components.garmin_connect.request_gate import GarminRequestGate
+from custom_components.garmin_connect.request_gate import (
+    GarminRequestGate,
+    GarminRequestPriority,
+)
 
 _COORDINATORS = (
     CoreCoordinator,
@@ -151,6 +155,44 @@ async def test_token_update_stays_inside_current_request_slot() -> None:
     release_token_update.set()
     assert await first_task == {"source": "core"}
     assert await second_task == {"source": "activity"}
+    await gate.async_close()
+
+
+async def test_runtime_request_persists_service_token_refresh_inside_gate() -> None:
+    """Direct service work uses the coordinator token persistence lifecycle."""
+    hass, entry, client, auth = _inputs()
+    gate = GarminRequestGate()
+    core = CoreCoordinator(hass, entry, client, auth, gate)
+    runtime = GarminConnectCoordinators(
+        core=core,
+        activity=core,
+        training=core,
+        body=core,
+        goals=core,
+        gear=core,
+        blood_pressure=core,
+        menstrual=core,
+        nutrition=core,
+        request_gate=gate,
+    )
+
+    async def service_request() -> str:
+        auth.di_token = "refreshed-token"
+        auth.di_refresh_token = "refreshed-refresh-token"
+        return "written"
+
+    assert (
+        await runtime.async_request(GarminRequestPriority.FOREGROUND, service_request)
+        == "written"
+    )
+    hass.config_entries.async_update_entry.assert_called_once_with(
+        entry,
+        data={
+            CONF_TOKEN: "refreshed-token",
+            CONF_REFRESH_TOKEN: "refreshed-refresh-token",
+            CONF_CLIENT_ID: "client-id",
+        },
+    )
     await gate.async_close()
 
 

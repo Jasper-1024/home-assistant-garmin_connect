@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from custom_components.garmin_connect.sensor import (
     _COORDINATOR_SENSOR_MAP,
     ACTIVITY_TRACKING_SENSORS,
@@ -9,6 +11,7 @@ from custom_components.garmin_connect.sensor import (
     BODY_COMPOSITION_SENSORS,
     GEAR_SENSORS,
     GOALS_SENSORS,
+    INTENSITY_SENSORS,
     MENSTRUAL_CYCLE_SENSORS,
     NUTRITION_SENSORS,
     TRAINING_SENSORS,
@@ -156,6 +159,36 @@ def test_native_value_returns_none_for_missing_key() -> None:
     sensor = GarminConnectSensor(coord, description, "test_entry_id")
 
     assert sensor.native_value is None
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        ({"sedentaryMinutes": -12}, None),  # Live Garmin sentinel observed by Recorder.
+        ({"sedentaryMinutes": -1}, None),
+        ({}, None),
+        ({"sedentaryMinutes": None}, None),
+        ({"sedentaryMinutes": "30"}, None),
+        ({"sedentaryMinutes": True}, None),
+        ({"sedentaryMinutes": float("nan")}, None),
+        ({"sedentaryMinutes": float("inf")}, None),
+        ({"sedentaryMinutes": float("-inf")}, None),
+        ({"sedentaryMinutes": 0}, 0),
+        ({"sedentaryMinutes": 1}, 1),
+        ({"sedentaryMinutes": 1.5}, 1.5),
+    ],
+)
+def test_sedentary_time_accepts_only_finite_non_negative_numbers(
+    data: dict[str, object], expected: int | float | None
+) -> None:
+    """Sedentary time only publishes finite non-negative numeric states."""
+    description = next(d for d in INTENSITY_SENSORS if d.key == "sedentaryMinutes")
+    coordinator = MagicMock()
+    coordinator.data = data
+
+    sensor = GarminConnectSensor(coordinator, description, "test_entry_id")
+
+    assert sensor.native_value == expected
 
 
 def test_unique_id_uses_entry_id_and_key() -> None:

@@ -11,7 +11,7 @@ ha_platforms:
   - sensor
 ha_integration_type: integration
 ha_codeowners:
-  - '@cyberjunky'
+  - '@Jasper-1024'
 ha_config_flow: true
 ---
 
@@ -187,7 +187,8 @@ Upload an activity file (FIT, GPX, TCX) to Garmin Connect.
 
 ## Data updates
 
-Data is polled from Garmin Connect every 5 minutes. Due to API rate limits, more frequent polling is not recommended.
+Data is polled from Garmin Connect every 900 seconds (15 minutes) by default.
+Due to API rate limits, more frequent polling is not recommended.
 
 ## MFA Support
 

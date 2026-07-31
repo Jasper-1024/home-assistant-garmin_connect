@@ -3,12 +3,20 @@
 import asyncio
 from contextlib import ExitStack
 from datetime import UTC, date, datetime, timedelta
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant import loader
-from homeassistant.config_entries import SOURCE_USER, ConfigEntries, ConfigEntry, ConfigEntryState
+from homeassistant.config_entries import (
+    SOURCE_REAUTH,
+    SOURCE_RECONFIGURE,
+    SOURCE_USER,
+    ConfigEntries,
+    ConfigEntry,
+    ConfigEntryNotReady,
+    ConfigEntryState,
+)
 from homeassistant.core import HomeAssistant
 
 from custom_components.garmin_connect import (
@@ -24,6 +32,7 @@ from custom_components.garmin_connect.const import (
     CONF_ARCHIVE_PREVIOUSLY_ENABLED,
     CONF_CLIENT_ID,
     CONF_REFRESH_TOKEN,
+    CONF_SCAN_INTERVAL,
     CONF_TOKEN,
     DOMAIN,
 )
@@ -61,10 +70,44 @@ def _coord_mock() -> MagicMock:
     return c
 
 
-def _stack_coordinators(stack: ExitStack, coord: MagicMock) -> None:
+def _config_entry_mock(**kwargs) -> MagicMock:
+    """Return a config-entry double with HA-managed task creation."""
+    entry = MagicMock(**kwargs)
+    entry.async_create_task.side_effect = (
+        lambda _hass, target, name: asyncio.create_task(target, name=name)
+    )
+    return entry
+
+
+def _configure_entry_task_factory(hass: MagicMock) -> None:
+    """Make a mocked hass run tasks created through a real ConfigEntry."""
+    hass.async_create_task_internal.side_effect = (
+        lambda target, name, _eager_start: asyncio.create_task(target, name=name)
+    )
+
+
+def _stack_coordinators(stack: ExitStack, coord: MagicMock) -> list[MagicMock]:
     """Push patches for all 9 coordinator constructors onto an ExitStack."""
-    for target in _COORD_TARGETS:
-        stack.enter_context(patch(target, return_value=coord))
+    return [
+        stack.enter_context(patch(target, return_value=coord)) for target in _COORD_TARGETS
+    ]
+
+
+def _real_config_entry(entry_id: str = "entry-transaction") -> ConfigEntry:
+    """Build a ConfigEntry for lifecycle transaction tests."""
+    return ConfigEntry(
+        version=2,
+        minor_version=1,
+        domain=DOMAIN,
+        title="Garmin account",
+        data=dict(ENTRY_DATA),
+        options={},
+        source=SOURCE_USER,
+        unique_id="garmin-account",
+        discovery_keys=MappingProxyType({}),
+        subentries_data=None,
+        entry_id=entry_id,
+    )
 
 
 class _LifecycleTimer:
@@ -124,7 +167,7 @@ class _RuntimeHistoryClient:
         return {}
 
     async def get_user_profile(self) -> SimpleNamespace:
-        return SimpleNamespace(display_name="athlete")
+        return SimpleNamespace(display_name="athlete", profile_id=123456789)
 
     async def _request(self, *_args, **_kwargs) -> dict:
         return await self._archive_request()
@@ -150,18 +193,15 @@ class _RuntimeHistoryClient:
 
 
 async def test_options_update_listener_reloads_config_entry() -> None:
-    """Option changes use the config-entry reload lifecycle seam."""
+    """Option changes use HA's config-entry reload scheduler."""
     entry = MagicMock(entry_id="entry-1")
     hass = MagicMock()
-    reload = AsyncMock()
-    hass.config_entries.async_reload = reload
-    tasks = []
-    hass.async_create_task = MagicMock(side_effect=tasks.append)
+    schedule_reload = MagicMock()
+    hass.config_entries.async_schedule_reload = schedule_reload
 
     await async_options_update_listener(hass, entry)
-    await tasks[0]
 
-    reload.assert_awaited_once_with("entry-1")
+    schedule_reload.assert_called_once_with("entry-1")
 
 
 async def test_options_update_persists_transition_before_reload() -> None:
@@ -173,21 +213,17 @@ async def test_options_update_persists_transition_before_reload() -> None:
     hass.config_entries.async_update_entry = MagicMock(
         side_effect=lambda updated_entry, *, data: setattr(updated_entry, "data", data)
     )
-    tasks = []
-
-    async def reload(_entry_id: str) -> None:
+    def schedule_reload(_entry_id: str) -> None:
         assert entry.data[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-08-03"
         assert entry.data[CONF_ARCHIVE_PREVIOUSLY_ENABLED] is True
 
-    hass.config_entries.async_reload = reload
-    hass.async_create_task = MagicMock(side_effect=tasks.append)
+    hass.config_entries.async_schedule_reload = MagicMock(side_effect=schedule_reload)
 
     with patch(
         "custom_components.garmin_connect.history.dt_util.utcnow",
         return_value=datetime(2026, 8, 3, 23, 59, tzinfo=UTC),
     ):
         await async_options_update_listener(hass, entry)
-    await tasks[0]
 
 
 async def test_options_update_does_not_rewrite_stable_enablement() -> None:
@@ -200,20 +236,33 @@ async def test_options_update_does_not_rewrite_stable_enablement() -> None:
     entry.options = {CONF_ARCHIVE_ENABLED: True}
     hass = MagicMock()
     hass.config_entries.async_update_entry = MagicMock()
-    reload = AsyncMock()
-    tasks = []
-    hass.config_entries.async_reload = reload
-    hass.async_create_task = MagicMock(side_effect=tasks.append)
+    schedule_reload = MagicMock()
+    hass.config_entries.async_schedule_reload = schedule_reload
 
     with patch(
         "custom_components.garmin_connect.history.dt_util.utcnow",
         return_value=datetime(2026, 8, 4, 0, 1, tzinfo=UTC),
     ):
         await async_options_update_listener(hass, entry)
-    await tasks[0]
 
     hass.config_entries.async_update_entry.assert_not_called()
-    reload.assert_awaited_once_with("entry-1")
+    schedule_reload.assert_called_once_with("entry-1")
+
+
+async def test_options_update_coalesces_in_flight_changes() -> None:
+    """Several option transitions before setup starts schedule one reload."""
+    entry = MagicMock(entry_id="entry-1")
+    entry.data = {}
+    entry.options = {CONF_SCAN_INTERVAL: 300}
+    hass = MagicMock()
+    schedule_reload = MagicMock()
+    hass.config_entries.async_schedule_reload = schedule_reload
+
+    await async_options_update_listener(hass, entry)
+    entry.options = {CONF_SCAN_INTERVAL: 301}
+    await async_options_update_listener(hass, entry)
+
+    schedule_reload.assert_called_once_with("entry-1")
 
 
 async def test_setup_persists_enablement_before_current_refresh_failure() -> None:
@@ -256,29 +305,24 @@ async def test_enablement_date_survives_store_failure_after_midnight() -> None:
     hass.config_entries.async_update_entry = MagicMock(
         side_effect=lambda updated_entry, *, data: setattr(updated_entry, "data", data)
     )
-    tasks = []
-
     def failing_store(*_args, **_kwargs):
         raise OSError("private storage unavailable")
 
-    async def reload(_entry_id: str) -> None:
-        archive = GarminHistoryArchive(hass, entry, store_factory=failing_store)
-        with patch(
-            "custom_components.garmin_connect.history.dt_util.utcnow",
-            return_value=datetime(2026, 8, 4, 0, 1, tzinfo=UTC),
-        ):
-            await archive.async_start()
-        assert archive.status.error_type == "store_initialization"
-
-    hass.config_entries.async_reload = reload
-    hass.async_create_task = MagicMock(side_effect=tasks.append)
+    hass.config_entries.async_schedule_reload = MagicMock()
 
     with patch(
         "custom_components.garmin_connect.history.dt_util.utcnow",
         return_value=datetime(2026, 8, 3, 23, 59, tzinfo=UTC),
     ):
         await async_options_update_listener(hass, entry)
-    await tasks[0]
+
+    archive = GarminHistoryArchive(hass, entry, store_factory=failing_store)
+    with patch(
+        "custom_components.garmin_connect.history.dt_util.utcnow",
+        return_value=datetime(2026, 8, 4, 0, 1, tzinfo=UTC),
+    ):
+        await archive.async_start()
+    assert archive.status.error_type == "store_initialization"
 
     assert entry.data[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-08-03"
     assert entry.data[CONF_ARCHIVE_PREVIOUSLY_ENABLED] is True
@@ -293,7 +337,6 @@ async def test_enablement_date_survives_recorder_startup_failure_after_midnight(
     hass.config_entries.async_update_entry = MagicMock(
         side_effect=lambda updated_entry, *, data: setattr(updated_entry, "data", data)
     )
-    tasks = []
     store = MagicMock()
     store.async_load = AsyncMock(return_value=None)
     store.async_save = AsyncMock()
@@ -302,29 +345,26 @@ async def test_enablement_date_survives_recorder_startup_failure_after_midnight(
         return_value=RecorderCompatibilityResult.incompatible_result("recorder_signature")
     )
 
-    async def reload(_entry_id: str) -> None:
-        archive = GarminHistoryArchive(
-            hass,
-            entry,
-            recorder_checker=checker,
-            store_factory=lambda *_args, **_kwargs: store,
-        )
-        with patch(
-            "custom_components.garmin_connect.history.dt_util.utcnow",
-            return_value=datetime(2026, 8, 4, 0, 1, tzinfo=UTC),
-        ):
-            await archive.async_start()
-        assert archive.status.error_type == "recorder_signature"
-
-    hass.config_entries.async_reload = reload
-    hass.async_create_task = MagicMock(side_effect=tasks.append)
+    hass.config_entries.async_schedule_reload = MagicMock()
 
     with patch(
         "custom_components.garmin_connect.history.dt_util.utcnow",
         return_value=datetime(2026, 8, 3, 23, 59, tzinfo=UTC),
     ):
         await async_options_update_listener(hass, entry)
-    await tasks[0]
+
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=checker,
+        store_factory=lambda *_args, **_kwargs: store,
+    )
+    with patch(
+        "custom_components.garmin_connect.history.dt_util.utcnow",
+        return_value=datetime(2026, 8, 4, 0, 1, tzinfo=UTC),
+    ):
+        await archive.async_start()
+    assert archive.status.error_type == "recorder_signature"
 
     assert entry.data[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-08-03"
     assert entry.data[CONF_ARCHIVE_PREVIOUSLY_ENABLED] is True
@@ -346,7 +386,7 @@ async def test_real_config_entry_lifecycle_keeps_backfill_dormant_and_surfaces_v
         options={CONF_ARCHIVE_ENABLED: False},
         source=SOURCE_USER,
         unique_id="garmin-account",
-        discovery_keys={},
+        discovery_keys=MappingProxyType({}),
         subentries_data=None,
         entry_id="entry-1",
     )
@@ -404,9 +444,20 @@ async def test_real_config_entry_lifecycle_keeps_backfill_dormant_and_surfaces_v
             backfill = stack.enter_context(
                 patch("custom_components.garmin_connect.history.BackfillScheduler")
             )
-            _stack_coordinators(stack, coordinator)
-            hass.config_entries.async_forward_entry_setups = AsyncMock()
-            hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
+            first_sync = stack.enter_context(
+                patch.object(GarminHistoryArchive, "_async_run_first_sync", new=AsyncMock())
+            )
+            coordinator_constructors = _stack_coordinators(stack, coordinator)
+            stack.enter_context(
+                patch.object(hass.config_entries, "async_forward_entry_setups", new=AsyncMock())
+            )
+            stack.enter_context(
+                patch.object(
+                    hass.config_entries,
+                    "async_unload_platforms",
+                    new=AsyncMock(return_value=True),
+                )
+            )
 
             await hass.config_entries.async_add(entry)
             await assert_disabled_surfaces()
@@ -422,19 +473,154 @@ async def test_real_config_entry_lifecycle_keeps_backfill_dormant_and_surfaces_v
             await assert_disabled_surfaces()
             assert entry.data["history_account_key"] == account_key
 
+            schedule_reload = stack.enter_context(
+                patch.object(
+                    hass.config_entries,
+                    "async_schedule_reload",
+                    wraps=hass.config_entries.async_schedule_reload,
+                )
+            )
+            reload_entry = stack.enter_context(
+                patch.object(
+                    hass.config_entries,
+                    "async_reload",
+                    wraps=hass.config_entries.async_reload,
+                )
+            )
+
+            constructed = []
+            setup_reached = asyncio.Event()
+            release_setup = asyncio.Event()
+
+            def coordinator_constructor(*args, **_kwargs) -> MagicMock:
+                configured_entry = args[1]
+                configured = _coord_mock()
+                configured.update_interval = timedelta(
+                    seconds=configured_entry.options[CONF_SCAN_INTERVAL]
+                )
+                constructed.append(configured)
+                return configured
+
+            async def block_stale_setup() -> None:
+                setup_reached.set()
+                assert entry.update_listeners == []
+                await release_setup.wait()
+
+            def core_constructor(*args, **kwargs) -> MagicMock:
+                configured = coordinator_constructor(*args, **kwargs)
+                configured.async_config_entry_first_refresh = AsyncMock(
+                    side_effect=block_stale_setup
+                )
+                return configured
+
+            for constructor in coordinator_constructors:
+                constructor.side_effect = coordinator_constructor
+            coordinator_constructors[0].side_effect = core_constructor
+
+            hass.config_entries.async_update_entry(
+                entry,
+                options={CONF_ARCHIVE_ENABLED: True, CONF_SCAN_INTERVAL: 601},
+            )
+            await asyncio.wait_for(setup_reached.wait(), timeout=0.1)
+
+            # The first reload has unloaded its listener. This update must be
+            # reconciled after setup rather than silently recorded as applied.
+            hass.config_entries.async_update_entry(
+                entry,
+                options={CONF_ARCHIVE_ENABLED: True, CONF_SCAN_INTERVAL: 602},
+            )
+            release_setup.set()
+            await hass.async_block_till_done()
+
+            assert schedule_reload.call_count == 2
+            assert entry.runtime_data.core.update_interval == timedelta(seconds=602)
+            assert first_sync.await_count == 1
+            assert len(constructed) == 18
+            assert all(
+                configured.update_interval == timedelta(seconds=601)
+                for configured in constructed[:9]
+            )
+            assert all(
+                configured.update_interval == timedelta(seconds=602)
+                for configured in constructed[9:]
+            )
+
+            for constructor in coordinator_constructors:
+                constructor.side_effect = None
+                constructor.return_value = coordinator
+            hass.config_entries.async_update_entry(
+                entry,
+                options={CONF_ARCHIVE_ENABLED: False, CONF_SCAN_INTERVAL: 602},
+            )
+            await hass.async_block_till_done()
+            schedule_reload.reset_mock()
+            reload_entry.reset_mock()
+            first_sync.reset_mock()
+
             with patch(
                 "custom_components.garmin_connect.history.dt_util.utcnow",
                 return_value=datetime(2026, 8, 10, tzinfo=UTC),
             ):
                 hass.config_entries.async_update_entry(entry, options={CONF_ARCHIVE_ENABLED: True})
+                hass.config_entries.async_update_entry(
+                    entry,
+                    data={**entry.data, CONF_TOKEN: "token-before-options-listener"},
+                )
                 await hass.async_block_till_done()
 
+            schedule_reload.assert_called_once_with(entry.entry_id)
+            assert entry.data[CONF_TOKEN] == "token-before-options-listener"
             assert entry.runtime_data.history_archive.archive_enabled is True
             assert entry.runtime_data.history_archive.status.state.value == "idle"
             assert entry.runtime_data.history_archive.activation_date == date(2026, 8, 10)
+            assert entry.data[CONF_ARCHIVE_PREVIOUSLY_ENABLED] is True
+            first_sync.assert_awaited_once()
             assert backfill.call_count == 0
+
+            hass.config_entries.async_update_entry(
+                entry, data={**entry.data, CONF_TOKEN: "refreshed-token"}
+            )
+            await hass.async_block_till_done()
+            schedule_reload.assert_called_once()
+
+            hass.config_entries.async_update_entry(
+                entry, data={**entry.data, CONF_TOKEN: "second-refreshed-token"}
+            )
+            await hass.async_block_till_done()
+            schedule_reload.assert_called_once()
+
+            hass.config_entries.async_update_entry(
+                entry,
+                options={CONF_ARCHIVE_ENABLED: True, CONF_SCAN_INTERVAL: 602},
+            )
+            await hass.async_block_till_done()
+            assert schedule_reload.call_count == 2
+
+            from custom_components.garmin_connect.config_flow import GarminConnectConfigFlow
+
+            for flow_source, finish_method, token, is_cn in (
+                (SOURCE_REAUTH, "_async_finish_reauth", "reauth-token", False),
+                (SOURCE_RECONFIGURE, "_async_finish_reconfigure", "reconfigure-token", True),
+            ):
+                flow = GarminConnectConfigFlow()
+                flow.hass = hass
+                flow.context = {"source": flow_source, "entry_id": entry.entry_id}
+                flow._auth = MagicMock(
+                    di_token=token,
+                    di_refresh_token=f"{token}-refresh",
+                    di_client_id="GARMIN_CONNECT_MOBILE_ANDROID_DI",
+                )
+                flow._is_cn = is_cn
+
+                await getattr(flow, finish_method)()
+                await hass.async_block_till_done()
+
+            assert schedule_reload.call_count == 2
+            assert reload_entry.await_count == 4
+
             assert await hass.config_entries.async_unload(entry.entry_id)
             assert entry.state is ConfigEntryState.NOT_LOADED
+            assert entry._on_unload == []
     finally:
         hass.config_entries._store._async_cleanup_delay_listener()
         await hass.async_stop(force=True)
@@ -459,7 +645,7 @@ async def test_option_disablement_reload_cancels_recurring_archive_work(tmp_path
         options={CONF_ARCHIVE_ENABLED: True},
         source=SOURCE_USER,
         unique_id="garmin-account",
-        discovery_keys={},
+        discovery_keys=MappingProxyType({}),
         subentries_data=None,
         entry_id="entry-1",
     )
@@ -510,8 +696,16 @@ async def test_option_disablement_reload_cancels_recurring_archive_work(tmp_path
             stack.enter_context(
                 patch("custom_components.garmin_connect.async_setup_services", new=AsyncMock())
             )
-            hass.config_entries.async_forward_entry_setups = AsyncMock()
-            hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
+            stack.enter_context(
+                patch.object(hass.config_entries, "async_forward_entry_setups", new=AsyncMock())
+            )
+            stack.enter_context(
+                patch.object(
+                    hass.config_entries,
+                    "async_unload_platforms",
+                    new=AsyncMock(return_value=True),
+                )
+            )
 
             await hass.config_entries.async_add(entry)
             first_archive = entry.runtime_data.history_archive
@@ -556,7 +750,7 @@ async def test_runtime_archive_prioritizes_foreground_work_through_shared_gate(t
         options={CONF_ARCHIVE_ENABLED: True},
         source=SOURCE_USER,
         unique_id="garmin-account",
-        discovery_keys={},
+        discovery_keys=MappingProxyType({}),
         subentries_data=None,
         entry_id="entry-1",
     )
@@ -607,8 +801,16 @@ async def test_runtime_archive_prioritizes_foreground_work_through_shared_gate(t
             stack.enter_context(
                 patch("custom_components.garmin_connect.async_setup_services", new=AsyncMock())
             )
-            hass.config_entries.async_forward_entry_setups = AsyncMock()
-            hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
+            stack.enter_context(
+                patch.object(hass.config_entries, "async_forward_entry_setups", new=AsyncMock())
+            )
+            stack.enter_context(
+                patch.object(
+                    hass.config_entries,
+                    "async_unload_platforms",
+                    new=AsyncMock(return_value=True),
+                )
+            )
 
             await hass.config_entries.async_add(entry)
             await asyncio.wait_for(client.first_sync_done.wait(), timeout=0.1)
@@ -653,7 +855,7 @@ async def test_runtime_archive_prioritizes_foreground_work_through_shared_gate(t
 
 async def test_setup_entry_success() -> None:
     """Test that a config entry sets up correctly and returns True."""
-    entry = MagicMock()
+    entry = _config_entry_mock()
     entry.data = dict(ENTRY_DATA)
     entry.options = {}
     hass = MagicMock()
@@ -678,11 +880,16 @@ async def test_setup_entry_success() -> None:
 
     assert result is True
     assert entry.runtime_data is not None
+    entry.async_create_task.assert_called_once()
+    assert entry.async_create_task.call_args.args[0] is hass
+    assert entry.async_create_task.call_args.kwargs == {
+        "name": "garmin_connect archive startup"
+    }
 
 
 async def test_enabled_first_sync_does_not_delay_platform_forwarding() -> None:
     """Platform setup completes while the enabled first archive request waits."""
-    entry = MagicMock(entry_id="entry-1", title="Garmin account")
+    entry = _config_entry_mock(entry_id="entry-1", title="Garmin account")
     entry.data = {
         **ENTRY_DATA,
         "history_account_key": "opaque-account-key-1234567890",
@@ -737,11 +944,147 @@ async def test_enabled_first_sync_does_not_delay_platform_forwarding() -> None:
     await archive.async_stop()
 
 
+async def test_options_changed_during_archive_start_reload_latest_once(tmp_path) -> None:
+    """Archive startup observes updates without running a duplicate first sync."""
+    hass = HomeAssistant(str(tmp_path))
+    hass.config_entries = ConfigEntries(hass, {})
+    loader.async_setup(hass)
+    entry = ConfigEntry(
+        version=2,
+        minor_version=1,
+        domain=DOMAIN,
+        title="Garmin account",
+        data={
+            **ENTRY_DATA,
+            "history_account_key": "opaque-account-key-1234567890",
+        },
+        options={CONF_ARCHIVE_ENABLED: False, CONF_SCAN_INTERVAL: 600},
+        source=SOURCE_USER,
+        unique_id="garmin-account",
+        discovery_keys=MappingProxyType({}),
+        subentries_data=None,
+        entry_id="entry-archive-start-race",
+    )
+    coordinator = _coord_mock()
+    archive_started = asyncio.Event()
+    release_archive = asyncio.Event()
+    block_archive_start = False
+    constructed: list[MagicMock] = []
+    original_archive_start = GarminHistoryArchive.async_start
+
+    def coordinator_constructor(*args, **_kwargs) -> MagicMock:
+        configured_entry = args[1]
+        configured = _coord_mock()
+        configured.update_interval = timedelta(
+            seconds=configured_entry.options[CONF_SCAN_INTERVAL]
+        )
+        constructed.append(configured)
+        return configured
+
+    async def start_archive(archive: GarminHistoryArchive) -> None:
+        if block_archive_start:
+            archive_started.set()
+            await release_archive.wait()
+        await original_archive_start(archive)
+
+    try:
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("custom_components.garmin_connect.GarminAuth", return_value=MagicMock())
+            )
+            stack.enter_context(
+                patch("custom_components.garmin_connect.GarminClient", return_value=MagicMock())
+            )
+            stack.enter_context(
+                patch(
+                    "custom_components.garmin_connect.history.HomeAssistantRecorderCompatibility.async_check",
+                    new=AsyncMock(return_value=MagicMock(compatible=True, error_type=None)),
+                )
+            )
+            source = MagicMock()
+            source.async_fetch = AsyncMock(return_value=())
+            source.async_fetch_details = None
+            stack.enter_context(
+                patch(
+                    "custom_components.garmin_connect.history.GarminHistorySource",
+                    return_value=source,
+                )
+            )
+            recorder = MagicMock()
+            recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(0))
+            stack.enter_context(
+                patch(
+                    "custom_components.garmin_connect.history.GarminHistoryRecorder",
+                    return_value=recorder,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "homeassistant.helpers.recorder.get_instance",
+                    return_value=recorder,
+                )
+            )
+            first_sync = stack.enter_context(
+                patch.object(GarminHistoryArchive, "_async_run_first_sync", new=AsyncMock())
+            )
+            coordinator_constructors = _stack_coordinators(stack, coordinator)
+            for constructor in coordinator_constructors:
+                constructor.side_effect = coordinator_constructor
+            stack.enter_context(
+                patch.object(hass.config_entries, "async_forward_entry_setups", new=AsyncMock())
+            )
+            stack.enter_context(
+                patch.object(
+                    hass.config_entries,
+                    "async_unload_platforms",
+                    new=AsyncMock(return_value=True),
+                )
+            )
+            schedule_reload = stack.enter_context(
+                patch.object(
+                    hass.config_entries,
+                    "async_schedule_reload",
+                    wraps=hass.config_entries.async_schedule_reload,
+                )
+            )
+            stack.enter_context(
+                patch.object(GarminHistoryArchive, "async_start", new=start_archive)
+            )
+
+            await hass.config_entries.async_add(entry)
+            await hass.async_block_till_done()
+            assert entry.runtime_data.core.update_interval == timedelta(seconds=600)
+
+            block_archive_start = True
+            hass.config_entries.async_update_entry(
+                entry,
+                options={CONF_ARCHIVE_ENABLED: True, CONF_SCAN_INTERVAL: 601},
+            )
+            await asyncio.wait_for(archive_started.wait(), timeout=0.1)
+            assert len(entry.update_listeners) == 1
+
+            hass.config_entries.async_update_entry(
+                entry,
+                options={CONF_ARCHIVE_ENABLED: True, CONF_SCAN_INTERVAL: 602},
+            )
+            block_archive_start = False
+            release_archive.set()
+            await hass.async_block_till_done()
+
+            assert schedule_reload.call_count == 2
+            assert entry.runtime_data.core.update_interval == timedelta(seconds=602)
+            first_sync.assert_awaited_once()
+            assert len(constructed) == 27
+    finally:
+        hass.config_entries._store._async_cleanup_delay_listener()
+        await hass.async_stop(force=True)
+
+
 async def test_setup_entry_stores_all_coordinators() -> None:
     """runtime_data must be a GarminConnectCoordinators with all 9 fields."""
     from custom_components.garmin_connect.coordinator import GarminConnectCoordinators
 
-    entry = MagicMock()
+    entry = _config_entry_mock()
     entry.data = dict(ENTRY_DATA)
     entry.options = {}
     hass = MagicMock()
@@ -773,7 +1116,7 @@ async def test_setup_entry_stores_all_coordinators() -> None:
 
 async def test_setup_entry_passes_one_gate_to_all_coordinators() -> None:
     """All current coordinators for one entry share the account gate."""
-    entry = MagicMock()
+    entry = _config_entry_mock()
     entry.data = dict(ENTRY_DATA)
     entry.options = {}
     hass = MagicMock()
@@ -798,7 +1141,7 @@ async def test_setup_entry_passes_one_gate_to_all_coordinators() -> None:
 
 async def test_setup_entry_restores_di_tokens_onto_auth() -> None:
     """Tokens from config entry data must be assigned to auth before client is built."""
-    entry = MagicMock()
+    entry = _config_entry_mock()
     entry.data = dict(ENTRY_DATA)
     entry.options = {}
     hass = MagicMock()
@@ -833,7 +1176,7 @@ async def test_setup_entry_restores_di_tokens_onto_auth() -> None:
 
 async def test_setup_entry_registers_services_when_not_present() -> None:
     """Services are registered when has_service returns False."""
-    entry = MagicMock()
+    entry = _config_entry_mock()
     entry.data = dict(ENTRY_DATA)
     entry.options = {}
     hass = MagicMock()
@@ -860,7 +1203,7 @@ async def test_setup_entry_registers_services_when_not_present() -> None:
 
 async def test_archive_startup_failure_does_not_block_current_setup() -> None:
     """Archive startup failure must leave coordinators and sensor setup active."""
-    entry = MagicMock()
+    entry = _config_entry_mock()
     entry.data = dict(ENTRY_DATA)
     entry.options = {}
     hass = MagicMock()
@@ -886,9 +1229,103 @@ async def test_archive_startup_failure_does_not_block_current_setup() -> None:
     hass.config_entries.async_forward_entry_setups.assert_awaited_once()
 
 
+async def test_stalled_recorder_check_times_out_archive_without_leaking_setup_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stuck Recorder capability check cannot delay current-value setup."""
+    entry = _config_entry_mock(entry_id="entry-stalled-recorder", title="Garmin account")
+    entry.data = {**ENTRY_DATA, "history_account_key": "opaque-account-key-1234567890"}
+    entry.options = {}
+    hass = MagicMock()
+    hass.config.country = "US"
+    hass.services.has_service = MagicMock(return_value=True)
+    hass.config_entries.async_forward_entry_setups = AsyncMock()
+    coordinator = _coord_mock()
+    created_tasks: list[asyncio.Task[None]] = []
+    entry.async_create_task.side_effect = (
+        lambda _hass, target, name: created_tasks.append(
+            asyncio.create_task(target, name=name)
+        )
+        or created_tasks[-1]
+    )
+    store = MagicMock()
+    store.async_load = AsyncMock(return_value=None)
+    store.async_save = AsyncMock()
+    recorder_check_started = asyncio.Event()
+
+    async def never_complete() -> RecorderCompatibilityResult:
+        recorder_check_started.set()
+        await asyncio.Event().wait()
+
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        recorder_checker=MagicMock(async_check=AsyncMock(side_effect=never_complete)),
+        store_factory=lambda *_args, **_kwargs: store,
+    )
+    monkeypatch.setattr("custom_components.garmin_connect._ARCHIVE_STARTUP_TIMEOUT", 0.01)
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("custom_components.garmin_connect.GarminAuth"))
+        stack.enter_context(patch("custom_components.garmin_connect.GarminClient"))
+        _stack_coordinators(stack, coordinator)
+        stack.enter_context(
+            patch("custom_components.garmin_connect.GarminHistoryArchive", return_value=archive)
+        )
+
+        assert await asyncio.wait_for(async_setup_entry(hass, entry), timeout=0.1) is True
+
+    assert recorder_check_started.is_set()
+    assert archive.status.state.value == "failed"
+    assert archive.status.error_type == "startup_timeout"
+    assert hass.config_entries.async_forward_entry_setups.await_count == 1
+    assert created_tasks and all(task.done() for task in created_tasks)
+    assert not [task for task in created_tasks if not task.done()]
+
+
+async def test_missing_recorder_task_only_fails_archive_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RecorderTask remains an archive-only dependency during core setup."""
+    entry = _config_entry_mock(entry_id="entry-missing-recorder-task")
+    entry.data = {**ENTRY_DATA, "history_account_key": "opaque-account-key-1234567890"}
+    entry.options = {}
+    hass = MagicMock()
+    hass.config.country = "US"
+    hass.services.has_service = MagicMock(return_value=True)
+    hass.config_entries.async_forward_entry_setups = AsyncMock()
+    coordinator = _coord_mock()
+    store = MagicMock()
+    store.async_load = AsyncMock(return_value=None)
+    store.async_save = AsyncMock()
+    archive = GarminHistoryArchive(
+        hass,
+        entry,
+        store_factory=lambda *_args, **_kwargs: store,
+    )
+    monkeypatch.setattr(
+        "custom_components.garmin_connect.history_recorder._load_recorder_task",
+        lambda: (_ for _ in ()).throw(TypeError("RecorderTask is unavailable")),
+    )
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("custom_components.garmin_connect.GarminAuth"))
+        stack.enter_context(patch("custom_components.garmin_connect.GarminClient"))
+        _stack_coordinators(stack, coordinator)
+        stack.enter_context(
+            patch("custom_components.garmin_connect.GarminHistoryArchive", return_value=archive)
+        )
+
+        assert await async_setup_entry(hass, entry) is True
+
+    assert archive.status.state.value == "failed"
+    assert archive.status.error_type == "recorder_signature"
+    assert hass.config_entries.async_forward_entry_setups.await_count == 1
+
+
 async def test_setup_entry_skips_services_when_already_registered() -> None:
     """Services are not re-registered when has_service returns True."""
-    entry = MagicMock()
+    entry = _config_entry_mock()
     entry.data = dict(ENTRY_DATA)
     entry.options = {}
     hass = MagicMock()
@@ -913,6 +1350,256 @@ async def test_setup_entry_skips_services_when_already_registered() -> None:
     setup_services.assert_not_awaited()
 
 
+async def test_real_entry_setup_rolls_back_partial_platform_failure_and_retries() -> None:
+    """A failed platform setup leaves no runtime and a retry installs one."""
+    entry = _real_config_entry()
+    hass = MagicMock()
+    _configure_entry_task_factory(hass)
+    hass.config.country = "US"
+    hass.services.has_service = MagicMock(return_value=False)
+    hass.config_entries.async_forward_entry_setups = AsyncMock(
+        side_effect=[RuntimeError("calendar setup failed"), None]
+    )
+    hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
+    coord = _coord_mock()
+    first_archive = MagicMock(spec=GarminHistoryArchive)
+    first_archive.async_start = AsyncMock()
+    first_archive.async_stop = AsyncMock()
+    second_archive = MagicMock(spec=GarminHistoryArchive)
+    second_archive.async_start = AsyncMock()
+    second_archive.async_stop = AsyncMock()
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("custom_components.garmin_connect.GarminAuth"))
+        stack.enter_context(patch("custom_components.garmin_connect.GarminClient"))
+        constructors = _stack_coordinators(stack, coord)
+        stack.enter_context(
+            patch(
+                "custom_components.garmin_connect.GarminHistoryArchive",
+                side_effect=[first_archive, second_archive],
+            )
+        )
+        setup_services = stack.enter_context(
+            patch("custom_components.garmin_connect.async_setup_services", new=AsyncMock())
+        )
+
+        with pytest.raises(RuntimeError, match="calendar setup failed"):
+            await async_setup_entry(hass, entry)
+
+        first_gate = constructors[0].call_args.args[4]
+        assert first_gate._closed is True
+        first_archive.async_stop.assert_awaited_once()
+        assert not hasattr(entry, "runtime_data")
+        assert entry.update_listeners == []
+        assert entry._on_unload is None
+        setup_services.assert_not_awaited()
+
+        assert await async_setup_entry(hass, entry) is True
+
+    assert entry.runtime_data.request_gate is not first_gate
+    assert entry.runtime_data.request_gate._closed is False
+    assert len(entry.update_listeners) == 1
+    second_archive.async_start.assert_awaited_once()
+
+
+async def test_setup_rollback_platform_refusal_retains_runtime_until_retry() -> None:
+    """A refused rollback preserves the platform runtime and retries teardown first."""
+    entry = _real_config_entry()
+    hass = MagicMock()
+    _configure_entry_task_factory(hass)
+    hass.config.country = "US"
+    hass.services.has_service = MagicMock(return_value=False)
+    hass.config_entries.async_entries = MagicMock(return_value=[entry])
+    hass.config_entries.async_forward_entry_setups = AsyncMock(
+        side_effect=[RuntimeError("calendar setup failed"), None]
+    )
+    hass.config_entries.async_unload_platforms = AsyncMock(side_effect=[False, True])
+    coord = _coord_mock()
+    first_archive = MagicMock(spec=GarminHistoryArchive)
+    first_archive.async_start = AsyncMock()
+    first_archive.async_stop = AsyncMock()
+    second_archive = MagicMock(spec=GarminHistoryArchive)
+    second_archive.async_start = AsyncMock()
+    second_archive.async_stop = AsyncMock()
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("custom_components.garmin_connect.GarminAuth"))
+        stack.enter_context(patch("custom_components.garmin_connect.GarminClient"))
+        constructors = _stack_coordinators(stack, coord)
+        stack.enter_context(
+            patch(
+                "custom_components.garmin_connect.GarminHistoryArchive",
+                side_effect=[first_archive, second_archive],
+            )
+        )
+        unload_services = stack.enter_context(
+            patch("custom_components.garmin_connect.async_unload_services", new=AsyncMock())
+        )
+        stack.enter_context(
+            patch("custom_components.garmin_connect.async_setup_services", new=AsyncMock())
+        )
+
+        with pytest.raises(RuntimeError, match="calendar setup failed"):
+            await async_setup_entry(hass, entry)
+
+        retained_runtime = entry.runtime_data
+        first_gate = constructors[0].call_args.args[4]
+        assert first_gate._closed is False
+        first_archive.async_stop.assert_not_awaited()
+        assert entry.update_listeners == []
+
+        assert await async_setup_entry(hass, entry) is True
+
+    assert entry.runtime_data is not retained_runtime
+    assert first_gate._closed is True
+    first_archive.async_stop.assert_awaited_once()
+    assert hass.config_entries.async_unload_platforms.await_count == 2
+    unload_services.assert_awaited_once_with(hass)
+
+
+async def test_real_entry_setup_cancellation_propagates_and_rolls_back() -> None:
+    """Cancelling setup is not converted to ConfigEntryNotReady or leaked work."""
+    entry = _real_config_entry()
+    hass = MagicMock()
+    hass.config.country = "US"
+    hass.services.has_service = MagicMock(return_value=False)
+    hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
+    coord = _coord_mock()
+    refresh_started = asyncio.Event()
+    release_refresh = asyncio.Event()
+
+    async def wait_for_refresh() -> None:
+        refresh_started.set()
+        await release_refresh.wait()
+
+    coord.async_config_entry_first_refresh.side_effect = wait_for_refresh
+    with ExitStack() as stack:
+        stack.enter_context(patch("custom_components.garmin_connect.GarminAuth"))
+        stack.enter_context(patch("custom_components.garmin_connect.GarminClient"))
+        constructors = _stack_coordinators(stack, coord)
+        setup_task = asyncio.create_task(async_setup_entry(hass, entry))
+        await refresh_started.wait()
+        setup_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await setup_task
+
+    gate = constructors[0].call_args.args[4]
+    assert gate._closed is True
+    assert not hasattr(entry, "runtime_data")
+    assert entry.update_listeners == []
+
+
+async def test_real_entry_timeout_becomes_not_ready() -> None:
+    """Only a timeout maps to ConfigEntryNotReady during setup."""
+    entry = _real_config_entry()
+    hass = MagicMock()
+    hass.config.country = "US"
+    coord = _coord_mock()
+    coord.async_config_entry_first_refresh.side_effect = asyncio.TimeoutError
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("custom_components.garmin_connect.GarminAuth"))
+        stack.enter_context(patch("custom_components.garmin_connect.GarminClient"))
+        constructors = _stack_coordinators(stack, coord)
+        with pytest.raises(ConfigEntryNotReady, match="timed out"):
+            await async_setup_entry(hass, entry)
+
+    assert constructors[0].call_args.args[4]._closed is True
+
+
+async def test_setup_cancellation_removes_registered_services_and_listener() -> None:
+    """Cancellation after registration compensates every setup-side resource."""
+    entry = _real_config_entry()
+    hass = MagicMock()
+    _configure_entry_task_factory(hass)
+    hass.config.country = "US"
+    hass.services.has_service = MagicMock(return_value=False)
+    hass.config_entries.async_forward_entry_setups = AsyncMock()
+    hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
+    coord = _coord_mock()
+    archive = MagicMock(spec=GarminHistoryArchive)
+    archive_started = asyncio.Event()
+    release_archive = asyncio.Event()
+
+    async def start_archive() -> None:
+        archive_started.set()
+        await release_archive.wait()
+
+    archive.async_start = AsyncMock(side_effect=start_archive)
+    archive.async_stop = AsyncMock()
+    with ExitStack() as stack:
+        stack.enter_context(patch("custom_components.garmin_connect.GarminAuth"))
+        stack.enter_context(patch("custom_components.garmin_connect.GarminClient"))
+        constructors = _stack_coordinators(stack, coord)
+        stack.enter_context(
+            patch("custom_components.garmin_connect.GarminHistoryArchive", return_value=archive)
+        )
+        unload_services = stack.enter_context(
+            patch("custom_components.garmin_connect.async_unload_services", new=AsyncMock())
+        )
+        stack.enter_context(
+            patch("custom_components.garmin_connect.async_setup_services", new=AsyncMock())
+        )
+
+        setup_task = asyncio.create_task(async_setup_entry(hass, entry))
+        await archive_started.wait()
+        setup_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await setup_task
+
+    assert constructors[0].call_args.args[4]._closed is True
+    archive.async_stop.assert_awaited_once()
+    unload_services.assert_awaited_once_with(hass)
+    assert entry.update_listeners == []
+    assert not hasattr(entry, "runtime_data")
+
+
+async def test_setup_rollback_keeps_services_owned_by_another_loaded_entry() -> None:
+    """Cancelling entry A cannot unregister the services entry B still needs."""
+    entry_a = _real_config_entry()
+    entry_b = _real_config_entry("entry-b")
+    entry_b.runtime_data = object()
+    hass = MagicMock()
+    _configure_entry_task_factory(hass)
+    hass.config.country = "US"
+    hass.services.has_service = MagicMock(return_value=False)
+    hass.config_entries.async_entries = MagicMock(return_value=[entry_a, entry_b])
+    hass.config_entries.async_forward_entry_setups = AsyncMock()
+    hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
+    coord = _coord_mock()
+    archive = MagicMock(spec=GarminHistoryArchive)
+    archive_started = asyncio.Event()
+
+    async def start_archive() -> None:
+        archive_started.set()
+        await asyncio.Event().wait()
+
+    archive.async_start = AsyncMock(side_effect=start_archive)
+    archive.async_stop = AsyncMock()
+    with ExitStack() as stack:
+        stack.enter_context(patch("custom_components.garmin_connect.GarminAuth"))
+        stack.enter_context(patch("custom_components.garmin_connect.GarminClient"))
+        _stack_coordinators(stack, coord)
+        stack.enter_context(
+            patch("custom_components.garmin_connect.GarminHistoryArchive", return_value=archive)
+        )
+        unload_services = stack.enter_context(
+            patch("custom_components.garmin_connect.async_unload_services", new=AsyncMock())
+        )
+        stack.enter_context(
+            patch("custom_components.garmin_connect.async_setup_services", new=AsyncMock())
+        )
+
+        setup_task = asyncio.create_task(async_setup_entry(hass, entry_a))
+        await archive_started.wait()
+        setup_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await setup_task
+
+    unload_services.assert_not_awaited()
+    assert entry_b.runtime_data is not None
+
+
 # ── Unload tests ──────────────────────────────────────────────────────────────
 
 
@@ -932,8 +1619,9 @@ async def test_unload_entry_unregisters_services_when_last_entry() -> None:
 
 
 async def test_unload_entry_keeps_services_when_other_entries_exist() -> None:
-    """Services are NOT removed when other config entries remain loaded."""
+    """Services stay registered while another entry has a live runtime."""
     entry1, entry2 = MagicMock(), MagicMock()
+    entry2.runtime_data = object()
     hass = MagicMock()
     hass.config_entries.async_entries = MagicMock(return_value=[entry1, entry2])
     hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
@@ -979,6 +1667,70 @@ async def test_unload_entry_stops_history_archive() -> None:
     assert result is True
     request_gate.async_close.assert_awaited_once()
     archive.async_stop.assert_awaited_once()
+
+
+async def test_real_entry_partial_unload_keeps_runtime_usable() -> None:
+    """A refused platform unload cannot stop the still-loaded runtime."""
+    from custom_components.garmin_connect.coordinator import GarminConnectCoordinators
+
+    entry = _real_config_entry()
+    archive = MagicMock(spec=GarminHistoryArchive)
+    archive.async_stop = AsyncMock()
+    gate = GarminRequestGate()
+    coord = _coord_mock()
+    runtime = GarminConnectCoordinators(
+        core=coord,
+        activity=coord,
+        training=coord,
+        body=coord,
+        goals=coord,
+        gear=coord,
+        blood_pressure=coord,
+        menstrual=coord,
+        nutrition=coord,
+        request_gate=gate,
+        history_archive=archive,
+    )
+    entry.runtime_data = runtime
+    hass = MagicMock()
+    hass.config_entries.async_entries = MagicMock(return_value=[entry])
+    hass.config_entries.async_unload_platforms = AsyncMock(side_effect=[False, True])
+
+    with patch("custom_components.garmin_connect.async_unload_services", new=AsyncMock()):
+        assert await async_unload_entry(hass, entry) is False
+        assert entry.runtime_data is runtime
+        assert gate._closed is False
+        archive.async_stop.assert_not_awaited()
+
+        assert await async_unload_entry(hass, entry) is True
+
+    assert gate._closed is True
+    archive.async_stop.assert_awaited_once()
+
+
+async def test_unload_exception_reopens_reload_gate() -> None:
+    """A failed platform unload cannot suppress the next options reload."""
+    entry = MagicMock(entry_id="entry-unload-exception")
+    entry.data = {}
+    entry.options = {CONF_SCAN_INTERVAL: 300}
+    hass = MagicMock()
+    schedule_reload = MagicMock()
+    hass.config_entries.async_schedule_reload = schedule_reload
+    hass.config_entries.async_unload_platforms = AsyncMock(
+        side_effect=RuntimeError("platform unload failed")
+    )
+
+    await async_options_update_listener(hass, entry)
+    schedule_reload.assert_called_once_with(entry.entry_id)
+
+    with pytest.raises(RuntimeError, match="platform unload failed"):
+        await async_unload_entry(hass, entry)
+
+    entry.options = {CONF_SCAN_INTERVAL: 301}
+    await async_options_update_listener(hass, entry)
+
+    assert schedule_reload.call_count == 2
+    schedule_reload.assert_called_with(entry.entry_id)
 
 
 async def test_unload_entry_cancels_active_current_refresh() -> None:
