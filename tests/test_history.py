@@ -4857,6 +4857,37 @@ async def test_store_failure_does_not_raise_or_probe_recorder() -> None:
     checker.check.assert_not_awaited()
 
 
+async def test_upgrade_starts_with_retired_floor_family_in_store() -> None:
+    """A beta.8 floor bookkeeping key cannot brick the beta.10 archive."""
+    target = date(2026, 8, 1)
+    store = _reconciliation_store(target)
+    assert store.data is not None
+    store.data["reconciliation_family_presence"] = {
+        target.isoformat(): {
+            "floors": "present",
+            "heart_rate": "present",
+        }
+    }
+    entry = _entry(
+        data={
+            "history_account_key": "opaque-account-key-1234567890",
+            CONF_ARCHIVE_ACTIVATION_DATE: target.isoformat(),
+            CONF_ARCHIVE_PREVIOUSLY_ENABLED: True,
+        }
+    )
+    entry.options = {CONF_ARCHIVE_ENABLED: False}
+    archive = _archive(
+        _hass(),
+        entry,
+        FakeRecorderChecker(RecorderCompatibilityResult.compatible_result()),
+        store,
+    )
+
+    await archive.async_start()
+
+    assert archive.status.state is HistoryArchiveState.DISABLED
+
+
 async def test_status_sensor_exposes_only_privacy_safe_placeholders() -> None:
     """The status entity never exposes the opaque identity or health values."""
     hass = _hass()

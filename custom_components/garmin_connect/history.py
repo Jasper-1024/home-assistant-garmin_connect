@@ -204,6 +204,7 @@ _SNAPSHOT_METADATA = {
     "recovery_time": TRAINING_RECOVERY_TIME_METADATA,
 }
 _RECONCILIATION_FAMILIES = _FROZEN_ARCHIVE_FAMILIES
+_RETIRED_RECONCILIATION_FAMILIES = frozenset({"floors"})
 _RECONCILIATION_EXPLICIT_EMPTY_STATES = frozenset(
     {"empty", "all-null", "null", "returned-empty", "absent"}
 )
@@ -4647,6 +4648,8 @@ class GarminHistoryArchive:
                 raise ValueError("Store reconciliation family presence is invalid")
             bounded_families: dict[str, str] = {}
             for family, state in families.items():
+                if family in _RETIRED_RECONCILIATION_FAMILIES:
+                    continue
                 if (
                     not isinstance(family, str)
                     or family not in _RECONCILIATION_FAMILIES
