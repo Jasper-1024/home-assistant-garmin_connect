@@ -4,7 +4,7 @@
 
 ## 范围与证据等级
 
-本页补充 `garmin-health-data-map.md` 中仅靠接口/schema 无法回答的问题，重点核对
+本页补充 `garmin-health-data-integration.md` 中仅靠接口/schema 无法回答的问题，重点核对
 Garmin 官方支持文档、Garmin 官方论坛、`python-garminconnect`/GarminDB 项目资料
 和少量真实用户反馈。
 
