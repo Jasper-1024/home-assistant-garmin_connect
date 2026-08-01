@@ -11,8 +11,10 @@ from custom_components.garmin_connect.daily_status import (
     daily_status_record,
     normalize_fitness_age_status,
     normalize_hrv_status,
+    normalize_sleep_daily_records,
     normalize_sleep_daily_status,
     normalize_stress_daily_status,
+    normalize_training_daily_records,
     normalize_training_daily_status,
     unavailable_daily_status,
 )
@@ -98,12 +100,15 @@ def test_sleep_fitness_and_stress_normalization():
                     "deepPercentage": {"value": 24},
                 },
                 "sleepNeed": {"actual": 28800, "baseline": 27000},
+                "nextSleepNeed": {"actual": 28000},
                 "avgOvernightHrv": 42,
             }
         },
         TARGET,
     )
     assert metric_values(sleep)["sleep_score_overall"] == 82
+    assert sleep.field_presence["sleepNeed.actual"] == "present"
+    assert sleep.field_presence["nextSleepNeed.actual"] == "present"
     fitness = normalize_fitness_age_status(
         {
             "chronologicalAge": 35,
@@ -140,6 +145,59 @@ def test_source_calendar_date_and_absence_semantics_round_trip():
     assert record.calendar_date == date(2026, 7, 30)
     failed = unavailable_daily_status("hrv", TARGET, "failed")
     assert daily_status_from_record(daily_status_record(failed)).presence == "failed"
+
+
+def test_training_and_sleep_subsources_keep_independent_identity_and_time():
+    training = normalize_training_daily_records(
+        {
+            "mostRecentTrainingStatus": {
+                "latestTrainingStatusData": {
+                    "watch": {
+                        "calendarDate": "2026-07-31",
+                        "trainingStatus": 7,
+                    }
+                }
+            },
+            "mostRecentVO2Max": {
+                "generic": {
+                    "calendarDate": "2026-07-29",
+                    "vo2MaxValue": 48,
+                }
+            },
+        },
+        TARGET,
+    )
+    assert {record.calendar_date for record in training} == {
+        date(2026, 7, 29),
+        date(2026, 7, 31),
+    }
+    assert len({record.record_key for record in training}) == 2
+
+    sleep = normalize_sleep_daily_records(
+        {
+            "dailySleepDTO": {
+                "calendarDate": "2026-07-31",
+                "sleepScores": {"overall": {"value": 82}},
+                "sleepNeed": {
+                    "calendarDate": "2026-07-31",
+                    "timestampGmt": "2026-07-31T06:00:00+00:00",
+                    "actual": 450,
+                },
+                "nextSleepNeed": {
+                    "calendarDate": "2026-08-01",
+                    "timestampGmt": "2026-07-31T20:00:00+00:00",
+                    "actual": 440,
+                },
+            }
+        },
+        TARGET,
+    )
+    next_need = next(record for record in sleep if record.record_key == "sleep_next_sleep_need")
+    assert next_need.calendar_date == date(2026, 8, 1)
+    assert next_need.statistic_timestamp == datetime(2026, 7, 31, 20, tzinfo=UTC)
+    assert "sleep_average_overnight_hrv" not in {
+        metric.key for record in sleep for metric in record.metrics
+    }
 
 
 @pytest.mark.asyncio

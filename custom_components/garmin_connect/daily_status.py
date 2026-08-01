@@ -17,8 +17,6 @@ from .history_source import HistorySchemaError, NormalizedSample
 
 DAILY_STATUS_SCHEMA_VERSION = 1
 _DAY_TIME_ZONE = timezone(timedelta(hours=8))
-_MAX_DEVICES = 32
-_MAX_TEXT = 512
 _FAMILIES = frozenset({"hrv", "training", "sleep", "fitness_age", "stress"})
 _PRESENCE = frozenset({"present", "empty", "missing", "unsupported", "failed"})
 
@@ -47,6 +45,7 @@ class DailyStatusRecord:
     """One source-date status snapshot containing only known bounded fields."""
 
     family: str
+    record_key: str
     calendar_date: date
     source_timestamp: datetime | None
     statistic_timestamp: datetime
@@ -129,7 +128,7 @@ def _text(value: Any, field_name: str) -> str | None:
         return None
     if not isinstance(value, str):
         raise HistorySchemaError(f"{field_name} has an invalid type")
-    return value[:_MAX_TEXT]
+    return value
 
 
 def _mapping(value: Any, field_name: str) -> Mapping[str, Any]:
@@ -147,16 +146,18 @@ def _field(
     presence: dict[str, str],
     *,
     text_value: bool = False,
+    presence_name: str | None = None,
 ) -> float | str | None:
+    presence_key = presence_name or name
     if name not in source:
-        presence[name] = "missing"
+        presence[presence_key] = "missing"
         return None
     raw = source[name]
     if raw is None:
-        presence[name] = "null"
+        presence[presence_key] = "null"
         return None
     value = _text(raw, name) if text_value else _number(raw, name)
-    presence[name] = "present"
+    presence[presence_key] = "present"
     values[name] = value
     return value
 
@@ -177,12 +178,15 @@ def _finish(
     *,
     raw_timestamp: Any = None,
     record_presence: str | None = None,
+    record_key: str | None = None,
 ) -> DailyStatusRecord:
+    identity_key = record_key or family
     present = record_presence or ("present" if values or metrics else "empty")
     source_timestamp = _aware_timestamp(raw_timestamp)
     statistic_timestamp = _statistic_timestamp(calendar_date, source_timestamp)
     canonical = {
         "family": family,
+        "record_key": identity_key,
         "calendar_date": calendar_date.isoformat(),
         "source_timestamp": source_timestamp.isoformat() if source_timestamp else None,
         "statistic_timestamp": statistic_timestamp.isoformat(),
@@ -199,6 +203,7 @@ def _finish(
     ).hexdigest()[:24]
     return DailyStatusRecord(
         family,
+        identity_key,
         calendar_date,
         source_timestamp,
         statistic_timestamp,
@@ -218,6 +223,21 @@ def unavailable_daily_status(
         raise HistorySchemaError("daily status availability is invalid")
     return _finish(
         family, calendar_date, {}, {}, (), record_presence=presence
+    )
+
+
+def _with_record_key(
+    record: DailyStatusRecord, record_key: str
+) -> DailyStatusRecord:
+    return _finish(
+        record.family,
+        record.calendar_date,
+        record.values,
+        record.field_presence,
+        record.metrics,
+        raw_timestamp=record.source_timestamp,
+        record_presence=record.presence,
+        record_key=record_key,
     )
 
 
@@ -268,8 +288,6 @@ def normalize_training_daily_status(payload: Any, target_date: date) -> DailySta
     root = _mapping(payload, "training payload")
     status_root = _mapping(root.get("mostRecentTrainingStatus"), "training status")
     devices = _mapping(status_root.get("latestTrainingStatusData"), "training devices")
-    if len(devices) > _MAX_DEVICES:
-        raise HistorySchemaError("training status has too many devices")
     values: dict[str, Any] = {"devices": {}}
     presence: dict[str, str] = {}
     metrics: list[DailyStatusMetric] = []
@@ -284,9 +302,9 @@ def normalize_training_daily_status(payload: Any, target_date: date) -> DailySta
         values["devices"][suffix] = device_values
         returned_dates.append(_calendar_date(item, target_date))
         for source in ("calendarDate", "sinceDate", "trainingStatusFeedbackPhrase"):
-            _field(item, source, device_values, presence, text_value=True)
+            _field(item, source, device_values, presence, text_value=True, presence_name=f"devices.{suffix}.{source}")
         for source in ("trainingStatus", "fitnessTrend"):
-            value = _field(item, source, device_values, presence)
+            value = _field(item, source, device_values, presence, presence_name=f"devices.{suffix}.{source}")
             if source == "fitnessTrend":
                 _metric(metrics, f"training_fitness_trend_{suffix}", "Training fitness trend", "unitless", value)
         status_code = device_values.get("trainingStatus")
@@ -317,10 +335,10 @@ def normalize_training_daily_status(payload: Any, target_date: date) -> DailySta
             ("minTrainingLoadChronic", "chronic_load_min_target", "Training chronic-load minimum target", "load"),
             ("maxTrainingLoadChronic", "chronic_load_max_target", "Training chronic-load maximum target", "load"),
         ):
-            value = _field(acute, source, acute_values, presence)
+            value = _field(acute, source, acute_values, presence, presence_name=f"devices.{suffix}.acuteTrainingLoad.{source}")
             _metric(metrics, f"training_{key}_{suffix}", name, unit, value)
         for source in ("acwrStatus", "acwrStatusFeedback"):
-            _field(acute, source, acute_values, presence, text_value=True)
+            _field(acute, source, acute_values, presence, text_value=True, presence_name=f"devices.{suffix}.acuteTrainingLoad.{source}")
 
     vo2_root = _mapping(root.get("mostRecentVO2Max"), "training VO2")
     vo2_values: dict[str, Any] = {}
@@ -332,12 +350,12 @@ def normalize_training_daily_status(payload: Any, target_date: date) -> DailySta
         vo2_values[suffix] = item_values
         returned_dates.append(_calendar_date(item, target_date))
         for source in ("calendarDate", "maxMetCategory"):
-            _field(item, source, item_values, presence, text_value=True)
+            _field(item, source, item_values, presence, text_value=True, presence_name=f"vo2Max.{suffix}.{source}")
         for source, key, name in (
             ("vo2MaxValue", "vo2_max", "Training VO2 max"),
             ("vo2MaxPreciseValue", "vo2_max_precise", "Training precise VO2 max"),
         ):
-            value = _field(item, source, item_values, presence)
+            value = _field(item, source, item_values, presence, presence_name=f"vo2Max.{suffix}.{source}")
             _metric(metrics, f"training_{key}_{suffix}", name, "mL/kg/min", value)
     if vo2_values:
         values["vo2Max"] = vo2_values
@@ -361,7 +379,7 @@ def normalize_training_daily_status(payload: Any, target_date: date) -> DailySta
             continue
         if isinstance(raw, str) or raw is None:
             if isinstance(raw, str):
-                balance_values[str(key)] = raw[:_MAX_TEXT]
+                balance_values[str(key)] = raw
             continue
         if isinstance(raw, bool) or not isinstance(raw, int | float):
             continue
@@ -387,6 +405,44 @@ def normalize_training_daily_status(payload: Any, target_date: date) -> DailySta
     )
 
 
+def normalize_training_daily_records(
+    payload: Any, target_date: date
+) -> tuple[DailyStatusRecord, ...]:
+    """Split training status, VO2, and load balance by source identity."""
+    root = _mapping(payload, "training payload")
+    records: list[DailyStatusRecord] = []
+    status_root = _mapping(root.get("mostRecentTrainingStatus"), "training status")
+    devices = _mapping(status_root.get("latestTrainingStatusData"), "training devices")
+    for raw_id, item in devices.items():
+        device_id = str(_mapping(item, "training device").get("deviceId", raw_id))
+        suffix = _device_suffix(device_id)
+        record = normalize_training_daily_status(
+            {
+                "mostRecentTrainingStatus": {
+                    "latestTrainingStatusData": {str(raw_id): item}
+                }
+            },
+            target_date,
+        )
+        records.append(_with_record_key(record, f"training_status:{suffix}"))
+    vo2 = _mapping(root.get("mostRecentVO2Max"), "training VO2")
+    for raw_key, item in vo2.items():
+        mapped = _mapping(item, "training VO2 item")
+        raw_device = mapped.get("deviceId")
+        suffix = _device_suffix(str(raw_device)) if raw_device is not None else "generic"
+        record = normalize_training_daily_status(
+            {"mostRecentVO2Max": {str(raw_key): item}}, target_date
+        )
+        records.append(_with_record_key(record, f"training_vo2:{suffix}"))
+    if root.get("mostRecentTrainingLoadBalance") is not None:
+        record = normalize_training_daily_status(
+            {"mostRecentTrainingLoadBalance": root["mostRecentTrainingLoadBalance"]},
+            target_date,
+        )
+        records.append(_with_record_key(record, "training_load_balance"))
+    return tuple(records) or (normalize_training_daily_status({}, target_date),)
+
+
 def normalize_sleep_daily_status(payload: Any, target_date: date) -> DailyStatusRecord:
     """Normalize sleep scores, sleep need, and bounded daily insights."""
     root = _mapping(payload, "sleep payload")
@@ -399,10 +455,10 @@ def normalize_sleep_daily_status(payload: Any, target_date: date) -> DailyStatus
     for component, raw_component in scores.items():
         component_data = _mapping(raw_component, f"sleep score {component}")
         normalized: dict[str, Any] = {}
-        value = _field(component_data, "value", normalized, presence)
+        value = _field(component_data, "value", normalized, presence, presence_name=f"sleepScores.{component}.value")
         _metric(metrics, f"sleep_score_{_stat_key(str(component))}", f"Sleep score {component}", "unitless", value)
         for source in ("optimalStart", "optimalEnd", "idealStartInSeconds", "idealEndInSeconds"):
-            range_value = _field(component_data, source, normalized, presence)
+            range_value = _field(component_data, source, normalized, presence, presence_name=f"sleepScores.{component}.{source}")
             _metric(
                 metrics,
                 f"sleep_score_{_stat_key(str(component))}_{_stat_key(source)}",
@@ -410,17 +466,13 @@ def normalize_sleep_daily_status(payload: Any, target_date: date) -> DailyStatus
                 "s" if "Seconds" in source else "unitless",
                 range_value,
             )
-        _field(component_data, "qualifierKey", normalized, presence, text_value=True)
+        _field(component_data, "qualifierKey", normalized, presence, text_value=True, presence_name=f"sleepScores.{component}.qualifierKey")
         if normalized:
             score_values[str(component)] = normalized
     if score_values:
         values["sleepScores"] = score_values
-    for source, key, name, unit in (
-        ("avgOvernightHrv", "sleep_average_overnight_hrv", "Sleep average overnight HRV", "ms"),
-        ("bodyBatteryChange", "sleep_body_battery_change", "Sleep Body Battery change", "unitless"),
-    ):
-        value = _field(daily, source, values, presence)
-        _metric(metrics, key, name, unit, value)
+    for source in ("avgOvernightHrv", "bodyBatteryChange"):
+        _field(daily, source, values, presence)
     for source in ("hrvStatus", "sleepScoreFeedback", "sleepScoreInsight", "sleepScorePersonalizedInsight"):
         _field(daily, source, values, presence, text_value=True)
     for need_name in ("sleepNeed", "nextSleepNeed"):
@@ -431,19 +483,19 @@ def normalize_sleep_daily_status(payload: Any, target_date: date) -> DailyStatus
             ("napAdjustment", "min"), ("sleepHistoryAdjustment", "min"),
             ("trainingAdjustment", "min"),
         ):
-            value = _field(need, source, need_values, presence)
+            value = _field(need, source, need_values, presence, presence_name=f"{need_name}.{source}")
             _metric(metrics, f"sleep_{_stat_key(need_name)}_{_stat_key(source)}", f"Sleep {need_name} {source}", unit, value)
         for source in ("calendarDate", "feedback", "trainingFeedback"):
-            _field(need, source, need_values, presence, text_value=True)
+            _field(need, source, need_values, presence, text_value=True, presence_name=f"{need_name}.{source}")
         for source in (
             "timestampGmt", "recommendedBedtimeStartTimestampGmt",
             "recommendedBedtimeEndTimestampGmt",
         ):
-            _field(need, source, need_values, presence, text_value=True)
+            _field(need, source, need_values, presence, text_value=True, presence_name=f"{need_name}.{source}")
         for source in (
             "recommendedBedtimeStartMins", "recommendedBedtimeEndMins"
         ):
-            value = _field(need, source, need_values, presence)
+            value = _field(need, source, need_values, presence, presence_name=f"{need_name}.{source}")
             _metric(
                 metrics,
                 f"sleep_{_stat_key(need_name)}_{_stat_key(source)}",
@@ -479,6 +531,44 @@ def normalize_sleep_daily_status(payload: Any, target_date: date) -> DailyStatus
     )
 
 
+def normalize_sleep_daily_records(
+    payload: Any, target_date: date
+) -> tuple[DailyStatusRecord, ...]:
+    """Split the sleep summary and both sleep-need snapshots."""
+    root = _mapping(payload, "sleep payload")
+    daily = dict(
+        _mapping(root.get("dailySleepDTO", root.get("sleepData", root)), "daily sleep")
+    )
+    base = dict(daily)
+    base.pop("sleepNeed", None)
+    base.pop("nextSleepNeed", None)
+    records = [
+        _with_record_key(
+            normalize_sleep_daily_status({"dailySleepDTO": base}, target_date),
+            "sleep_summary",
+        )
+    ]
+    for need_name in ("sleepNeed", "nextSleepNeed"):
+        raw_need = daily.get(need_name, root.get(need_name))
+        if raw_need is None:
+            continue
+        need = _mapping(raw_need, need_name)
+        envelope = {
+            "calendarDate": need.get("calendarDate", daily.get("calendarDate")),
+            "sleepEndTimestampGMT": need.get("timestampGmt"),
+            need_name: raw_need,
+        }
+        records.append(
+            _with_record_key(
+                normalize_sleep_daily_status(
+                    {"dailySleepDTO": envelope}, target_date
+                ),
+                f"sleep_{_stat_key(need_name)}",
+            )
+        )
+    return tuple(records)
+
+
 def normalize_fitness_age_status(payload: Any, target_date: date) -> DailyStatusRecord:
     """Normalize Garmin fitness-age values and known components."""
     root = _mapping(payload, "fitness age payload")
@@ -496,17 +586,17 @@ def normalize_fitness_age_status(payload: Any, target_date: date) -> DailyStatus
     if physique is not None:
         if isinstance(physique, bool) or not isinstance(physique, str | int):
             raise HistorySchemaError("physiqueRating has an invalid type")
-        values["physiqueRating"] = str(physique)[:_MAX_TEXT]
+        values["physiqueRating"] = str(physique)
         presence["physiqueRating"] = "present"
     components: dict[str, Any] = {}
     for component in ("bodyFat", "rhr", "vigorousDaysAvg", "vigorousMinutesAvg"):
         data = _mapping(root.get(component), f"fitness age {component}")
         normalized: dict[str, Any] = {}
         for source in ("value", "targetValue", "potentialAge", "improvement", "priority", "weeks"):
-            value = _field(data, source, normalized, presence)
+            value = _field(data, source, normalized, presence, presence_name=f"components.{component}.{source}")
             _metric(metrics, f"fitness_age_{_stat_key(component)}_{_stat_key(source)}", f"Fitness age {component} {source}", "unitless", value)
         for source in ("date",):
-            _field(data, source, normalized, presence, text_value=True)
+            _field(data, source, normalized, presence, text_value=True, presence_name=f"components.{component}.{source}")
         if "stale" in data:
             stale = data["stale"]
             if not isinstance(stale, bool):
@@ -559,6 +649,7 @@ def daily_status_record(record: DailyStatusRecord) -> dict[str, Any]:
     """Serialize one validated daily status record."""
     return {
         "family": record.family,
+        "record_key": record.record_key,
         "calendar_date": record.calendar_date.isoformat(),
         "source_timestamp": (
             record.source_timestamp.astimezone(UTC).isoformat()
@@ -582,6 +673,7 @@ def daily_status_from_record(raw: Mapping[str, Any]) -> DailyStatusRecord:
     """Validate and restore a daily status record."""
     try:
         family = raw["family"]
+        record_key = raw["record_key"]
         calendar_date = date.fromisoformat(raw["calendar_date"])
         source_timestamp = (
             datetime.fromisoformat(raw["source_timestamp"])
@@ -598,6 +690,8 @@ def daily_status_from_record(raw: Mapping[str, Any]) -> DailyStatusRecord:
         raise HistorySchemaError("daily status record is invalid") from err
     if (
         family not in _FAMILIES
+        or not isinstance(record_key, str)
+        or not record_key.startswith(family)
         or (source_timestamp is not None and source_timestamp.tzinfo is None)
         or (
             source_timestamp is not None
@@ -630,6 +724,7 @@ def daily_status_from_record(raw: Mapping[str, Any]) -> DailyStatusRecord:
         raise HistorySchemaError("daily status record is invalid") from err
     restored = DailyStatusRecord(
         family,
+        record_key,
         calendar_date,
         source_timestamp.astimezone(UTC) if source_timestamp is not None else None,
         statistic_timestamp.astimezone(UTC),
@@ -648,6 +743,7 @@ def daily_status_from_record(raw: Mapping[str, Any]) -> DailyStatusRecord:
         metrics,
         raw_timestamp=source_timestamp,
         record_presence=raw["presence"],
+        record_key=record_key,
     )
     if expected.revision != revision:
         raise HistorySchemaError("daily status record is inconsistent")
@@ -702,11 +798,14 @@ class DailyStatusStore:
             if str(parsed_date.year) != year_key or not isinstance(families, Mapping):
                 raise HistorySchemaError("daily status partition is invalid")
             parsed_families: dict[str, DailyStatusRecord] = {}
-            for family, record in families.items():
+            for record_key, record in families.items():
                 restored = daily_status_from_record(record)
-                if restored.family != family or restored.calendar_date != parsed_date:
+                if (
+                    restored.record_key != record_key
+                    or restored.calendar_date != parsed_date
+                ):
                     raise HistorySchemaError("daily status partition is invalid")
-                parsed_families[family] = restored
+                parsed_families[record_key] = restored
             dates[date_key] = parsed_families
         self._records[year_key] = dates
 
@@ -731,14 +830,14 @@ class DailyStatusStore:
             await self.async_load_year(year)
             date_key = incoming.calendar_date.isoformat()
             families = self._records[year].setdefault(date_key, {})
-            existing = families.get(incoming.family)
+            existing = families.get(incoming.record_key)
             if existing is not None and existing.presence == "present" and incoming.presence != "present":
                 retained.append(existing)
                 continue
             if existing is not None and existing.revision == incoming.revision:
                 retained.append(existing)
                 continue
-            families[incoming.family] = incoming
+            families[incoming.record_key] = incoming
             changed_years.add(year)
             retained.append(incoming)
         for year in changed_years:
@@ -748,11 +847,11 @@ class DailyStatusStore:
     async def async_mark_projected(self, record: DailyStatusRecord) -> DailyStatusRecord:
         year = str(record.calendar_date.year)
         await self.async_load_year(year)
-        current = self._records[year].get(record.calendar_date.isoformat(), {}).get(record.family)
+        current = self._records[year].get(record.calendar_date.isoformat(), {}).get(record.record_key)
         if current is None or current.revision != record.revision:
             raise HistorySchemaError("daily status projection revision changed")
         projected = replace(current, projected_revision=current.revision)
-        self._records[year][record.calendar_date.isoformat()][record.family] = projected
+        self._records[year][record.calendar_date.isoformat()][record.record_key] = projected
         await self._async_save_year(year)
         return projected
 
@@ -766,4 +865,6 @@ class DailyStatusStore:
             if start <= date.fromisoformat(date_key) <= end
             for record in families.values()
         ]
-        return tuple(sorted(result, key=lambda item: (item.calendar_date, item.family)))
+        return tuple(
+            sorted(result, key=lambda item: (item.calendar_date, item.record_key))
+        )

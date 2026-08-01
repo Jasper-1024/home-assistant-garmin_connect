@@ -41,7 +41,7 @@ families are not polled:
 | --- | --- |
 | `CoreCoordinator` | Daily summary, steps, sleep, HR, stress, SpO2, body battery (~50 sensors) |
 | `ActivityCoordinator` | Last activity, last 10 activities, polyline, workouts (~5 sensors) |
-| `TrainingCoordinator` | Readiness, VO2max, HRV, training status, scores (~11 sensors) |
+| `TrainingCoordinator` | Training status, VO2max, HRV, power-to-weight and FTP |
 | `BodyCoordinator` | Weight, BMI, hydration, fitness age, body composition (~17 sensors) |
 | `GoalsCoordinator` | Badges, points, active goals (~6 sensors) |
 | `GearCoordinator` | Gear stats (dynamic sensors per item), alarms |

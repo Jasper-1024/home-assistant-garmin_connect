@@ -49,9 +49,9 @@ from .daily_status import (
     DailyStatusStore,
     normalize_fitness_age_status,
     normalize_hrv_status,
-    normalize_sleep_daily_status,
+    normalize_sleep_daily_records,
     normalize_stress_daily_status,
-    normalize_training_daily_status,
+    normalize_training_daily_records,
     unavailable_daily_status,
 )
 from .fit_archive import (
@@ -2388,12 +2388,21 @@ class GarminHistoryArchive:
         if status_store is None or descriptor is None or not callable(fetch):
             return 0, 0, 0
 
-        normalizers: tuple[tuple[str, Callable[[Any, date], DailyStatusRecord]], ...] = (
+        normalizers: tuple[
+            tuple[
+                str,
+                Callable[
+                    [Any, date],
+                    DailyStatusRecord | tuple[DailyStatusRecord, ...],
+                ],
+            ],
+            ...,
+        ] = (
             ("stress", normalize_stress_daily_status),
             ("hrv", normalize_hrv_status),
-            ("sleep", normalize_sleep_daily_status),
+            ("sleep", normalize_sleep_daily_records),
             ("fitness_age", normalize_fitness_age_status),
-            ("training", normalize_training_daily_status),
+            ("training", normalize_training_daily_records),
         )
         if not include_training:
             normalizers = tuple(item for item in normalizers if item[0] != "training")
@@ -2402,7 +2411,11 @@ class GarminHistoryArchive:
         for family, normalize in normalizers:
             try:
                 payload = await fetch(target, family)
-                incoming.append(normalize(payload, target))
+                normalized = normalize(payload, target)
+                if isinstance(normalized, DailyStatusRecord):
+                    incoming.append(normalized)
+                else:
+                    incoming.extend(normalized)
             except asyncio.CancelledError:
                 raise
             except (
