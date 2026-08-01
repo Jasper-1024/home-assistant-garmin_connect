@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, date
 from unittest.mock import AsyncMock, MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
+from freezegun.api import FrozenDateTimeFactory
 from ha_garmin.exceptions import GarminAuthError
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import UpdateFailed
+from homeassistant.util import dt as dt_util
 
 from custom_components.garmin_connect.const import (
     CONF_CLIENT_ID,
@@ -276,3 +280,28 @@ async def test_training_coordinator_only_calls_supported_endpoint_families() -> 
     ):
         unsupported.assert_not_awaited()
     await coordinator.request_gate.async_close()
+
+
+async def test_training_coordinator_uses_home_assistant_local_date(
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Training endpoints receive HA's local date across the UTC boundary."""
+    freezer.move_to("2026-08-01 16:30:00+00:00")
+    dt_util.set_default_time_zone(ZoneInfo("Asia/Taipei"))
+    hass, entry, client, auth = _inputs()
+    client.get_training_status = AsyncMock(return_value={})
+    client._get_hrv_data_raw = AsyncMock(return_value={})
+    client.get_power_to_weight = AsyncMock(return_value=[])
+    gate = GarminRequestGate()
+    coordinator = TrainingCoordinator(hass, entry, client, auth, gate)
+
+    try:
+        await coordinator._async_update_data()
+
+        expected_date = date(2026, 8, 2)
+        client.get_training_status.assert_awaited_once_with(expected_date)
+        client._get_hrv_data_raw.assert_awaited_once_with(expected_date)
+        client.get_power_to_weight.assert_awaited_once_with(expected_date)
+    finally:
+        dt_util.set_default_time_zone(UTC)
+        await gate.async_close()

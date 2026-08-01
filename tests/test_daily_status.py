@@ -27,6 +27,7 @@ TARGET = date(2026, 7, 31)
 
 class MemoryStore:
     records: dict[str, dict] = {}
+    fail_saves = False
 
     def __init__(self, _hass, _version, key, **_kwargs):
         self.key = key
@@ -35,12 +36,15 @@ class MemoryStore:
         return self.records.get(self.key)
 
     async def async_save(self, value):
+        if self.fail_saves:
+            raise OSError("save failed")
         self.records[self.key] = value
 
 
 @pytest.fixture(autouse=True)
 def clear_store():
     MemoryStore.records = {}
+    MemoryStore.fail_saves = False
 
 
 def metric_values(record):
@@ -217,7 +221,12 @@ def test_malformed_subsource_does_not_discard_valid_siblings():
         },
         TARGET,
     )
-    assert {record.presence for record in training} == {"present", "failed"}
+    status_records = (
+        record
+        for record in training
+        if record.record_key.startswith("training_status:")
+    )
+    assert {record.presence for record in status_records} == {"present", "failed"}
 
     sleep = normalize_sleep_daily_records(
         {
@@ -263,6 +272,53 @@ def test_nullable_status_fields_remain_distinct_from_missing():
     assert any(record.presence == "null" for record in null_need)
     null_stale = normalize_fitness_age_status({"rhr": {"stale": None}}, TARGET)
     assert null_stale.field_presence["components.rhr.stale"] == "null"
+
+
+@pytest.mark.parametrize(
+    ("source_name", "record_key"),
+    (
+        ("mostRecentTrainingStatus", "training_status"),
+        ("mostRecentVO2Max", "training_vo2"),
+        ("mostRecentTrainingLoadBalance", "training_load_balance"),
+    ),
+)
+def test_training_top_level_source_presence_is_preserved(
+    source_name, record_key
+):
+    missing = normalize_training_daily_records({}, TARGET)
+    null = normalize_training_daily_records({source_name: None}, TARGET)
+    empty = normalize_training_daily_records({source_name: {}}, TARGET)
+
+    assert (
+        next(record for record in missing if record.record_key == record_key).presence
+        == "missing"
+    )
+    assert (
+        next(record for record in null if record.record_key == record_key).presence
+        == "null"
+    )
+    assert (
+        next(record for record in empty if record.record_key == record_key).presence
+        == "empty"
+    )
+
+
+def test_non_mapping_vo2_source_is_recorded_as_failed():
+    records = normalize_training_daily_records(
+        {
+            "mostRecentVO2Max": {
+                "generic": 48,
+                "userId": 123,
+            }
+        },
+        TARGET,
+    )
+
+    generic = next(
+        record for record in records if record.record_key == "training_vo2:generic"
+    )
+    assert generic.presence == "failed"
+    assert not any("user_id" in record.record_key for record in records)
 
 
 def test_live_training_and_sleep_status_shapes_normalize_without_failure():
@@ -395,6 +451,49 @@ async def test_projection_checkpoint_is_persisted_and_account_scoped():
     wrong_account = DailyStatusStore(object(), "entry", "other-account", MemoryStore)
     with pytest.raises(HistorySchemaError):
         await wrong_account.async_get_range(TARGET, TARGET)
+
+
+@pytest.mark.asyncio
+async def test_failed_upsert_keeps_last_durable_revision_until_retry():
+    store = DailyStatusStore(object(), "entry", "account-key", MemoryStore)
+    original = normalize_hrv_status({"hrvSummary": {"weeklyAvg": 45}}, TARGET)
+    revised = normalize_hrv_status({"hrvSummary": {"weeklyAvg": 46}}, TARGET)
+    await store.async_upsert((original,))
+
+    MemoryStore.fail_saves = True
+    with pytest.raises(OSError, match="save failed"):
+        await store.async_upsert((revised,))
+
+    (current,) = await store.async_get_range(TARGET, TARGET)
+    assert current.revision == original.revision
+    with pytest.raises(HistorySchemaError, match="revision changed"):
+        await store.async_mark_projected(revised)
+
+    MemoryStore.fail_saves = False
+    (saved,) = await store.async_upsert((revised,))
+    assert saved.revision == revised.revision
+    assert (await store.async_get_range(TARGET, TARGET))[0].revision == revised.revision
+
+
+@pytest.mark.asyncio
+async def test_failed_projection_mark_keeps_unprojected_state_until_retry():
+    store = DailyStatusStore(object(), "entry", "account-key", MemoryStore)
+    record = normalize_hrv_status({"hrvSummary": {"weeklyAvg": 45}}, TARGET)
+    await store.async_upsert((record,))
+
+    MemoryStore.fail_saves = True
+    with pytest.raises(OSError, match="save failed"):
+        await store.async_mark_projected(record)
+
+    (current,) = await store.async_get_range(TARGET, TARGET)
+    assert current.projected_revision is None
+    reloaded = DailyStatusStore(object(), "entry", "account-key", MemoryStore)
+    assert (await reloaded.async_get_range(TARGET, TARGET))[0].projected_revision is None
+
+    MemoryStore.fail_saves = False
+    projected = await store.async_mark_projected(record)
+    assert projected.projected_revision == record.revision
+    assert (await store.async_get_range(TARGET, TARGET))[0] == projected
 
 
 @pytest.mark.asyncio

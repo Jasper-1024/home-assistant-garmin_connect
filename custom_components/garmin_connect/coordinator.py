@@ -9,7 +9,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from ha_garmin import GarminAuth, GarminClient
@@ -18,6 +18,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_CLIENT_ID,
@@ -236,7 +237,7 @@ class TrainingCoordinator(BaseGarminCoordinator):
 
     async def _async_fetch_supported_training_data(self) -> dict[str, Any]:
         """Avoid six known-empty endpoint families while preserving useful data."""
-        target_date = date.today()
+        target_date = dt_util.now().date()
         training_status = await self.client.get_training_status(target_date) or {}
         hrv_payload = await self.client._get_hrv_data_raw(target_date) or {}
         power_to_weight = await self.client.get_power_to_weight(target_date) or []

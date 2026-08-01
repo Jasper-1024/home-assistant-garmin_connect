@@ -479,17 +479,38 @@ def normalize_training_daily_records(
     """Split training status, VO2, and load balance by source identity."""
     root = _mapping(payload, "training payload")
     records: list[DailyStatusRecord] = []
-    try:
-        status_root = _mapping(root.get("mostRecentTrainingStatus"), "training status")
-        devices = _mapping(status_root.get("latestTrainingStatusData"), "training devices")
-    except HistorySchemaError:
+
+    def append_availability(record_key: str, presence: str) -> None:
         records.append(
             _with_record_key(
-                unavailable_daily_status("training", target_date, "failed"),
-                "training_status",
+                unavailable_daily_status("training", target_date, presence),
+                record_key,
             )
         )
-        devices = {}
+
+    status_name = "mostRecentTrainingStatus"
+    status_raw = root.get(status_name)
+    devices: Mapping[str, Any] = {}
+    if status_name not in root:
+        append_availability("training_status", "missing")
+    elif status_raw is None:
+        append_availability("training_status", "null")
+    elif not isinstance(status_raw, Mapping):
+        append_availability("training_status", "failed")
+    elif not status_raw:
+        append_availability("training_status", "empty")
+    else:
+        devices_raw = status_raw.get("latestTrainingStatusData")
+        if "latestTrainingStatusData" not in status_raw:
+            append_availability("training_status", "empty")
+        elif devices_raw is None:
+            append_availability("training_status", "null")
+        elif not isinstance(devices_raw, Mapping):
+            append_availability("training_status", "failed")
+        elif not devices_raw:
+            append_availability("training_status", "empty")
+        else:
+            devices = devices_raw
     for raw_id, item in devices.items():
         fallback_suffix = _device_suffix(str(raw_id))
         try:
@@ -507,30 +528,31 @@ def normalize_training_daily_records(
             record = unavailable_daily_status("training", target_date, "failed")
             suffix = fallback_suffix
         records.append(_with_record_key(record, f"training_status:{suffix}"))
-    try:
-        vo2 = _mapping(root.get("mostRecentVO2Max"), "training VO2")
-    except HistorySchemaError:
-        records.append(
-            _with_record_key(
-                unavailable_daily_status("training", target_date, "failed"),
-                "training_vo2",
-            )
-        )
-        vo2 = {}
+
+    vo2_name = "mostRecentVO2Max"
+    vo2_raw = root.get(vo2_name)
+    vo2: Mapping[str, Any] = {}
+    if vo2_name not in root:
+        append_availability("training_vo2", "missing")
+    elif vo2_raw is None:
+        append_availability("training_vo2", "null")
+    elif not isinstance(vo2_raw, Mapping):
+        append_availability("training_vo2", "failed")
+    elif not vo2_raw:
+        append_availability("training_vo2", "empty")
+    else:
+        vo2 = vo2_raw
+    vo2_source_count = 0
     for raw_key, item in vo2.items():
         if str(raw_key) in {"userId"}:
             continue
+        vo2_source_count += 1
         suffix = _stat_key(str(raw_key))
         if item is None:
-            records.append(
-                _with_record_key(
-                    unavailable_daily_status("training", target_date, "null"),
-                    f"training_vo2:{suffix}",
-                )
-            )
+            append_availability(f"training_vo2:{suffix}", "null")
             continue
         if not isinstance(item, Mapping):
-            # The VO2 envelope also contains account metadata such as userId.
+            append_availability(f"training_vo2:{suffix}", "failed")
             continue
         try:
             mapped = item
@@ -546,42 +568,49 @@ def normalize_training_daily_records(
             record, suffix, replace_existing_suffix=True
         )
         records.append(_with_record_key(record, f"training_vo2:{suffix}"))
-    raw_balance = root.get("mostRecentTrainingLoadBalance")
-    if raw_balance is not None:
-        try:
-            balance_root = _mapping(raw_balance, "training load balance")
-            balance_by_device = _mapping(
-                balance_root.get("metricsTrainingLoadBalanceDTOMap"),
-                "training load balance devices",
-            )
-        except HistorySchemaError:
-            records.append(
-                _with_record_key(
-                    unavailable_daily_status("training", target_date, "failed"),
-                    "training_load_balance",
+    if vo2 and vo2_source_count == 0:
+        append_availability("training_vo2", "empty")
+
+    balance_name = "mostRecentTrainingLoadBalance"
+    balance_raw = root.get(balance_name)
+    candidates: Mapping[str, Any] = {}
+    if balance_name not in root:
+        append_availability("training_load_balance", "missing")
+    elif balance_raw is None:
+        append_availability("training_load_balance", "null")
+    elif not isinstance(balance_raw, Mapping):
+        append_availability("training_load_balance", "failed")
+    elif not balance_raw:
+        append_availability("training_load_balance", "empty")
+    elif "metricsTrainingLoadBalanceDTOMap" in balance_raw:
+        balance_devices = balance_raw["metricsTrainingLoadBalanceDTOMap"]
+        if balance_devices is None:
+            append_availability("training_load_balance", "null")
+        elif not isinstance(balance_devices, Mapping):
+            append_availability("training_load_balance", "failed")
+        elif not balance_devices:
+            append_availability("training_load_balance", "empty")
+        else:
+            candidates = balance_devices
+    else:
+        candidates = {"generic": balance_raw}
+
+    for raw_id, item in candidates.items():
+        suffix = _device_suffix(str(raw_id)) if raw_id != "generic" else "generic"
+        if item is None:
+            record = unavailable_daily_status("training", target_date, "null")
+        else:
+            try:
+                record = normalize_training_daily_status(
+                    {"mostRecentTrainingLoadBalance": item}, target_date
                 )
-            )
-            balance_by_device = {}
-            balance_root = {}
-        candidates = balance_by_device or (
-            {"generic": balance_root} if balance_root else {}
+            except HistorySchemaError:
+                record = unavailable_daily_status("training", target_date, "failed")
+        record = _with_metric_suffix(record, suffix)
+        records.append(
+            _with_record_key(record, f"training_load_balance:{suffix}")
         )
-        for raw_id, item in candidates.items():
-            suffix = _device_suffix(str(raw_id)) if raw_id != "generic" else "generic"
-            if item is None:
-                record = unavailable_daily_status("training", target_date, "null")
-            else:
-                try:
-                    record = normalize_training_daily_status(
-                        {"mostRecentTrainingLoadBalance": item}, target_date
-                    )
-                except HistorySchemaError:
-                    record = unavailable_daily_status("training", target_date, "failed")
-            record = _with_metric_suffix(record, suffix)
-            records.append(
-                _with_record_key(record, f"training_load_balance:{suffix}")
-            )
-    return tuple(records) or (normalize_training_daily_status({}, target_date),)
+    return tuple(records)
 
 
 def normalize_sleep_daily_status(payload: Any, target_date: date) -> DailyStatusRecord:
@@ -1020,8 +1049,9 @@ class DailyStatusStore:
             dates[date_key] = parsed_families
         self._records[year_key] = dates
 
-    async def _async_save_year(self, year: str) -> None:
-        dates = self._records.get(year, {})
+    async def _async_save_year(
+        self, year: str, dates: Mapping[str, Mapping[str, DailyStatusRecord]]
+    ) -> None:
         await self._store(year).async_save({
             "schema_version": HISTORY_STORE_VERSION,
             "daily_status_schema_version": DAILY_STATUS_SCHEMA_VERSION,
@@ -1035,12 +1065,22 @@ class DailyStatusStore:
 
     async def async_upsert(self, records: Sequence[DailyStatusRecord]) -> tuple[DailyStatusRecord, ...]:
         changed_years: set[str] = set()
+        proposed_years: dict[
+            str, dict[str, dict[str, DailyStatusRecord]]
+        ] = {}
         retained: list[DailyStatusRecord] = []
         for incoming in records:
             year = str(incoming.calendar_date.year)
             await self.async_load_year(year)
+            dates = proposed_years.get(year)
+            if dates is None:
+                dates = {
+                    date_key: dict(families)
+                    for date_key, families in self._records[year].items()
+                }
+                proposed_years[year] = dates
             date_key = incoming.calendar_date.isoformat()
-            families = self._records[year].setdefault(date_key, {})
+            families = dates.setdefault(date_key, {})
             existing = families.get(incoming.record_key)
             if existing is not None and existing.presence == "present" and incoming.presence != "present":
                 retained.append(existing)
@@ -1051,8 +1091,10 @@ class DailyStatusStore:
             families[incoming.record_key] = incoming
             changed_years.add(year)
             retained.append(incoming)
-        for year in changed_years:
-            await self._async_save_year(year)
+        for year in sorted(changed_years):
+            proposed = proposed_years[year]
+            await self._async_save_year(year, proposed)
+            self._records[year] = proposed
         return tuple(retained)
 
     async def async_mark_projected(self, record: DailyStatusRecord) -> DailyStatusRecord:
@@ -1062,8 +1104,13 @@ class DailyStatusStore:
         if current is None or current.revision != record.revision:
             raise HistorySchemaError("daily status projection revision changed")
         projected = replace(current, projected_revision=current.revision)
-        self._records[year][record.calendar_date.isoformat()][record.record_key] = projected
-        await self._async_save_year(year)
+        proposed = {
+            date_key: dict(families)
+            for date_key, families in self._records[year].items()
+        }
+        proposed[record.calendar_date.isoformat()][record.record_key] = projected
+        await self._async_save_year(year, proposed)
+        self._records[year] = proposed
         return projected
 
     async def async_get_range(self, start: date, end: date) -> tuple[DailyStatusRecord, ...]:
