@@ -44,6 +44,15 @@ from .const import (
     HISTORY_STORE_VERSION,
     RECORDER_COMPATIBILITY_TARGET,
 )
+from .daily_status import (
+    DailyStatusRecord,
+    DailyStatusStore,
+    normalize_fitness_age_status,
+    normalize_hrv_status,
+    normalize_sleep_daily_status,
+    normalize_stress_daily_status,
+    normalize_training_daily_status,
+)
 from .fit_archive import (
     FitArchiveError,
     async_archive_fit,
@@ -1085,6 +1094,7 @@ class GarminHistoryArchive:
             else _noop_history_timer_factory
         )
         self._store: Any | None = None
+        self._daily_status_store: DailyStatusStore | None = None
         self._status_listeners: set[Callable[[], None]] = set()
         self._started = False
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -2360,6 +2370,111 @@ class GarminHistoryArchive:
             family_observation,
         )
 
+    async def _async_sync_daily_status(
+        self,
+        source: GarminHistorySource,
+        recorder: GarminHistoryRecorder,
+        target: date,
+        *,
+        include_training: bool,
+    ) -> tuple[int, int, int]:
+        """Checkpoint daily status first, then project pending revisions."""
+        status_store = self._daily_status_store
+        fetch = getattr(source, "async_fetch_daily_status_payload", None)
+        if status_store is None or not callable(fetch):
+            return 0, 0, 0
+
+        normalizers: tuple[tuple[str, Callable[[Any, date], DailyStatusRecord]], ...] = (
+            ("stress", normalize_stress_daily_status),
+            ("hrv", normalize_hrv_status),
+            ("sleep", normalize_sleep_daily_status),
+            ("fitness_age", normalize_fitness_age_status),
+            ("training", normalize_training_daily_status),
+        )
+        if not include_training:
+            normalizers = tuple(item for item in normalizers if item[0] != "training")
+
+        incoming: list[DailyStatusRecord] = []
+        for family, normalize in normalizers:
+            try:
+                payload = await fetch(target, family)
+                incoming.append(normalize(payload, target))
+            except asyncio.CancelledError:
+                raise
+            except (
+                GarminConnectError,
+                AttributeError,
+                ImportError,
+                OSError,
+                TypeError,
+                ValueError,
+                RuntimeError,
+            ) as error:
+                error_type = _safe_family_error_type(error)
+                if error_type in {"rate_limited", "reauth_required"}:
+                    raise _ArchivePolicyError(error_type) from error
+                _LOGGER.warning(
+                    "Garmin daily status family failed for %s (%s: %s)",
+                    target.isoformat(),
+                    family,
+                    error_type,
+                )
+
+        # A Store save is the durability boundary. Empty later responses cannot
+        # erase a valid record, and unprojected revisions survive HA restarts.
+        if incoming:
+            await status_store.async_upsert(incoming)
+        return await self._async_project_daily_status(recorder, target)
+
+    async def _async_project_daily_status(
+        self, recorder: GarminHistoryRecorder, target: date
+    ) -> tuple[int, int, int]:
+        """Retry unprojected Store revisions without another Garmin request."""
+        status_store = self._daily_status_store
+        if status_store is None:
+            return 0, 0, 0
+        records = await status_store.async_get_range(target, target)
+        inserted = updated = skipped = 0
+        for record in records:
+            if record.projected_revision == record.revision:
+                skipped += len(record.metrics)
+                continue
+            projection_succeeded = True
+            for metric, sample in record.samples():
+                statistic_id = statistic_id_for(self._account_key(), metric.key)
+                await self._async_prepare_numeric_source_dates(statistic_id, (sample,))
+                try:
+                    outcome = await recorder.async_write(
+                        statistic_id, metric.metadata, (sample,)
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except (
+                    AttributeError,
+                    ImportError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                    RuntimeError,
+                ):
+                    projection_succeeded = False
+                    _LOGGER.warning(
+                        "Garmin daily status projection failed for %s (%s)",
+                        target.isoformat(),
+                        record.family,
+                    )
+                    break
+                if outcome.outcome != "written":
+                    projection_succeeded = False
+                    break
+                await self._async_confirm_numeric_source_dates(statistic_id, (sample,))
+                inserted += getattr(outcome, "inserted_count", outcome.accepted_count)
+                updated += getattr(outcome, "updated_count", 0)
+                skipped += getattr(outcome, "skipped_count", 0)
+            if projection_succeeded:
+                await status_store.async_mark_projected(record)
+        return inserted, updated, skipped
+
     async def _async_sync_range(
         self,
         start_date: date,
@@ -2444,7 +2559,12 @@ class GarminHistoryArchive:
                 and target != force_date
                 and target not in force_dates
             ):
-                skipped += 1
+                daily_inserted, daily_updated, daily_skipped = (
+                    await self._async_project_daily_status(recorder, target)
+                )
+                inserted += daily_inserted
+                updated += daily_updated
+                skipped += 1 + daily_skipped
                 processed.append(target)
                 date_results.append(
                     (target, HistorySyncReport(outcome="written", skipped_count=1))
@@ -2827,6 +2947,17 @@ class GarminHistoryArchive:
                     checkpoint,
                     outcome="failed" if "sleep_stream" in failed_families else "written",
                 )
+                daily_inserted, daily_updated, daily_skipped = (
+                    await self._async_sync_daily_status(
+                        source,
+                        recorder,
+                        target,
+                        include_training=include_training_status,
+                    )
+                )
+                inserted += daily_inserted
+                updated += daily_updated
+                skipped += daily_skipped
                 self._remember_date_reconciliation_observation(target_key, family_observations)
                 if failed_families:
                     await self._async_persist_numeric_recovery_state(
@@ -4350,6 +4481,12 @@ class GarminHistoryArchive:
 
     async def _async_initialize_store(self, account_key: str) -> None:
         """Create and validate the per-account Store catalog."""
+        self._daily_status_store = DailyStatusStore(
+            self._hass,
+            self._entry.entry_id,
+            account_key,
+            self._store_factory,
+        )
         await self._async_open_store()
         assert self._store is not None
         catalog = await self._store.async_load()

@@ -76,6 +76,46 @@ class GarminConnectSensorEntityDescription(SensorEntityDescription):
     """Retain last known value when API returns None (weight, sleep at midnight, etc)."""
 
 
+def _training_status_attributes(data: dict[str, Any]) -> dict[str, Any]:
+    """Return bounded current-status attributes, not the complete API payload."""
+    devices = (
+        ((data.get("trainingStatus") or {}).get("mostRecentTrainingStatus") or {}).get(
+            "latestTrainingStatusData"
+        )
+        or {}
+    )
+    if not isinstance(devices, dict) or not devices:
+        return {}
+    latest = max(
+        (item for item in devices.values() if isinstance(item, dict)),
+        key=lambda item: item.get("calendarDate") or "",
+        default={},
+    )
+    acute = latest.get("acuteTrainingLoadDTO") or {}
+    return {
+        "calendar_date": latest.get("calendarDate"),
+        "status_code": latest.get("trainingStatus"),
+        "fitness_trend": latest.get("fitnessTrend"),
+        "feedback": latest.get("trainingStatusFeedbackPhrase"),
+        "acute_load": acute.get("dailyTrainingLoadAcute"),
+        "chronic_load": acute.get("dailyTrainingLoadChronic"),
+        "acwr": acute.get("dailyAcuteChronicWorkloadRatio"),
+    }
+
+
+def _hrv_status_attributes(data: dict[str, Any]) -> dict[str, Any]:
+    """Return the bounded HRV summary fields useful on the latest entity."""
+    summary = data.get("hrvStatus") or {}
+    baseline = summary.get("baseline") or {}
+    return {
+        "calendar_date": summary.get("calendarDate"),
+        "feedback": summary.get("feedbackPhrase"),
+        "baseline_balanced_low": baseline.get("balancedLow"),
+        "baseline_balanced_upper": baseline.get("balancedUpper"),
+        "baseline_marker": baseline.get("markerValue"),
+    }
+
+
 # The archive status is lifecycle metadata rather than Garmin data, but it
 # still uses the integration's description convention for stable entity keys.
 HISTORY_STATUS_SENSOR_DESCRIPTIONS: tuple[GarminConnectSensorEntityDescription, ...] = (
@@ -823,6 +863,7 @@ TRAINING_SENSORS: tuple[GarminConnectSensorEntityDescription, ...] = (
         translation_key="endurance_score",
         coordinator_type=CoordinatorType.TRAINING,
         state_class=SensorStateClass.MEASUREMENT,
+        entity_registry_enabled_default=False,
         value_fn=lambda data: (data.get("enduranceScore") or {}).get("overallScore"),
         attributes_fn=lambda data: {
             k: v for k, v in (data.get("enduranceScore") or {}).items() if k != "overallScore"
@@ -833,6 +874,7 @@ TRAINING_SENSORS: tuple[GarminConnectSensorEntityDescription, ...] = (
         translation_key="hill_score",
         coordinator_type=CoordinatorType.TRAINING,
         state_class=SensorStateClass.MEASUREMENT,
+        entity_registry_enabled_default=False,
         value_fn=lambda data: (data.get("hillScore") or {}).get("overallScore"),
         attributes_fn=lambda data: {
             k: v for k, v in (data.get("hillScore") or {}).items() if k != "overallScore"
@@ -843,6 +885,7 @@ TRAINING_SENSORS: tuple[GarminConnectSensorEntityDescription, ...] = (
         translation_key="training_readiness",
         coordinator_type=CoordinatorType.TRAINING,
         native_unit_of_measurement=PERCENTAGE,
+        entity_registry_enabled_default=False,
         value_fn=lambda data: (data.get("trainingReadiness") or {}).get("score"),
         attributes_fn=lambda data: data.get("trainingReadiness") or {},
     ),
@@ -855,6 +898,7 @@ TRAINING_SENSORS: tuple[GarminConnectSensorEntityDescription, ...] = (
         native_unit_of_measurement=UnitOfTime.MINUTES,
         suggested_unit_of_measurement=UnitOfTime.HOURS,
         suggested_display_precision=1,
+        entity_registry_enabled_default=False,
         value_fn=lambda data: (data.get("trainingReadiness") or {}).get("recoveryTime"),
         preserve_value=True,
     ),
@@ -863,13 +907,14 @@ TRAINING_SENSORS: tuple[GarminConnectSensorEntityDescription, ...] = (
         translation_key="training_status",
         coordinator_type=CoordinatorType.TRAINING,
         value_fn=lambda data: data.get("trainingStatusPhrase"),
-        attributes_fn=lambda data: data.get("trainingStatus") or {},
+        attributes_fn=_training_status_attributes,
     ),
     GarminConnectSensorEntityDescription(
         key="morningTrainingReadiness",
         translation_key="morning_training_readiness",
         coordinator_type=CoordinatorType.TRAINING,
         native_unit_of_measurement=PERCENTAGE,
+        entity_registry_enabled_default=False,
         value_fn=lambda data: (data.get("morningTrainingReadiness") or {}).get("score"),
         attributes_fn=lambda data: {
             "level": (data.get("morningTrainingReadiness") or {}).get("level"),
@@ -884,6 +929,7 @@ TRAINING_SENSORS: tuple[GarminConnectSensorEntityDescription, ...] = (
         translation_key="lactate_threshold_hr",
         coordinator_type=CoordinatorType.TRAINING,
         native_unit_of_measurement="bpm",
+        entity_registry_enabled_default=False,
         # Garmin API returns "hearRate" (typo), ha_garmin merges the list into a flat dict
         value_fn=lambda data: (data.get("lactateThreshold") or {}).get("hearRate"),
         attributes_fn=lambda data: data.get("lactateThreshold") or {},
@@ -894,6 +940,7 @@ TRAINING_SENSORS: tuple[GarminConnectSensorEntityDescription, ...] = (
         translation_key="lactate_threshold_speed",
         coordinator_type=CoordinatorType.TRAINING,
         native_unit_of_measurement="m/s",
+        entity_registry_enabled_default=False,
         value_fn=lambda data: (data.get("lactateThreshold") or {}).get("speed"),
         attributes_fn=lambda data: data.get("lactateThreshold") or {},
         preserve_value=True,
@@ -903,16 +950,13 @@ TRAINING_SENSORS: tuple[GarminConnectSensorEntityDescription, ...] = (
         key="hrvStatusText",
         translation_key="hrv_status",
         coordinator_type=CoordinatorType.TRAINING,
-        attributes_fn=lambda data: {
-            k: v for k, v in (data.get("hrvStatus") or {}).items() if k != "status"
-        },
+        attributes_fn=_hrv_status_attributes,
         preserve_value=True,
     ),
     GarminConnectSensorEntityDescription(
         key="hrvWeeklyAvg",
         translation_key="hrv_weekly_avg",
         coordinator_type=CoordinatorType.TRAINING,
-        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement="ms",
         preserve_value=True,
     ),
@@ -920,7 +964,6 @@ TRAINING_SENSORS: tuple[GarminConnectSensorEntityDescription, ...] = (
         key="hrvLastNightAvg",
         translation_key="hrv_last_night_avg",
         coordinator_type=CoordinatorType.TRAINING,
-        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement="ms",
         preserve_value=True,
     ),
@@ -928,7 +971,6 @@ TRAINING_SENSORS: tuple[GarminConnectSensorEntityDescription, ...] = (
         key="hrvLastNight5MinHigh",
         translation_key="hrv_last_night_5min_high",
         coordinator_type=CoordinatorType.TRAINING,
-        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement="ms",
         preserve_value=True,
     ),
@@ -936,8 +978,8 @@ TRAINING_SENSORS: tuple[GarminConnectSensorEntityDescription, ...] = (
         key="hrvBaselineLowUpper",
         translation_key="hrv_baseline",
         coordinator_type=CoordinatorType.TRAINING,
-        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement="ms",
+        entity_registry_enabled_default=False,
         attributes_fn=lambda data: (data.get("hrvStatus") or {}).get("baseline") or {},
         preserve_value=True,
     ),
@@ -945,7 +987,6 @@ TRAINING_SENSORS: tuple[GarminConnectSensorEntityDescription, ...] = (
         key="vo2Max",
         translation_key="vo2_max",
         coordinator_type=CoordinatorType.TRAINING,
-        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement="mL/(kg·min)",
         value_fn=lambda data: data.get("vo2MaxValue"),
         preserve_value=True,
@@ -1060,7 +1101,6 @@ FITNESS_AGE_SENSORS: tuple[GarminConnectSensorEntityDescription, ...] = (
         key="chronologicalAge",
         translation_key="chronological_age",
         coordinator_type=CoordinatorType.BODY,
-        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfTime.YEARS,
         suggested_display_precision=0,
     ),
@@ -1068,7 +1108,6 @@ FITNESS_AGE_SENSORS: tuple[GarminConnectSensorEntityDescription, ...] = (
         key="fitnessAge",
         translation_key="fitness_age",
         coordinator_type=CoordinatorType.BODY,
-        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfTime.YEARS,
         suggested_display_precision=1,
     ),
@@ -1076,7 +1115,6 @@ FITNESS_AGE_SENSORS: tuple[GarminConnectSensorEntityDescription, ...] = (
         key="achievableFitnessAge",
         translation_key="achievable_fitness_age",
         coordinator_type=CoordinatorType.BODY,
-        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfTime.YEARS,
         suggested_display_precision=1,
     ),
@@ -1084,7 +1122,6 @@ FITNESS_AGE_SENSORS: tuple[GarminConnectSensorEntityDescription, ...] = (
         key="previousFitnessAge",
         translation_key="previous_fitness_age",
         coordinator_type=CoordinatorType.BODY,
-        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfTime.YEARS,
         suggested_display_precision=1,
     ),

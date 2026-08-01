@@ -9,7 +9,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from ha_garmin import GarminAuth, GarminClient
@@ -225,14 +225,75 @@ class TrainingCoordinator(BaseGarminCoordinator):
         )
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch training data from Garmin Connect."""
+        """Fetch only status, HRV, and power data supported by this integration."""
         try:
-            data = await self._async_fetch(self.client.fetch_training_data)
+            data = await self._async_fetch(self._async_fetch_supported_training_data)
         except GarminAuthError as err:
             raise ConfigEntryAuthFailed("Authentication failed") from err
         except Exception as err:
             raise UpdateFailed(f"Error fetching training data: {err}") from err
         return data
+
+    async def _async_fetch_supported_training_data(self) -> dict[str, Any]:
+        """Avoid six known-empty endpoint families while preserving useful data."""
+        target_date = date.today()
+        training_status = await self.client.get_training_status(target_date) or {}
+        hrv_payload = await self.client._get_hrv_data_raw(target_date) or {}
+        power_to_weight = await self.client.get_power_to_weight(target_date) or []
+
+        hrv_status = hrv_payload.get("hrvSummary") or {}
+        latest_status = (
+            (training_status.get("mostRecentTrainingStatus") or {}).get(
+                "latestTrainingStatusData"
+            )
+            or {}
+        )
+        most_recent = (
+            max(
+                latest_status.values(),
+                key=lambda item: item.get("calendarDate") or "",
+            )
+            if latest_status
+            else {}
+        )
+        status_phrases = {
+            0: "No Status",
+            1: "Peaking",
+            2: "Maintaining",
+            3: "Recovering",
+            4: "Unproductive",
+            5: "Detraining",
+            6: "Peaking",
+            7: "Productive",
+            8: "Strained",
+        }
+        status_code = most_recent.get("trainingStatus")
+        vo2_container = training_status.get("mostRecentVO2Max") or {}
+        vo2_generic = (
+            vo2_container.get("generic") or {}
+            if isinstance(vo2_container, dict)
+            else {}
+        )
+        baseline = hrv_status.get("baseline") or {}
+        return {
+            "trainingStatus": training_status,
+            "trainingStatusPhrase": (
+                status_phrases.get(status_code)
+                if isinstance(status_code, int) and not isinstance(status_code, bool)
+                else None
+            ),
+            "hrvStatus": hrv_status,
+            "hrvStatusText": (hrv_status.get("status") or "unknown").capitalize(),
+            "hrvWeeklyAvg": hrv_status.get("weeklyAvg"),
+            "hrvLastNightAvg": hrv_status.get("lastNightAvg"),
+            "hrvLastNight5MinHigh": hrv_status.get("lastNight5MinHigh"),
+            "hrvBaselineLowUpper": baseline.get("lowUpper"),
+            "hrvBaselineBalancedLow": baseline.get("balancedLow"),
+            "hrvBaselineBalancedUpper": baseline.get("balancedUpper"),
+            "vo2MaxValue": vo2_generic.get("vo2MaxValue"),
+            "vo2MaxPreciseValue": vo2_generic.get("vo2MaxPreciseValue"),
+            "powerToWeight": power_to_weight,
+        }
 
 
 class BodyCoordinator(BaseGarminCoordinator):

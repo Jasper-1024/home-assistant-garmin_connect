@@ -96,7 +96,7 @@ made new data available. Nine independent coordinators fetch data in parallel:
 |-------------|------|
 | Core | Steps, distance, calories, heart rate, stress, sleep, body battery, SpO2, respiration, intensity |
 | Activity | Last activity, recent activities, workouts |
-| Training | Training readiness/status, HRV, lactate threshold, endurance/hill scores, power-to-weight and FTP by sport |
+| Training | Training status, HRV, VO2 max, power-to-weight and FTP by sport |
 | Body | Weight, BMI, body fat, muscle mass, hydration, fitness age |
 | Goals | Active/future goals, goal history, badges, user points |
 | Gear | Shoes, bikes, equipment usage and distance |
@@ -106,7 +106,7 @@ made new data available. Nine independent coordinators fetch data in parallel:
 
 > **Tip:** Garmin devices sync to Garmin Connect when in Bluetooth range of the paired phone or via WiFi. Sensors update after your device syncs to Garmin Connect **and** the integration polls for new data.
 
-## Prospective Archive (3.1.0-beta.12)
+## Prospective Archive (3.1.0-beta.13)
 
 The Prospective Archive is **off by default**. It records eligible data only
 after you explicitly enable **Prospective Archive** in the Garmin config-entry
@@ -126,7 +126,7 @@ retained; this integration provides no archive-deletion action and no automatic
 expiry policy. There is no built-in retention period: the records remain until
 an administrator manages the storage outside this integration. Disabling,
 reloading, upgrading, or rolling back does not remove those records. See the
-[3.1.0-beta.12 release guide](docs/release-3.1.0-beta.12.md) for the current-data
+[3.1.0-beta.13 release guide](docs/release-3.1.0-beta.13.md) for the current-data
 cadence, retention planning, downgrade, and re-authentication safety guidance.
 
 ### Raw HTTP capture and offline replay

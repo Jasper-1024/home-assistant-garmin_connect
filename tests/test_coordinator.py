@@ -214,3 +214,65 @@ async def test_fetch_errors_keep_update_failed_semantics() -> None:
 
     with pytest.raises(UpdateFailed, match="network down"):
         await coordinator._async_update_data()
+
+
+async def test_training_coordinator_only_calls_supported_endpoint_families() -> None:
+    """Known-empty readiness, score, recovery, and lactate calls stay dormant."""
+    hass, entry, client, auth = _inputs()
+    client.get_training_status = AsyncMock(
+        return_value={
+            "mostRecentTrainingStatus": {
+                "latestTrainingStatusData": {
+                    "watch": {"calendarDate": "2026-08-01", "trainingStatus": 7}
+                }
+            },
+            "mostRecentVO2Max": {"generic": {"vo2MaxValue": 48}},
+        }
+    )
+    client._get_hrv_data_raw = AsyncMock(
+        return_value={
+            "hrvSummary": {
+                "status": "BALANCED",
+                "weeklyAvg": 43,
+                "baseline": {"lowUpper": 31},
+            }
+        }
+    )
+    client.get_power_to_weight = AsyncMock(
+        return_value=[
+            {
+                "sport": "cycling",
+                "powerToWeight": 2.94,
+                "functionalThresholdPower": 208,
+            }
+        ]
+    )
+    client.fetch_training_data = AsyncMock()
+    client.get_training_readiness = AsyncMock()
+    client.get_morning_training_readiness = AsyncMock()
+    client.get_lactate_threshold = AsyncMock()
+    client.get_endurance_score = AsyncMock()
+    client.get_hill_score = AsyncMock()
+    coordinator = TrainingCoordinator(
+        hass, entry, client, auth, GarminRequestGate()
+    )
+
+    result = await coordinator._async_update_data()
+
+    assert result["trainingStatusPhrase"] == "Productive"
+    assert result["hrvWeeklyAvg"] == 43
+    assert result["vo2MaxValue"] == 48
+    assert result["powerToWeight"][0]["functionalThresholdPower"] == 208
+    client.get_training_status.assert_awaited_once()
+    client._get_hrv_data_raw.assert_awaited_once()
+    client.get_power_to_weight.assert_awaited_once()
+    for unsupported in (
+        client.fetch_training_data,
+        client.get_training_readiness,
+        client.get_morning_training_readiness,
+        client.get_lactate_threshold,
+        client.get_endurance_score,
+        client.get_hill_score,
+    ):
+        unsupported.assert_not_awaited()
+    await coordinator.request_gate.async_close()

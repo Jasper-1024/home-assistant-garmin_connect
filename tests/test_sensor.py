@@ -78,6 +78,35 @@ def test_coordinator_type_on_non_core_sensor_groups() -> None:
         assert desc.coordinator_type == CoordinatorType.GEAR
     for desc in BLOOD_PRESSURE_SENSORS:
         assert desc.coordinator_type == CoordinatorType.BLOOD_PRESSURE
+
+
+def test_known_unsupported_training_entities_are_default_disabled() -> None:
+    disabled = {
+        "enduranceScore",
+        "hillScore",
+        "trainingReadiness",
+        "morningTrainingReadiness",
+        "recoveryTime",
+        "lactateThresholdHeartRate",
+        "lactateThresholdSpeed",
+        "hrvBaselineLowUpper",
+    }
+    descriptions = {item.key: item for item in TRAINING_SENSORS}
+    assert all(
+        not descriptions[key].entity_registry_enabled_default for key in disabled
+    )
+
+
+def test_daily_status_snapshot_entities_do_not_claim_sync_time_statistics() -> None:
+    snapshot_keys = {
+        "hrvWeeklyAvg",
+        "hrvLastNightAvg",
+        "hrvLastNight5MinHigh",
+        "hrvBaselineLowUpper",
+        "vo2Max",
+    }
+    descriptions = {item.key: item for item in TRAINING_SENSORS}
+    assert all(descriptions[key].state_class is None for key in snapshot_keys)
     for desc in MENSTRUAL_CYCLE_SENSORS:
         assert desc.coordinator_type == CoordinatorType.MENSTRUAL
     for desc in NUTRITION_SENSORS:

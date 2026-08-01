@@ -1484,11 +1484,23 @@ class GarminHistorySource:
         async def request() -> Any:
             base = self.client._base_url
             if metric == "daily_summary":
-                return await self.client._get_user_summary_raw(target_date)
+                return await self._async_cached_payload(
+                    target_date,
+                    "daily_summary",
+                    lambda: self.client._get_user_summary_raw(target_date),
+                )
             if metric == "training_status":
-                return await self.client.get_training_status(target_date)
+                return await self._async_cached_payload(
+                    target_date,
+                    "training_status",
+                    lambda: self.client.get_training_status(target_date),
+                )
             if metric == "sleep_sessions":
-                return await self.client._get_sleep_data_raw(target_date)
+                return await self._async_cached_payload(
+                    target_date,
+                    "sleep",
+                    lambda: self.client._get_sleep_data_raw(target_date),
+                )
             if metric == "timed_activities":
                 pages: list[Any] = []
                 for offset in range(0, 500, 100):
@@ -1572,7 +1584,11 @@ class GarminHistorySource:
                 )
                 return primary, events
             if metric == "nightly_hrv":
-                return await self.client._get_hrv_data_raw(target_date)
+                return await self._async_cached_payload(
+                    target_date,
+                    "hrv",
+                    lambda: self.client._get_hrv_data_raw(target_date),
+                )
             if metric == "steps":
                 profile = await self.client.get_user_profile()
                 return await self.client._request("GET", f"{base}/wellness-service/wellness/dailySummaryChart/{profile.display_name}", params={"date": target_date.isoformat()})
@@ -1669,6 +1685,36 @@ class GarminHistorySource:
             _normalize_body_battery_event_series(
                 event_payload, target_date, "stress"
             ),
+        )
+
+    async def async_fetch_daily_status_payload(
+        self, target_date: date, family: str
+    ) -> Any:
+        """Fetch one status payload while sharing this sync's endpoint cache."""
+        requests: dict[str, Callable[[], Awaitable[Any]]] = {
+            "stress": lambda: self.client._get_user_summary_raw(target_date),
+            "training": lambda: self.client.get_training_status(target_date),
+            "sleep": lambda: self.client._get_sleep_data_raw(target_date),
+            "hrv": lambda: self.client._get_hrv_data_raw(target_date),
+            "fitness_age": lambda: self.client.get_fitness_age(target_date),
+        }
+        cache_keys = {
+            "stress": "daily_summary",
+            "training": "training_status",
+            "sleep": "sleep",
+            "hrv": "hrv",
+            "fitness_age": "fitness_age",
+        }
+        if family not in requests:
+            raise ValueError(f"unsupported daily status family: {family}")
+
+        async def request() -> Any:
+            return await self._async_cached_payload(
+                target_date, cache_keys[family], requests[family]
+            )
+
+        return await self.request_gate.async_request(
+            GarminRequestPriority.BACKGROUND, request
         )
 
 

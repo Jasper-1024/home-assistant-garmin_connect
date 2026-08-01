@@ -1408,6 +1408,36 @@ async def test_daily_summary_uses_raw_client_method_without_profile() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("metric", "family", "method", "payload"),
+    (
+        ("daily_summary", "stress", "_get_user_summary_raw", {}),
+        ("training_status", "training", "get_training_status", {}),
+        ("nightly_hrv", "hrv", "_get_hrv_data_raw", {}),
+        (
+            "sleep_sessions",
+            "sleep",
+            "_get_sleep_data_raw",
+            {"dailySleepDTO": None},
+        ),
+    ),
+)
+async def test_daily_status_reuses_shared_endpoint_payload(
+    metric: str, family: str, method: str, payload: dict
+) -> None:
+    client = MagicMock()
+    request = AsyncMock(return_value=payload)
+    setattr(client, method, request)
+    source = GarminHistorySource(client, _ImmediateGate())
+    target = date(2026, 7, 24)
+
+    await source.async_fetch_details(target, metric)
+    assert await source.async_fetch_daily_status_payload(target, family) is payload
+
+    request.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_current_body_battery_event_enriches_numeric_series_and_event() -> None:
     """One live-shaped event response feeds both statistics and Calendar data."""
     target = date(2026, 8, 1)
