@@ -52,6 +52,7 @@ from .daily_status import (
     normalize_sleep_daily_status,
     normalize_stress_daily_status,
     normalize_training_daily_status,
+    unavailable_daily_status,
 )
 from .fit_archive import (
     FitArchiveError,
@@ -2380,8 +2381,11 @@ class GarminHistoryArchive:
     ) -> tuple[int, int, int]:
         """Checkpoint daily status first, then project pending revisions."""
         status_store = self._daily_status_store
+        descriptor = inspect.getattr_static(
+            source, "async_fetch_daily_status_payload", None
+        )
         fetch = getattr(source, "async_fetch_daily_status_payload", None)
-        if status_store is None or not callable(fetch):
+        if status_store is None or descriptor is None or not callable(fetch):
             return 0, 0, 0
 
         normalizers: tuple[tuple[str, Callable[[Any, date], DailyStatusRecord]], ...] = (
@@ -2419,12 +2423,21 @@ class GarminHistoryArchive:
                     family,
                     error_type,
                 )
+                incoming.append(
+                    unavailable_daily_status(family, target, "failed")
+                )
 
         # A Store save is the durability boundary. Empty later responses cannot
         # erase a valid record, and unprojected revisions survive HA restarts.
-        if incoming:
-            await status_store.async_upsert(incoming)
-        return await self._async_project_daily_status(recorder, target)
+        retained = await status_store.async_upsert(incoming) if incoming else ()
+        totals = [0, 0, 0]
+        for source_date in sorted(
+            {target, *(record.calendar_date for record in retained)}
+        ):
+            outcome = await self._async_project_daily_status(recorder, source_date)
+            for index, count in enumerate(outcome):
+                totals[index] += count
+        return totals[0], totals[1], totals[2]
 
     async def _async_project_daily_status(
         self, recorder: GarminHistoryRecorder, target: date

@@ -144,8 +144,13 @@ def _hass() -> MagicMock:
 
 
 def _store_factory(store: FakeStore):
+    stores: dict[str, FakeStore] = {}
+
     def factory(*args, **kwargs) -> FakeStore:
-        return store
+        key = args[2]
+        if str(key).endswith(".history_catalog"):
+            return store
+        return stores.setdefault(str(key), FakeStore())
 
     return factory
 

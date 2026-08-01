@@ -32,8 +32,10 @@ library is the existing Garmin API dependency.
 
 Each data domain has its own `DataUpdateCoordinator` subclass in
 `custom_components/garmin_connect/coordinator.py`. All coordinators share the
-same `GarminClient` and `GarminAuth` instances, and each calls one
-`client.fetch_*_data()` method per poll:
+same `GarminClient` and `GarminAuth` instances. Most call one
+`client.fetch_*_data()` method per poll; Training deliberately calls only the
+three supported status, HRV, and power endpoints so known-empty device
+families are not polled:
 
 | Coordinator | Data |
 | --- | --- |

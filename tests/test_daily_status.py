@@ -1,6 +1,7 @@
 """Tests for bounded Garmin daily status records."""
 
 from datetime import UTC, date, datetime
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -13,7 +14,10 @@ from custom_components.garmin_connect.daily_status import (
     normalize_sleep_daily_status,
     normalize_stress_daily_status,
     normalize_training_daily_status,
+    unavailable_daily_status,
 )
+from custom_components.garmin_connect.history import GarminHistoryArchive
+from custom_components.garmin_connect.history_recorder import RecorderWriteOutcome
 from custom_components.garmin_connect.history_source import HistorySchemaError
 
 TARGET = date(2026, 7, 31)
@@ -109,7 +113,7 @@ def test_sleep_fitness_and_stress_normalization():
         },
         TARGET,
     )
-    assert metric_values(fitness)["fitness_age_fitnessAge"] == 31.5
+    assert metric_values(fitness)["fitness_age_fitness_age"] == 31.5
     stress = normalize_stress_daily_status(
         {
             "averageStressLevel": 28,
@@ -118,13 +122,24 @@ def test_sleep_fitness_and_stress_normalization():
         },
         TARGET,
     )
-    assert metric_values(stress)["stress_highStressDuration_minutes"] == 10
-    assert stress.source_timestamp == datetime(2026, 7, 30, 16, tzinfo=UTC)
+    assert metric_values(stress)["stress_high_stress_duration_minutes"] == 10
+    assert stress.source_timestamp is None
+    assert stress.statistic_timestamp == datetime(2026, 7, 30, 16, tzinfo=UTC)
 
 
 def test_invalid_known_numeric_field_is_rejected():
     with pytest.raises(HistorySchemaError):
         normalize_hrv_status({"hrvSummary": {"weeklyAvg": "45"}}, TARGET)
+
+
+def test_source_calendar_date_and_absence_semantics_round_trip():
+    record = normalize_hrv_status(
+        {"hrvSummary": {"calendarDate": "2026-07-30", "weeklyAvg": 45}},
+        TARGET,
+    )
+    assert record.calendar_date == date(2026, 7, 30)
+    failed = unavailable_daily_status("hrv", TARGET, "failed")
+    assert daily_status_from_record(daily_status_record(failed)).presence == "failed"
 
 
 @pytest.mark.asyncio
@@ -156,3 +171,49 @@ async def test_projection_checkpoint_is_persisted_and_account_scoped():
     wrong_account = DailyStatusStore(object(), "entry", "other-account", MemoryStore)
     with pytest.raises(HistorySchemaError):
         await wrong_account.async_get_range(TARGET, TARGET)
+
+
+@pytest.mark.asyncio
+async def test_archive_retries_store_projection_without_refetching_garmin():
+    entry = MagicMock()
+    entry.entry_id = "entry"
+    archive = GarminHistoryArchive(MagicMock(), entry, store_factory=MemoryStore)
+    archive._account_key_value = "account-key-long-enough-123"
+    archive._daily_status_store = DailyStatusStore(
+        object(), "entry", archive._account_key_value, MemoryStore
+    )
+    archive._async_prepare_numeric_source_dates = AsyncMock()
+    archive._async_confirm_numeric_source_dates = AsyncMock()
+
+    source = MagicMock()
+
+    async def fetch(_target, family):
+        if family == "hrv":
+            return {"hrvSummary": {"weeklyAvg": 45}}
+        return {}
+
+    source.async_fetch_daily_status_payload = AsyncMock(side_effect=fetch)
+    failed_recorder = MagicMock()
+    failed_recorder.async_write = AsyncMock(
+        return_value=RecorderWriteOutcome(outcome="failed")
+    )
+
+    await archive._async_sync_daily_status(
+        source, failed_recorder, TARGET, include_training=True
+    )
+    persisted = await archive._daily_status_store.async_get_range(TARGET, TARGET)
+    hrv = next(item for item in persisted if item.family == "hrv")
+    assert hrv.projected_revision is None
+
+    successful_recorder = MagicMock()
+    successful_recorder.async_write = AsyncMock(
+        return_value=RecorderWriteOutcome(
+            accepted_count=1, inserted_count=1, outcome="written"
+        )
+    )
+    result = await archive._async_project_daily_status(successful_recorder, TARGET)
+
+    assert result == (1, 0, 0)
+    assert source.async_fetch_daily_status_payload.await_count == 5
+    projected = await archive._daily_status_store.async_get_range(TARGET, TARGET)
+    assert all(item.projected_revision == item.revision for item in projected)

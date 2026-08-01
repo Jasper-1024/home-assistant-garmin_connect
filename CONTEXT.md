@@ -61,10 +61,10 @@ conservative degradation is the UTC date of the aware Source Instant.
 _Avoid_: Display date, target date stamped onto an unscoped feed
 
 **Canonical Date-Summary Bucket Instant**:
-The deterministic instant assigned only to a daily summary or training-status
-record that supplies a calendar date but no aware Garmin timestamp: 00:00 at
-UTC+08:00, normalized to UTC for Recorder identity. It is not a Source Instant;
-the Source Calendar Date remains separate provenance.
+The deterministic instant assigned to a date-scoped daily summary or daily
+status Source Record that supplies a Source Calendar Date but no aware Garmin
+timestamp: 00:00 at UTC+08:00, normalized to UTC for Recorder identity. It is
+not a Source Instant; the Source Calendar Date remains separate provenance.
 _Avoid_: Garmin-provided timestamp, inferred intraday measurement
 
 **Display Time**:
