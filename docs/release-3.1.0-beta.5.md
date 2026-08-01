@@ -2,7 +2,7 @@
 
 > **Historical release record.** This document describes `3.1.0-beta.5` and is
 > not current installation guidance. Use the
-> [3.1.0-beta.14 release guide](release-3.1.0-beta.14.md) for the current beta.
+> [documentation index](README.md) to find the current release guide.
 
 This release repairs Garmin response shapes captured from a live Home Assistant
 instance without requesting more Garmin data. History import now accepts the

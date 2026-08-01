@@ -154,7 +154,8 @@ Prospective Archive is **off by default**. Enabling it creates an activation
 date, performs one bounded current-day sync, and then runs nominally every 15
 minutes. Archive work uses background priority and does not block current-value
 coordinators or Home Assistant startup. A failed archive run is reported by the
-Archive Status entity and retried/backed off without deleting current values.
+`History status` entity (the Archive Status contract) and retried/backed off
+without deleting current values.
 
 Archive behavior:
 

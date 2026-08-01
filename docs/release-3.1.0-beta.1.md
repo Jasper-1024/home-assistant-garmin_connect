@@ -2,7 +2,7 @@
 
 > **Historical release record.** This document describes `3.1.0-beta.1` and is
 > not current installation guidance. Use the
-> [3.1.0-beta.14 release guide](release-3.1.0-beta.14.md) for the current beta.
+> [documentation index](README.md) to find the current release guide.
 
 Minimum Home Assistant Core version: **2026.7.4**. Newer patch and minor
 releases are accepted only after the Recorder capability contract passes; an

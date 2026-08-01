@@ -264,19 +264,15 @@ def test_key_current_document_local_markdown_links_resolve() -> None:
 
 def test_readme_active_training_polling_excludes_non_polled_capabilities() -> None:
     readme = (ROOT / "README.md").read_text()
-    training_polling_rows = re.findall(
-        r"(?im)^\|\s*Training\s*\|(?P<capabilities>[^|]+)\|\s*$",
+    data_updates = re.search(
+        r"(?ms)^## Data updates\s*$\n(?P<body>.*?)(?=^## |\Z)",
         readme,
     )
-    training_summary_rows = re.findall(
-        r"(?im)^-\s*\*\*Training metrics\*\*\s*[—:-]+\s*(?P<capabilities>.+)$",
-        readme,
-    )
-    active_training_descriptions = (*training_polling_rows, *training_summary_rows)
 
-    assert training_polling_rows, "README must document the active Training polling row"
-    for description in active_training_descriptions:
-        assert NON_POLLED_TRAINING_CAPABILITIES.search(description) is None, description
+    assert data_updates is not None, "README must contain a Data updates section"
+    active_polling = data_updates["body"]
+    assert re.search(r"(?i)\btraining\b", active_polling)
+    assert NON_POLLED_TRAINING_CAPABILITIES.search(active_polling) is None
 
 
 def test_executable_release_gate_matrix_covers_the_archive_contract() -> None:

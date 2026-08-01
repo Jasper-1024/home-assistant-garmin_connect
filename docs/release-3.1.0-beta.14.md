@@ -29,8 +29,9 @@ unchanged.
 
 Upgrade to `3.1.0-beta.14`, then restart Home Assistant from its control panel.
 Enable Prospective Archive if it is not already enabled. After Garmin has
-synced and one archive cycle has completed, verify that Archive Status returns
-to `idle`, supported current entities retain values, and Recorder statistics
+synced and one archive cycle has completed, verify that the `History status`
+entity (the Archive Status contract) returns to `idle`, supported current
+entities retain values, and Recorder statistics
 whose IDs begin with `garmin_connect:` contain Source Calendar Date HRV, sleep,
 stress, fitness-age, and training points.
 

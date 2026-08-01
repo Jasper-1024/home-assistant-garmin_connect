@@ -2,7 +2,7 @@
 
 > **Historical release record.** This document describes `3.1.0-beta.11` and is
 > not current installation guidance. Use the
-> [3.1.0-beta.14 release guide](release-3.1.0-beta.14.md) for the current beta.
+> [documentation index](README.md) to find the current release guide.
 
 This release prevents optional Garmin archive initialization from delaying
 Home Assistant startup. The archive must wait until Home Assistant has started
