@@ -256,6 +256,13 @@ def test_nullable_status_fields_remain_distinct_from_missing():
     )
     assert fitness.field_presence["physiqueRating"] == "null"
     assert metric_values(fitness)["fitness_age_visceral_fat"] == 7
+    assert fitness.field_presence["components.rhr.stale"] == "missing"
+    null_need = normalize_sleep_daily_records(
+        {"dailySleepDTO": {"sleepNeed": None}}, TARGET
+    )
+    assert any(record.presence == "null" for record in null_need)
+    null_stale = normalize_fitness_age_status({"rhr": {"stale": None}}, TARGET)
+    assert null_stale.field_presence["components.rhr.stale"] == "null"
 
 
 @pytest.mark.asyncio

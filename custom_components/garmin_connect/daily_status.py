@@ -18,7 +18,9 @@ from .history_source import HistorySchemaError, NormalizedSample
 DAILY_STATUS_SCHEMA_VERSION = 1
 _DAY_TIME_ZONE = timezone(timedelta(hours=8))
 _FAMILIES = frozenset({"hrv", "training", "sleep", "fitness_age", "stress"})
-_PRESENCE = frozenset({"present", "empty", "missing", "unsupported", "failed"})
+_PRESENCE = frozenset(
+    {"present", "empty", "null", "missing", "unsupported", "failed"}
+)
 
 
 def _stat_key(value: str) -> str:
@@ -606,8 +608,19 @@ def normalize_sleep_daily_records(
         summary = unavailable_daily_status("sleep", target_date, "failed")
     records = [_with_record_key(summary, "sleep_summary")]
     for need_name in ("sleepNeed", "nextSleepNeed"):
-        raw_need = daily.get(need_name, root.get(need_name))
+        if need_name in daily:
+            raw_need = daily[need_name]
+        elif need_name in root:
+            raw_need = root[need_name]
+        else:
+            continue
         if raw_need is None:
+            records.append(
+                _with_record_key(
+                    unavailable_daily_status("sleep", target_date, "null"),
+                    f"sleep_{_stat_key(need_name)}",
+                )
+            )
             continue
         try:
             need = _mapping(raw_need, need_name)
@@ -662,11 +675,18 @@ def normalize_fitness_age_status(payload: Any, target_date: date) -> DailyStatus
             _metric(metrics, f"fitness_age_{_stat_key(component)}_{_stat_key(source)}", f"Fitness age {component} {source}", "unitless", value)
         for source in ("date",):
             _field(data, source, normalized, presence, text_value=True, presence_name=f"components.{component}.{source}")
-        if "stale" in data:
+        stale_key = f"components.{component}.stale"
+        if "stale" not in data:
+            presence[stale_key] = "missing"
+        else:
             stale = data["stale"]
-            if not isinstance(stale, bool):
+            if stale is None:
+                presence[stale_key] = "null"
+            elif not isinstance(stale, bool):
                 raise HistorySchemaError("fitness age stale has an invalid type")
-            normalized["stale"] = stale
+            else:
+                normalized["stale"] = stale
+                presence[stale_key] = "present"
         if normalized:
             components[component] = normalized
     if components:
