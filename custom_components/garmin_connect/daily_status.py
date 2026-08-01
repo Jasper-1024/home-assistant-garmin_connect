@@ -83,8 +83,11 @@ def _aware_timestamp(raw: Any = None) -> datetime | None:
             parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         except ValueError:
             parsed = None
-        if parsed is not None and parsed.tzinfo is not None:
-            return parsed.astimezone(UTC)
+        if parsed is not None:
+            if parsed.tzinfo is not None:
+                return parsed.astimezone(UTC)
+            if "T" in raw:
+                return parsed.replace(tzinfo=UTC)
     if isinstance(raw, int | float) and not isinstance(raw, bool):
         seconds = float(raw) / (1000 if abs(float(raw)) >= 100_000_000_000 else 1)
         try:
@@ -318,9 +321,15 @@ def normalize_training_daily_status(payload: Any, target_date: date) -> DailySta
                 device_values["mappedTrainingStatus"] = mapped
         if "trainingPaused" in item:
             paused = item["trainingPaused"]
-            if not isinstance(paused, bool):
+            if paused is None:
+                presence[f"devices.{suffix}.trainingPaused"] = "null"
+            elif not isinstance(paused, bool):
                 raise HistorySchemaError("trainingPaused has an invalid type")
-            device_values["trainingPaused"] = paused
+            else:
+                device_values["trainingPaused"] = paused
+                presence[f"devices.{suffix}.trainingPaused"] = "present"
+        else:
+            presence[f"devices.{suffix}.trainingPaused"] = "missing"
         acute = _mapping(item.get("acuteTrainingLoadDTO"), "acute training load")
         acute_values: dict[str, Any] = {}
         if acute:
@@ -371,9 +380,16 @@ def normalize_training_daily_status(payload: Any, target_date: date) -> DailySta
             "monthlyLoadAnaerobicTargetMax", "lowAerobicTargetMin",
             "lowAerobicTargetMax", "highAerobicTargetMin", "highAerobicTargetMax",
             "anaerobicTargetMin", "anaerobicTargetMax", "feedback",
-            "trainingLoadBalanceFeedback",
+            "trainingLoadBalanceFeedback", "calendarDate",
         }
     )
+    if balance_root:
+        returned_dates.append(_calendar_date(balance_root, target_date))
+    for field_name in load_balance_fields:
+        presence[f"loadBalance.{field_name}"] = (
+            "missing" if field_name not in balance_root else "null"
+            if balance_root[field_name] is None else "present"
+        )
     for key, raw in balance_root.items():
         if key not in load_balance_fields:
             continue
@@ -411,34 +427,65 @@ def normalize_training_daily_records(
     """Split training status, VO2, and load balance by source identity."""
     root = _mapping(payload, "training payload")
     records: list[DailyStatusRecord] = []
-    status_root = _mapping(root.get("mostRecentTrainingStatus"), "training status")
-    devices = _mapping(status_root.get("latestTrainingStatusData"), "training devices")
+    try:
+        status_root = _mapping(root.get("mostRecentTrainingStatus"), "training status")
+        devices = _mapping(status_root.get("latestTrainingStatusData"), "training devices")
+    except HistorySchemaError:
+        records.append(
+            _with_record_key(
+                unavailable_daily_status("training", target_date, "failed"),
+                "training_status",
+            )
+        )
+        devices = {}
     for raw_id, item in devices.items():
-        device_id = str(_mapping(item, "training device").get("deviceId", raw_id))
-        suffix = _device_suffix(device_id)
-        record = normalize_training_daily_status(
-            {
-                "mostRecentTrainingStatus": {
-                    "latestTrainingStatusData": {str(raw_id): item}
-                }
-            },
-            target_date,
-        )
+        fallback_suffix = _device_suffix(str(raw_id))
+        try:
+            device_id = str(_mapping(item, "training device").get("deviceId", raw_id))
+            suffix = _device_suffix(device_id)
+            record = normalize_training_daily_status(
+                {
+                    "mostRecentTrainingStatus": {
+                        "latestTrainingStatusData": {str(raw_id): item}
+                    }
+                },
+                target_date,
+            )
+        except HistorySchemaError:
+            record = unavailable_daily_status("training", target_date, "failed")
+            suffix = fallback_suffix
         records.append(_with_record_key(record, f"training_status:{suffix}"))
-    vo2 = _mapping(root.get("mostRecentVO2Max"), "training VO2")
-    for raw_key, item in vo2.items():
-        mapped = _mapping(item, "training VO2 item")
-        raw_device = mapped.get("deviceId")
-        suffix = _device_suffix(str(raw_device)) if raw_device is not None else "generic"
-        record = normalize_training_daily_status(
-            {"mostRecentVO2Max": {str(raw_key): item}}, target_date
+    try:
+        vo2 = _mapping(root.get("mostRecentVO2Max"), "training VO2")
+    except HistorySchemaError:
+        records.append(
+            _with_record_key(
+                unavailable_daily_status("training", target_date, "failed"),
+                "training_vo2",
+            )
         )
+        vo2 = {}
+    for raw_key, item in vo2.items():
+        fallback_suffix = _device_suffix(str(raw_key))
+        try:
+            mapped = _mapping(item, "training VO2 item")
+            raw_device = mapped.get("deviceId")
+            suffix = _device_suffix(str(raw_device)) if raw_device is not None else "generic"
+            record = normalize_training_daily_status(
+                {"mostRecentVO2Max": {str(raw_key): item}}, target_date
+            )
+        except HistorySchemaError:
+            record = unavailable_daily_status("training", target_date, "failed")
+            suffix = fallback_suffix
         records.append(_with_record_key(record, f"training_vo2:{suffix}"))
     if root.get("mostRecentTrainingLoadBalance") is not None:
-        record = normalize_training_daily_status(
-            {"mostRecentTrainingLoadBalance": root["mostRecentTrainingLoadBalance"]},
-            target_date,
-        )
+        try:
+            record = normalize_training_daily_status(
+                {"mostRecentTrainingLoadBalance": root["mostRecentTrainingLoadBalance"]},
+                target_date,
+            )
+        except HistorySchemaError:
+            record = unavailable_daily_status("training", target_date, "failed")
         records.append(_with_record_key(record, "training_load_balance"))
     return tuple(records) or (normalize_training_daily_status({}, target_date),)
 
@@ -505,16 +552,27 @@ def normalize_sleep_daily_status(payload: Any, target_date: date) -> DailyStatus
             )
         if "displayedForTheDay" in need:
             displayed = need["displayedForTheDay"]
-            if not isinstance(displayed, bool):
+            if displayed is None:
+                presence[f"{need_name}.displayedForTheDay"] = "null"
+            elif not isinstance(displayed, bool):
                 raise HistorySchemaError("displayedForTheDay has an invalid type")
-            need_values["displayedForTheDay"] = displayed
+            else:
+                need_values["displayedForTheDay"] = displayed
+                presence[f"{need_name}.displayedForTheDay"] = "present"
+        else:
+            presence[f"{need_name}.displayedForTheDay"] = "missing"
         tracker = need.get("preferredActivityTracker")
-        if tracker is not None:
+        if "preferredActivityTracker" not in need:
+            presence[f"{need_name}.preferredActivityTracker"] = "missing"
+        elif tracker is None:
+            presence[f"{need_name}.preferredActivityTracker"] = "null"
+        else:
             if isinstance(tracker, bool) or not isinstance(tracker, str | int):
                 raise HistorySchemaError("preferredActivityTracker has an invalid type")
             need_values["preferredActivityTracker"] = hashlib.sha256(
                 str(tracker).encode()
             ).hexdigest()[:12]
+            presence[f"{need_name}.preferredActivityTracker"] = "present"
         bedtime = need_values.get("recommendedBedtimeStartMins")
         actual = need_values.get("actual")
         if isinstance(bedtime, float) and isinstance(actual, float):
@@ -542,30 +600,28 @@ def normalize_sleep_daily_records(
     base = dict(daily)
     base.pop("sleepNeed", None)
     base.pop("nextSleepNeed", None)
-    records = [
-        _with_record_key(
-            normalize_sleep_daily_status({"dailySleepDTO": base}, target_date),
-            "sleep_summary",
-        )
-    ]
+    try:
+        summary = normalize_sleep_daily_status({"dailySleepDTO": base}, target_date)
+    except HistorySchemaError:
+        summary = unavailable_daily_status("sleep", target_date, "failed")
+    records = [_with_record_key(summary, "sleep_summary")]
     for need_name in ("sleepNeed", "nextSleepNeed"):
         raw_need = daily.get(need_name, root.get(need_name))
         if raw_need is None:
             continue
-        need = _mapping(raw_need, need_name)
-        envelope = {
-            "calendarDate": need.get("calendarDate", daily.get("calendarDate")),
-            "sleepEndTimestampGMT": need.get("timestampGmt"),
-            need_name: raw_need,
-        }
-        records.append(
-            _with_record_key(
-                normalize_sleep_daily_status(
-                    {"dailySleepDTO": envelope}, target_date
-                ),
-                f"sleep_{_stat_key(need_name)}",
+        try:
+            need = _mapping(raw_need, need_name)
+            envelope = {
+                "calendarDate": need.get("calendarDate", daily.get("calendarDate")),
+                "sleepEndTimestampGMT": need.get("timestampGmt"),
+                need_name: raw_need,
+            }
+            record = normalize_sleep_daily_status(
+                {"dailySleepDTO": envelope}, target_date
             )
-        )
+        except HistorySchemaError:
+            record = unavailable_daily_status("sleep", target_date, "failed")
+        records.append(_with_record_key(record, f"sleep_{_stat_key(need_name)}"))
     return tuple(records)
 
 
@@ -577,13 +633,22 @@ def normalize_fitness_age_status(payload: Any, target_date: date) -> DailyStatus
     metrics: list[DailyStatusMetric] = []
     for source in (
         "chronologicalAge", "fitnessAge", "achievableFitnessAge",
-        "previousFitnessAge", "metabolicAge", "visceralFat",
+        "previousFitnessAge", "metabolicAge",
     ):
         value = _field(root, source, values, presence)
         _metric(metrics, f"fitness_age_{_stat_key(source)}", f"Fitness age {source}", "years", value)
+    visceral_fat = _field(root, "visceralFat", values, presence)
+    _metric(
+        metrics, "fitness_age_visceral_fat", "Fitness age visceral fat",
+        "unitless", visceral_fat,
+    )
     _field(root, "lastUpdated", values, presence, text_value=True)
     physique = root.get("physiqueRating")
-    if physique is not None:
+    if "physiqueRating" not in root:
+        presence["physiqueRating"] = "missing"
+    elif physique is None:
+        presence["physiqueRating"] = "null"
+    else:
         if isinstance(physique, bool) or not isinstance(physique, str | int):
             raise HistorySchemaError("physiqueRating has an invalid type")
         values["physiqueRating"] = str(physique)

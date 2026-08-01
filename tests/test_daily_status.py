@@ -164,14 +164,19 @@ def test_training_and_sleep_subsources_keep_independent_identity_and_time():
                     "vo2MaxValue": 48,
                 }
             },
+            "mostRecentTrainingLoadBalance": {
+                "calendarDate": "2026-07-28",
+                "monthlyLoadAerobicLow": 100,
+            },
         },
         TARGET,
     )
     assert {record.calendar_date for record in training} == {
         date(2026, 7, 29),
         date(2026, 7, 31),
+        date(2026, 7, 28),
     }
-    assert len({record.record_key for record in training}) == 2
+    assert len({record.record_key for record in training}) == 3
 
     sleep = normalize_sleep_daily_records(
         {
@@ -198,6 +203,59 @@ def test_training_and_sleep_subsources_keep_independent_identity_and_time():
     assert "sleep_average_overnight_hrv" not in {
         metric.key for record in sleep for metric in record.metrics
     }
+
+
+def test_malformed_subsource_does_not_discard_valid_siblings():
+    training = normalize_training_daily_records(
+        {
+            "mostRecentTrainingStatus": {
+                "latestTrainingStatusData": {
+                    "valid": {"calendarDate": "2026-07-31", "trainingStatus": 7},
+                    "bad": "invalid",
+                }
+            }
+        },
+        TARGET,
+    )
+    assert {record.presence for record in training} == {"present", "failed"}
+
+    sleep = normalize_sleep_daily_records(
+        {
+            "dailySleepDTO": {
+                "calendarDate": "2026-07-31",
+                "sleepScores": {"overall": {"value": 82}},
+                "nextSleepNeed": "invalid",
+            }
+        },
+        TARGET,
+    )
+    assert {record.presence for record in sleep} == {"present", "failed"}
+
+
+def test_nullable_status_fields_remain_distinct_from_missing():
+    training = normalize_training_daily_status(
+        {
+            "mostRecentTrainingStatus": {
+                "latestTrainingStatusData": {
+                    "watch": {
+                        "calendarDate": "2026-07-31",
+                        "trainingPaused": None,
+                    }
+                }
+            }
+        },
+        TARGET,
+    )
+    assert next(
+        value
+        for key, value in training.field_presence.items()
+        if key.endswith("trainingPaused")
+    ) == "null"
+    fitness = normalize_fitness_age_status(
+        {"physiqueRating": None, "visceralFat": 7}, TARGET
+    )
+    assert fitness.field_presence["physiqueRating"] == "null"
+    assert metric_values(fitness)["fitness_age_visceral_fat"] == 7
 
 
 @pytest.mark.asyncio
