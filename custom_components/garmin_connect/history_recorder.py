@@ -21,12 +21,13 @@ _LOGGER = logging.getLogger(__name__)
 
 _RECORDER_CHUNK_SIZE = 1024
 _RECENT_VALUE_CACHE_SIZE = 4096
-# A task may wait behind Recorder's normal persistence queue. This is an idle
-# timeout: every Recorder execution of the task renews it.
-_RECORDER_BARRIER_TIMEOUT = 60
+# Recorder may spend several minutes recovering a large database after an
+# unclean Home Assistant restart before it dispatches queued tasks. This is an
+# idle timeout: every Recorder execution of the task renews it.
+_RECORDER_BARRIER_TIMEOUT = 300
 # Progress may be continuous while Recorder retries a database operation. Keep
 # that healthy case alive, but never make a writer wait without a hard bound.
-_RECORDER_BARRIER_MAX_TIMEOUT = 300
+_RECORDER_BARRIER_MAX_TIMEOUT = 900
 
 
 class _UnavailableRecorderTask:

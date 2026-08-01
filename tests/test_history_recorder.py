@@ -68,6 +68,12 @@ class StalledRequester(FakeRequester):
         self.tasks.append(task)
 
 
+def test_recorder_barrier_defaults_allow_startup_recovery() -> None:
+    """Recorder recovery after an unclean restart can take several minutes."""
+    assert history_recorder_module._RECORDER_BARRIER_TIMEOUT == 300
+    assert history_recorder_module._RECORDER_BARRIER_MAX_TIMEOUT == 900
+
+
 class RetryingImportRequester:
     """Recorder queue that reorders a retrying statistics import behind a barrier."""
 
