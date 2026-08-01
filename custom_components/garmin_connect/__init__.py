@@ -6,6 +6,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 from weakref import WeakKeyDictionary
 
@@ -15,7 +16,15 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 
-from .const import CONF_CLIENT_ID, CONF_IS_CN, CONF_REFRESH_TOKEN, CONF_TOKEN, DOMAIN
+from .const import (
+    CONF_CLIENT_ID,
+    CONF_DEBUG_CAPTURE_ENABLED,
+    CONF_DEBUG_REPLAY_SESSION,
+    CONF_IS_CN,
+    CONF_REFRESH_TOKEN,
+    CONF_TOKEN,
+    DOMAIN,
+)
 from .coordinator import (
     ActivityCoordinator,
     BloodPressureCoordinator,
@@ -29,6 +38,7 @@ from .coordinator import (
     NutritionCoordinator,
     TrainingCoordinator,
 )
+from .debug_capture import GarminDebugCapture
 from .history import GarminHistoryArchive, _persist_archive_enablement_transition
 from .request_gate import GarminRequestGate
 from .services import async_setup_services, async_unload_services
@@ -198,6 +208,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: GarminConnectConfigEntry
     auth.di_client_id = entry.data[CONF_CLIENT_ID]
 
     client = GarminClient(auth, is_cn=is_cn)
+    debug_capture = GarminDebugCapture(
+        Path(hass.config.path("tmp", DOMAIN)),
+        entry.entry_id,
+        capture_enabled=bool(applied_options.get(CONF_DEBUG_CAPTURE_ENABLED, False)),
+        replay_session=applied_options.get(CONF_DEBUG_REPLAY_SESSION) or None,
+    )
+    debug_capture.install(client)
     request_gate = GarminRequestGate()
 
     coordinators = GarminConnectCoordinators(

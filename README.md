@@ -82,6 +82,8 @@ After setup, configure these options via the integration's **Configure** button:
 | Option | Default | Description |
 |--------|---------|-------------|
 | Scan interval | 900 seconds (15 minutes) | How often to poll Garmin Connect (60–3600 seconds) |
+| Capture complete Garmin HTTP requests and responses | Off | Writes complete local request/response sessions for offline debugging and replay |
+| Replay captured HTTP session | Empty | Replaces Garmin HTTP calls with one previously captured local session |
 
 ## Data updates
 
@@ -104,7 +106,7 @@ made new data available. Nine independent coordinators fetch data in parallel:
 
 > **Tip:** Garmin devices sync to Garmin Connect when in Bluetooth range of the paired phone or via WiFi. Sensors update after your device syncs to Garmin Connect **and** the integration polls for new data.
 
-## Prospective Archive (3.1.0-beta.2)
+## Prospective Archive (3.1.0-beta.3)
 
 The Prospective Archive is **off by default**. It records eligible data only
 after you explicitly enable **Prospective Archive** in the Garmin config-entry
@@ -124,8 +126,31 @@ retained; this integration provides no archive-deletion action and no automatic
 expiry policy. There is no built-in retention period: the records remain until
 an administrator manages the storage outside this integration. Disabling,
 reloading, upgrading, or rolling back does not remove those records. See the
-[3.1.0-beta.2 release guide](docs/release-3.1.0-beta.2.md) for the current-data
+[3.1.0-beta.3 release guide](docs/release-3.1.0-beta.3.md) for the current-data
 cadence, retention planning, downgrade, and re-authentication safety guidance.
+
+### Raw HTTP capture and offline replay
+
+For local debugging, enable **Capture complete Garmin HTTP requests and
+responses** in the integration options and reproduce the issue once. The
+integration stores each complete decoded HTTP request and response under:
+
+```text
+<config>/tmp/garmin_connect/<entry-id>/capture-*/
+```
+
+The session contains a JSONL manifest, complete JSON responses, and binary
+downloads such as FIT files. It has no automatic expiry or deletion. The
+capture contains health data and is intended only for the operator's local
+debugging environment. Authentication headers, cookies, and DI tokens are not
+captured because replay does not need them.
+
+To replay without creating any Garmin requests, disable capture and put the
+directory name (for example, `capture-20260801T091710-deadbeef`) in **Replay
+captured HTTP session**. The integration reloads, returns recorded responses
+for matching requests, and fails closed if an unrecorded request is attempted.
+Enable `custom_components.garmin_connect: debug` to see capture/replay sequence
+messages in the Home Assistant log.
 
 ## Sensors
 

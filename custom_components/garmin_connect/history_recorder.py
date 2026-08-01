@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import logging
 import threading
 from collections import OrderedDict
 from collections.abc import Sequence
@@ -15,6 +16,8 @@ from math import isfinite
 from typing import Any, Protocol
 
 from .history_source import NormalizedSample
+
+_LOGGER = logging.getLogger(__name__)
 
 _RECORDER_CHUNK_SIZE = 1024
 _RECENT_VALUE_CACHE_SIZE = 4096
@@ -529,6 +532,11 @@ class GarminHistoryRecorder:
         except asyncio.CancelledError:
             raise
         except (AttributeError, ImportError, TypeError, ValueError, RuntimeError) as err:
+            _LOGGER.debug(
+                "Garmin Recorder statistics write failed at the compatibility boundary (%s)",
+                type(err).__name__,
+                exc_info=True,
+            )
             error_type = (
                 "recorder_barrier"
                 if isinstance(err, _RecorderBarrierTimeoutError)

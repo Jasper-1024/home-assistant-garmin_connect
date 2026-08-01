@@ -6,6 +6,8 @@ from ha_garmin import GarminAuthError, GarminConnectError, GarminMFARequired, Ga
 
 from custom_components.garmin_connect.const import (
     CONF_ARCHIVE_ENABLED,
+    CONF_DEBUG_CAPTURE_ENABLED,
+    CONF_DEBUG_REPLAY_SESSION,
     CONF_SCAN_INTERVAL,
     DEFAULT_SCAN_INTERVAL,
 )
@@ -321,6 +323,26 @@ async def test_options_flow_accepts_archive_enablement() -> None:
 
     assert result["type"] == "create_entry"
     assert result["data"][CONF_ARCHIVE_ENABLED] is True
+
+
+async def test_options_flow_accepts_debug_capture_or_replay_but_not_both() -> None:
+    """Raw capture and offline replay are explicit, mutually exclusive options."""
+    flow = _make_options_flow({})
+
+    capture = await flow.async_step_init({CONF_DEBUG_CAPTURE_ENABLED: True})
+    assert capture["type"] == "create_entry"
+    assert capture["data"][CONF_DEBUG_CAPTURE_ENABLED] is True
+    assert capture["data"][CONF_DEBUG_REPLAY_SESSION] == ""
+
+    flow = _make_options_flow({})
+    conflict = await flow.async_step_init(
+        {
+            CONF_DEBUG_CAPTURE_ENABLED: True,
+            CONF_DEBUG_REPLAY_SESSION: "capture-20260801T091710-deadbeef",
+        }
+    )
+    assert conflict["type"] == "form"
+    assert conflict["errors"] == {"base": "debug_capture_replay_conflict"}
 
 
 async def test_options_flow_submission_keeps_archive_disabled_by_default() -> None:

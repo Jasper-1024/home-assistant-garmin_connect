@@ -71,12 +71,19 @@
         "data": {
           "scan_interval": "Update interval (seconds)",
           "is_cn": "Use Garmin Connect China (cn.garmin.com)",
-          "archive_enabled": "Enable prospective archive"
+          "archive_enabled": "Enable prospective archive",
+          "debug_capture_enabled": "Capture complete Garmin HTTP requests and responses",
+          "debug_replay_session": "Replay captured HTTP session"
         },
         "data_description": {
           "scan_interval": "How often to fetch data from Garmin Connect (60–3600 seconds)",
           "is_cn": "Enable for accounts registered on the Chinese Garmin Connect platform",
-          "archive_enabled": "Start collecting a durable Garmin history from the enablement date"
+          "archive_enabled": "Start collecting a durable Garmin history from the enablement date",
+          "debug_capture_enabled": "Write full request/response payloads to config/tmp/garmin_connect for local debugging. Does not automatically delete captures.",
+          "debug_replay_session": "Session directory name under config/tmp/garmin_connect/<entry-id>. Replay makes no Garmin network requests; leave blank for normal or capture mode."
+        },
+        "error": {
+          "debug_capture_replay_conflict": "Capture and replay cannot be enabled at the same time."
         },
         "description": "Configure your Garmin Connect integration settings.",
         "title": "Garmin Connect Options"

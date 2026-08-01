@@ -28,11 +28,14 @@ from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from .const import (
     CONF_ARCHIVE_ENABLED,
     CONF_CLIENT_ID,
+    CONF_DEBUG_CAPTURE_ENABLED,
+    CONF_DEBUG_REPLAY_SESSION,
     CONF_IS_CN,
     CONF_REFRESH_TOKEN,
     CONF_SCAN_INTERVAL,
     CONF_TOKEN,
     DEFAULT_ARCHIVE_ENABLED,
+    DEFAULT_DEBUG_CAPTURE_ENABLED,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     MAX_SCAN_INTERVAL,
@@ -141,6 +144,7 @@ class GarminConnectConfigFlow(ConfigFlow, domain=DOMAIN):
             options={
                 CONF_IS_CN: self._is_cn,
                 CONF_ARCHIVE_ENABLED: DEFAULT_ARCHIVE_ENABLED,
+                CONF_DEBUG_CAPTURE_ENABLED: DEFAULT_DEBUG_CAPTURE_ENABLED,
             },
         )
 
@@ -309,8 +313,32 @@ class GarminConnectOptionsFlow(OptionsFlow):
         current_archive_enabled = self.config_entry.options.get(
             CONF_ARCHIVE_ENABLED, DEFAULT_ARCHIVE_ENABLED
         )
+        current_debug_capture_enabled = self.config_entry.options.get(
+            CONF_DEBUG_CAPTURE_ENABLED, DEFAULT_DEBUG_CAPTURE_ENABLED
+        )
+        current_debug_replay_session = self.config_entry.options.get(
+            CONF_DEBUG_REPLAY_SESSION, ""
+        )
 
         if user_input is not None:
+            debug_capture_enabled = user_input.get(
+                CONF_DEBUG_CAPTURE_ENABLED, current_debug_capture_enabled
+            )
+            debug_replay_session = user_input.get(
+                CONF_DEBUG_REPLAY_SESSION, current_debug_replay_session
+            ).strip()
+            if debug_capture_enabled and debug_replay_session:
+                return self.async_show_form(
+                    step_id="init",
+                    data_schema=self._schema(
+                        current_scan_interval,
+                        current_is_cn,
+                        current_archive_enabled,
+                        current_debug_capture_enabled,
+                        current_debug_replay_session,
+                    ),
+                    errors={"base": "debug_capture_replay_conflict"},
+                )
             return self.async_create_entry(
                 title="",
                 data={
@@ -321,25 +349,48 @@ class GarminConnectOptionsFlow(OptionsFlow):
                     CONF_ARCHIVE_ENABLED: user_input.get(
                         CONF_ARCHIVE_ENABLED, current_archive_enabled
                     ),
+                    CONF_DEBUG_CAPTURE_ENABLED: debug_capture_enabled,
+                    CONF_DEBUG_REPLAY_SESSION: debug_replay_session,
                 },
             )
 
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema(
-                {
-                    vol.Optional(
-                        CONF_SCAN_INTERVAL,
-                        default=current_scan_interval,
-                    ): vol.All(
-                        vol.Coerce(int),
-                        vol.Range(min=MIN_SCAN_INTERVAL, max=MAX_SCAN_INTERVAL),
-                    ),
-                    vol.Optional(CONF_IS_CN, default=current_is_cn): bool,
-                    vol.Optional(
-                        CONF_ARCHIVE_ENABLED,
-                        default=current_archive_enabled,
-                    ): bool,
-                }
+            data_schema=self._schema(
+                current_scan_interval,
+                current_is_cn,
+                current_archive_enabled,
+                current_debug_capture_enabled,
+                current_debug_replay_session,
             ),
+        )
+
+    @staticmethod
+    def _schema(
+        scan_interval: int,
+        is_cn: bool,
+        archive_enabled: bool,
+        debug_capture_enabled: bool,
+        debug_replay_session: str,
+    ) -> vol.Schema:
+        """Build the options schema, including local debug capture controls."""
+        return vol.Schema(
+            {
+                vol.Optional(CONF_SCAN_INTERVAL, default=scan_interval): vol.All(
+                    vol.Coerce(int),
+                    vol.Range(min=MIN_SCAN_INTERVAL, max=MAX_SCAN_INTERVAL),
+                ),
+                vol.Optional(CONF_IS_CN, default=is_cn): bool,
+                vol.Optional(CONF_ARCHIVE_ENABLED, default=archive_enabled): bool,
+                vol.Optional(
+                    CONF_DEBUG_CAPTURE_ENABLED, default=debug_capture_enabled
+                ): bool,
+                vol.Optional(
+                    CONF_DEBUG_REPLAY_SESSION, default=debug_replay_session
+                ): vol.All(
+                    str,
+                    vol.Length(max=128),
+                    vol.Match(r"^$|^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"),
+                ),
+            }
         )

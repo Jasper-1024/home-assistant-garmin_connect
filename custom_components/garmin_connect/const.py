@@ -23,6 +23,8 @@ RECORDER_COMPATIBILITY_TARGET: Final = (
 CONF_IS_CN: Final = "is_cn"
 CONF_SCAN_INTERVAL: Final = "scan_interval"
 CONF_ARCHIVE_ENABLED: Final = "archive_enabled"
+CONF_DEBUG_CAPTURE_ENABLED: Final = "debug_capture_enabled"
+CONF_DEBUG_REPLAY_SESSION: Final = "debug_replay_session"
 
 # Archive lifecycle metadata. Enablement is an operator option; the
 # activation date and last observed state are persisted with the config entry
@@ -32,6 +34,7 @@ CONF_ARCHIVE_ACTIVATION_DATE: Final = "archive_activation_date"
 # this records the previous automatic enablement state across reloads.
 CONF_ARCHIVE_PREVIOUSLY_ENABLED: Final = "archive_last_enabled"
 DEFAULT_ARCHIVE_ENABLED: Final = False
+DEFAULT_DEBUG_CAPTURE_ENABLED: Final = False
 DEFAULT_SCAN_INTERVAL: Final = 900  # 15 minutes
 MIN_SCAN_INTERVAL: Final = 60  # 1 minute
 MAX_SCAN_INTERVAL: Final = 3600  # 1 hour

@@ -506,6 +506,13 @@ async def _async_observe_family(
         raise
     except Exception as error:
         error_type = _safe_family_error_type(error)
+        _LOGGER.debug(
+            "Garmin structured family exception for %s (%s: %s)",
+            target,
+            family,
+            type(error).__name__,
+            exc_info=True,
+        )
         if error_type in {"rate_limited", "reauth_required"}:
             raise _ArchivePolicyError(error_type) from error
         observation = accumulator.record_failure(family, error_type)
@@ -2406,6 +2413,13 @@ class GarminHistoryArchive:
                         RuntimeError,
                     ) as error:
                         error_type = _safe_family_error_type(error)
+                        _LOGGER.debug(
+                            "Garmin numeric family exception for %s (%s: %s)",
+                            target_key,
+                            metric,
+                            type(error).__name__,
+                            exc_info=True,
+                        )
                         if error_type in {"rate_limited", "reauth_required"}:
                             raise _ArchivePolicyError(error_type) from error
                         failed_families.add(metric)
