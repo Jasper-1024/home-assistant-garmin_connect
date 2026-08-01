@@ -1435,6 +1435,13 @@ def parse_hrv_data(payload: Any, target_date: date) -> HRVData:
     return HRVData(tuple(latest[key] for key in sorted(latest)), summary, presence)
 
 
+@dataclass(frozen=True, slots=True)
+class _CachedPayloadFailure:
+    """One shared endpoint failure retained only for this sync attempt."""
+
+    error: Exception
+
+
 class GarminHistorySource:
     """Small serialized adapter for Garmin intraday endpoints."""
 
@@ -1452,8 +1459,15 @@ class GarminHistorySource:
     ) -> Any:
         cache_key = (target_date, key)
         if cache_key not in self._payload_cache:
-            self._payload_cache[cache_key] = await request()
-        return self._payload_cache[cache_key]
+            try:
+                self._payload_cache[cache_key] = await request()
+            except Exception as err:
+                self._payload_cache[cache_key] = _CachedPayloadFailure(err)
+                raise
+        cached = self._payload_cache[cache_key]
+        if isinstance(cached, _CachedPayloadFailure):
+            raise cached.error
+        return cached
 
     async def async_fetch(self, target_date: date, metric: str) -> HistoryResult:
         """Fetch one metric, retaining the historical tuple return contract."""

@@ -1834,20 +1834,43 @@ async def async_setup_entry(
     entry.async_on_unload(coordinators.gear.async_add_listener(_async_add_new_gear))
 
     # Dynamic power-to-weight sensors (one PTW + one FTP sensor per sport)
-    ptw_list: list[dict[str, Any]] = (coordinators.training.data or {}).get("powerToWeight") or []
-    for ptw_entry in ptw_list:
-        sport = ptw_entry.get("sport")
-        if not sport:
-            continue
-        for sensor_type in ("ptw", "ftp"):
-            entities.append(
-                GarminConnectPowerToWeightSensor(
-                    coordinators.training,
-                    sport=sport,
-                    sensor_type=sensor_type,
-                    entry_id=entry.entry_id,
+    known_ptw_sports: set[str] = set()
+
+    def _new_power_to_weight_entities() -> list[GarminConnectPowerToWeightSensor]:
+        """Build entities for sports that appeared in the latest training data."""
+        new_entities: list[GarminConnectPowerToWeightSensor] = []
+        ptw_list: list[dict[str, Any]] = (coordinators.training.data or {}).get(
+            "powerToWeight"
+        ) or []
+        for ptw_entry in ptw_list:
+            sport = ptw_entry.get("sport")
+            if not sport or sport in known_ptw_sports:
+                continue
+            known_ptw_sports.add(sport)
+            for sensor_type in ("ptw", "ftp"):
+                new_entities.append(
+                    GarminConnectPowerToWeightSensor(
+                        coordinators.training,
+                        sport=sport,
+                        sensor_type=sensor_type,
+                        entry_id=entry.entry_id,
+                    )
                 )
-            )
+        return new_entities
+
+    entities.extend(_new_power_to_weight_entities())
+
+    @callback
+    def _async_add_new_power_to_weight_entities() -> None:
+        """Add sports discovered after the background initial refresh."""
+        if new_entities := _new_power_to_weight_entities():
+            async_add_entities(new_entities)
+
+    entry.async_on_unload(
+        coordinators.training.async_add_listener(
+            _async_add_new_power_to_weight_entities
+        )
+    )
 
     async_add_entities(entities)
 

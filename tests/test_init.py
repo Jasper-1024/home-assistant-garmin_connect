@@ -14,7 +14,6 @@ from homeassistant.config_entries import (
     SOURCE_USER,
     ConfigEntries,
     ConfigEntry,
-    ConfigEntryNotReady,
     ConfigEntryState,
 )
 from homeassistant.core import HomeAssistant
@@ -282,8 +281,8 @@ async def test_options_update_coalesces_in_flight_changes() -> None:
 
 
 async def test_setup_persists_enablement_before_current_refresh_failure() -> None:
-    """Setup records enablement before the current-value path can fail."""
-    entry = MagicMock(entry_id="entry-1")
+    """Setup records enablement and survives a current-value refresh failure."""
+    entry = _config_entry_mock(entry_id="entry-1")
     entry.data = {
         **ENTRY_DATA,
         CONF_ARCHIVE_PREVIOUSLY_ENABLED: False,
@@ -291,12 +290,14 @@ async def test_setup_persists_enablement_before_current_refresh_failure() -> Non
     entry.options = {CONF_ARCHIVE_ENABLED: True}
     hass = MagicMock()
     hass.config.country = "US"
+    hass.services.has_service = MagicMock(return_value=True)
+    hass.config_entries.async_forward_entry_setups = AsyncMock()
     hass.config_entries.async_update_entry = MagicMock(
         side_effect=lambda updated_entry, *, data: setattr(updated_entry, "data", data)
     )
 
     coord = _coord_mock()
-    coord.async_config_entry_first_refresh.side_effect = RuntimeError("current refresh failed")
+    coord.async_refresh.side_effect = RuntimeError("current refresh failed")
     with ExitStack() as stack:
         stack.enter_context(patch("custom_components.garmin_connect.GarminAuth"))
         stack.enter_context(patch("custom_components.garmin_connect.GarminClient"))
@@ -305,8 +306,12 @@ async def test_setup_persists_enablement_before_current_refresh_failure() -> Non
             "custom_components.garmin_connect.history.dt_util.utcnow",
             return_value=datetime(2026, 8, 3, 23, 30, tzinfo=UTC),
         ):
-            with pytest.raises(RuntimeError, match="current refresh failed"):
-                await async_setup_entry(hass, entry)
+            assert await async_setup_entry(hass, entry) is True
+            state = _ENTRY_UPDATE_STATES[entry]
+            current_refresh_task = state.current_refresh_task
+            if current_refresh_task is not None:
+                await current_refresh_task
+            await _await_archive_start_task(entry)
 
     assert entry.data[CONF_ARCHIVE_ACTIVATION_DATE] == "2026-08-03"
     assert entry.data[CONF_ARCHIVE_PREVIOUSLY_ENABLED] is True
@@ -520,21 +525,14 @@ async def test_real_config_entry_lifecycle_keeps_backfill_dormant_and_surfaces_v
                 constructed.append(configured)
                 return configured
 
-            async def block_stale_setup() -> None:
+            async def block_stale_setup(*_args: object) -> None:
                 setup_reached.set()
                 assert entry.update_listeners == []
                 await release_setup.wait()
 
-            def core_constructor(*args, **kwargs) -> MagicMock:
-                configured = coordinator_constructor(*args, **kwargs)
-                configured.async_config_entry_first_refresh = AsyncMock(
-                    side_effect=block_stale_setup
-                )
-                return configured
-
             for constructor in coordinator_constructors:
                 constructor.side_effect = coordinator_constructor
-            coordinator_constructors[0].side_effect = core_constructor
+            hass.config_entries.async_forward_entry_setups.side_effect = block_stale_setup
 
             hass.config_entries.async_update_entry(
                 entry,
@@ -638,8 +636,8 @@ async def test_real_config_entry_lifecycle_keeps_backfill_dormant_and_surfaces_v
                 await getattr(flow, finish_method)()
                 await hass.async_block_till_done()
 
-            assert schedule_reload.call_count == 2
-            assert reload_entry.await_count == 4
+            assert schedule_reload.call_count == 3
+            assert reload_entry.await_count == 5
 
             assert await hass.config_entries.async_unload(entry.entry_id)
             assert entry.state is ConfigEntryState.NOT_LOADED
@@ -734,7 +732,8 @@ async def test_option_disablement_reload_cancels_recurring_archive_work(tmp_path
             await _await_archive_start_task(entry)
             first_archive = entry.runtime_data.history_archive
             await asyncio.wait_for(client.first_sync_done.wait(), timeout=1)
-            await hass.async_block_till_done()
+            assert first_archive._first_sync_task is not None
+            await first_archive._first_sync_task
             assert timer.active, (first_archive.status, client.requests, client.events)
 
             client.block_cycle = True
@@ -839,7 +838,9 @@ async def test_runtime_archive_prioritizes_foreground_work_through_shared_gate(t
             await hass.config_entries.async_add(entry)
             await _await_archive_start_task(entry)
             await asyncio.wait_for(client.first_sync_done.wait(), timeout=1)
-            await hass.async_block_till_done()
+            first_archive = entry.runtime_data.history_archive
+            assert first_archive._first_sync_task is not None
+            await first_archive._first_sync_task
             for _ in range(100):
                 if timer.active:
                     break
@@ -864,7 +865,9 @@ async def test_runtime_archive_prioritizes_foreground_work_through_shared_gate(t
 
             client.release_cycle.set()
             assert await asyncio.wait_for(current_task, timeout=1) == "current-value"
-            await hass.async_block_till_done()
+            cycle_task = first_archive._cycle_task
+            assert cycle_task is not None
+            await cycle_task
 
             current_index = client.events.index("current")
             next_archive_index = next(
@@ -905,10 +908,17 @@ async def test_setup_entry_success() -> None:
 
     assert result is True
     assert entry.runtime_data is not None
-    entry.async_create_background_task.assert_called_once()
-    assert entry.async_create_background_task.call_args.args[0] is hass
-    assert entry.async_create_background_task.call_args.kwargs == {
-        "name": "garmin_connect archive startup"
+    assert entry.async_create_background_task.call_count == 2
+    assert all(
+        call.args[0] is hass
+        for call in entry.async_create_background_task.call_args_list
+    )
+    assert {
+        call.kwargs["name"]
+        for call in entry.async_create_background_task.call_args_list
+    } == {
+        "garmin_connect initial current refresh",
+        "garmin_connect archive startup",
     }
     entry.async_create_task.assert_not_called()
 
@@ -1301,11 +1311,11 @@ async def test_stalled_recorder_check_starts_archive_in_background_and_can_cance
 
     await asyncio.wait_for(recorder_check_started.wait(), timeout=0.1)
     assert hass.config_entries.async_forward_entry_setups.await_count == 1
-    assert created_tasks and not created_tasks[0].done()
+    assert len(created_tasks) == 2 and not created_tasks[-1].done()
 
-    created_tasks[0].cancel()
+    created_tasks[-1].cancel()
     with pytest.raises(asyncio.CancelledError):
-        await created_tasks[0]
+        await created_tasks[-1]
 
 
 async def test_archive_startup_wait_does_not_block_home_assistant(tmp_path) -> None:
@@ -1350,6 +1360,57 @@ async def test_archive_startup_wait_does_not_block_home_assistant(tmp_path) -> N
             await asyncio.wait_for(hass.async_block_till_done(), timeout=0.1)
     finally:
         release_archive.set()
+        await _await_archive_start_task(entry)
+        hass.config_entries._store._async_cleanup_delay_listener()
+        await hass.async_stop(force=True)
+
+
+async def test_current_refresh_wait_does_not_block_home_assistant(tmp_path) -> None:
+    """Garmin network waits are excluded from HA bootstrap work."""
+    hass = HomeAssistant(str(tmp_path))
+    hass.config_entries = ConfigEntries(hass, {})
+    loader.async_setup(hass)
+    entry = _real_config_entry("entry-background-current-refresh")
+    coordinator = _coord_mock()
+    refresh_started = asyncio.Event()
+    release_refresh = asyncio.Event()
+
+    async def wait_during_refresh() -> None:
+        refresh_started.set()
+        await release_refresh.wait()
+
+    coordinator.async_refresh.side_effect = wait_during_refresh
+    archive = MagicMock()
+    archive.async_start = AsyncMock()
+    archive.async_stop = AsyncMock()
+
+    try:
+        with ExitStack() as stack:
+            stack.enter_context(patch("custom_components.garmin_connect.GarminAuth"))
+            stack.enter_context(patch("custom_components.garmin_connect.GarminClient"))
+            _stack_coordinators(stack, coordinator)
+            stack.enter_context(
+                patch(
+                    "custom_components.garmin_connect.GarminHistoryArchive",
+                    return_value=archive,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    hass.config_entries,
+                    "async_forward_entry_setups",
+                    new=AsyncMock(),
+                )
+            )
+
+            assert await asyncio.wait_for(async_setup_entry(hass, entry), timeout=0.1)
+            await asyncio.wait_for(refresh_started.wait(), timeout=0.1)
+            await asyncio.wait_for(hass.async_block_till_done(), timeout=0.1)
+    finally:
+        release_refresh.set()
+        state = _ENTRY_UPDATE_STATES.get(entry)
+        if state is not None and state.current_refresh_task is not None:
+            await state.current_refresh_task
         await _await_archive_start_task(entry)
         hass.config_entries._store._async_cleanup_delay_listener()
         await hass.async_stop(force=True)
@@ -1542,11 +1603,13 @@ async def test_real_entry_setup_cancellation_propagates_and_rolls_back() -> None
     refresh_started = asyncio.Event()
     release_refresh = asyncio.Event()
 
-    async def wait_for_refresh() -> None:
+    async def wait_for_platform_setup(*_args: object) -> None:
         refresh_started.set()
         await release_refresh.wait()
 
-    coord.async_config_entry_first_refresh.side_effect = wait_for_refresh
+    hass.config_entries.async_forward_entry_setups = AsyncMock(
+        side_effect=wait_for_platform_setup
+    )
     with ExitStack() as stack:
         stack.enter_context(patch("custom_components.garmin_connect.GarminAuth"))
         stack.enter_context(patch("custom_components.garmin_connect.GarminClient"))
@@ -1563,22 +1626,32 @@ async def test_real_entry_setup_cancellation_propagates_and_rolls_back() -> None
     assert entry.update_listeners == []
 
 
-async def test_real_entry_timeout_becomes_not_ready() -> None:
-    """Only a timeout maps to ConfigEntryNotReady during setup."""
+async def test_real_entry_refresh_timeout_does_not_block_setup() -> None:
+    """A Garmin timeout marks data unavailable without delaying entry setup."""
     entry = _real_config_entry()
     hass = MagicMock()
+    _configure_entry_task_factory(hass)
     hass.config.country = "US"
+    hass.services.has_service = MagicMock(return_value=True)
+    hass.config_entries.async_forward_entry_setups = AsyncMock()
+    hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
     coord = _coord_mock()
-    coord.async_config_entry_first_refresh.side_effect = asyncio.TimeoutError
+    coord.async_refresh.side_effect = asyncio.TimeoutError
 
     with ExitStack() as stack:
         stack.enter_context(patch("custom_components.garmin_connect.GarminAuth"))
         stack.enter_context(patch("custom_components.garmin_connect.GarminClient"))
         constructors = _stack_coordinators(stack, coord)
-        with pytest.raises(ConfigEntryNotReady, match="timed out"):
-            await async_setup_entry(hass, entry)
+        assert await async_setup_entry(hass, entry) is True
+        state = _ENTRY_UPDATE_STATES[entry]
+        current_refresh_task = state.current_refresh_task
+        if current_refresh_task is not None:
+            await current_refresh_task
+        await _await_archive_start_task(entry)
 
-    assert constructors[0].call_args.args[4]._closed is True
+    assert constructors[0].call_args.args[4]._closed is False
+    assert entry.runtime_data is not None
+    assert await async_unload_entry(hass, entry) is True
 
 
 async def test_unload_cancels_pending_archive_start_and_releases_runtime() -> None:

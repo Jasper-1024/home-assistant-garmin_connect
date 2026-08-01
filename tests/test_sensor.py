@@ -1,5 +1,6 @@
 """Tests for Garmin Connect sensor platform."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -17,8 +18,10 @@ from custom_components.garmin_connect.sensor import (
     TRAINING_SENSORS,
     CoordinatorType,
     GarminConnectGearSensor,
+    GarminConnectPowerToWeightSensor,
     GarminConnectSensor,
     GarminConnectSensorEntityDescription,
+    async_setup_entry,
 )
 
 from .conftest import (
@@ -124,6 +127,57 @@ def test_nutrition_sensors_unknown_when_feature_unavailable() -> None:
         sensor = GarminConnectSensor(coordinator, description, "test_entry_id")
         assert sensor.native_value is None
         assert sensor.extra_state_attributes == {}
+
+
+@pytest.mark.asyncio
+async def test_training_listener_adds_delayed_power_to_weight_entities() -> None:
+    """Dynamic training entities appear after background initial refresh."""
+    training_listeners: list[object] = []
+
+    def coordinator(*, training: bool = False) -> MagicMock:
+        value = MagicMock()
+        value.data = {}
+        if training:
+            value.async_add_listener.side_effect = lambda listener: (
+                training_listeners.append(listener) or MagicMock()
+            )
+        return value
+
+    training = coordinator(training=True)
+    coordinators = SimpleNamespace(
+        core=coordinator(),
+        activity=coordinator(),
+        training=training,
+        body=coordinator(),
+        goals=coordinator(),
+        gear=coordinator(),
+        blood_pressure=coordinator(),
+        menstrual=coordinator(),
+        nutrition=coordinator(),
+        history_archive=None,
+    )
+    entry = MagicMock(entry_id="entry-1", runtime_data=coordinators)
+    added: list[object] = []
+
+    with patch("custom_components.garmin_connect.sensor.er.async_get") as registry:
+        registry.return_value.entities.values.return_value = []
+        await async_setup_entry(None, entry, lambda entities: added.extend(entities))
+
+    assert not any(isinstance(entity, GarminConnectPowerToWeightSensor) for entity in added)
+
+    training.data = {"powerToWeight": [{"sport": "cycling"}]}
+    for listener in training_listeners:
+        listener()
+    dynamic = [
+        entity for entity in added if isinstance(entity, GarminConnectPowerToWeightSensor)
+    ]
+    assert len(dynamic) == 2
+
+    for listener in training_listeners:
+        listener()
+    assert len(
+        [entity for entity in added if isinstance(entity, GarminConnectPowerToWeightSensor)]
+    ) == 2
 
 
 # ── GarminConnectSensor — basic behaviour ─────────────────────────────────────

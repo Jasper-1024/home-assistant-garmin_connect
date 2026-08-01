@@ -1513,3 +1513,24 @@ async def test_shared_daily_endpoints_are_requested_once_per_source_instance() -
     assert sum("/daily/im/" in url for url in urls) == 1
     assert sum("/daily/respiration/" in url for url in urls) == 1
     assert sum("/daily/spo2/" in url for url in urls) == 1
+
+
+@pytest.mark.asyncio
+async def test_shared_daily_endpoint_failure_is_cached_for_one_source_instance() -> None:
+    """Sibling metrics share one endpoint failure but a new sync source retries."""
+    target = date(2026, 8, 1)
+    client = MagicMock(_base_url="https://connect.garmin.test/gc-api")
+    client._request = AsyncMock(side_effect=OSError("temporary network failure"))
+    source = GarminHistorySource(client, _ImmediateGate())
+
+    with pytest.raises(OSError, match="temporary network failure"):
+        await source.async_fetch_details(target, "respiration_raw")
+    with pytest.raises(OSError, match="temporary network failure"):
+        await source.async_fetch_details(target, "respiration_average")
+
+    assert client._request.await_count == 1
+
+    restarted_source = GarminHistorySource(client, _ImmediateGate())
+    with pytest.raises(OSError, match="temporary network failure"):
+        await restarted_source.async_fetch_details(target, "respiration_raw")
+    assert client._request.await_count == 2

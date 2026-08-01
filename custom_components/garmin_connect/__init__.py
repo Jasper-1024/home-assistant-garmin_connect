@@ -54,6 +54,7 @@ class _EntryUpdateState:
     applied_options: dict[str, Any] | None = None
     reload_requested: bool = False
     reload_scheduled: bool = False
+    current_refresh_task: asyncio.Task[None] | None = None
     archive_start_task: asyncio.Task[None] | None = None
 
 
@@ -231,28 +232,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: GarminConnectConfigEntry
     services_setup_attempted = False
     remove_options_listener: Callable[[], None] | None = None
     try:
-        try:
-            await coordinators.core.async_config_entry_first_refresh()
-        except TimeoutError as err:
-            raise ConfigEntryNotReady(
-                "Garmin API timed out during setup; will retry"
-            ) from err
-
-        refresh_results = await asyncio.gather(
-            coordinators.activity.async_refresh(),
-            coordinators.training.async_refresh(),
-            coordinators.body.async_refresh(),
-            coordinators.goals.async_refresh(),
-            coordinators.gear.async_refresh(),
-            coordinators.blood_pressure.async_refresh(),
-            coordinators.menstrual.async_refresh(),
-            coordinators.nutrition.async_refresh(),
-            return_exceptions=True,
-        )
-        for result in refresh_results:
-            if isinstance(result, asyncio.CancelledError):
-                raise result
-
         # Platform setup needs runtime_data, so attach it provisionally and
         # remove it again if any later setup step fails.
         entry.runtime_data = coordinators
@@ -285,6 +264,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: GarminConnectConfigEntry
             return True
 
         state = _ENTRY_UPDATE_STATES[entry]
+        state.current_refresh_task = entry.async_create_background_task(
+            hass,
+            _async_refresh_current_data(coordinators, state),
+            name=f"{DOMAIN} initial current refresh",
+        )
         state.archive_start_task = entry.async_create_background_task(
             hass,
             _async_start_history_archive(
@@ -311,6 +295,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: GarminConnectConfigEntry
             services_setup_attempted,
         )
         raise
+
+
+async def _async_refresh_current_data(
+    coordinators: GarminConnectCoordinators,
+    state: _EntryUpdateState,
+) -> None:
+    """Refresh current values without making Garmin part of HA startup."""
+    try:
+        refresh_results = await asyncio.gather(
+            coordinators.core.async_refresh(),
+            coordinators.activity.async_refresh(),
+            coordinators.training.async_refresh(),
+            coordinators.body.async_refresh(),
+            coordinators.goals.async_refresh(),
+            coordinators.gear.async_refresh(),
+            coordinators.blood_pressure.async_refresh(),
+            coordinators.menstrual.async_refresh(),
+            coordinators.nutrition.async_refresh(),
+            return_exceptions=True,
+        )
+        for result in refresh_results:
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, Exception):
+                _LOGGER.warning("Unexpected Garmin initial refresh failure", exc_info=result)
+    finally:
+        state.current_refresh_task = None
 
 
 def _add_options_update_listener(entry: GarminConnectConfigEntry) -> Callable[[], None]:
@@ -444,6 +455,13 @@ async def _async_release_runtime(
     """Stop resources only after their platforms no longer reference them."""
     try:
         state = _ENTRY_UPDATE_STATES.get(entry)
+        if (
+            state is not None
+            and (current_refresh_task := state.current_refresh_task) is not None
+            and not current_refresh_task.done()
+        ):
+            current_refresh_task.cancel()
+            await asyncio.gather(current_refresh_task, return_exceptions=True)
         if (
             state is not None
             and (archive_start_task := state.archive_start_task) is not None

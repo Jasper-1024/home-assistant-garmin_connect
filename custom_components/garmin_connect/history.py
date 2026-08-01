@@ -1443,7 +1443,10 @@ class GarminHistoryArchive:
             else:
                 first_sync = self._async_run_first_sync_in_background()
                 if isinstance(self._hass, HomeAssistant):
-                    self._first_sync_task = self._hass.async_create_task(first_sync)
+                    self._first_sync_task = self._hass.async_create_background_task(
+                        first_sync,
+                        f"{DOMAIN} archive first sync {self._entry.entry_id}",
+                    )
                 else:
                     self._first_sync_task = asyncio.create_task(first_sync)
 
@@ -1455,6 +1458,10 @@ class GarminHistoryArchive:
             raise
         except Exception:
             self._set_failed("first_sync")
+            self._schedule_next_cycle()
+            await self._async_persist_archive_status_best_effort(
+                "Garmin archive first-sync retry schedule could not be persisted"
+            )
             _LOGGER.warning(
                 "Garmin history archive first synchronization failed for entry %s",
                 self._entry.entry_id,
@@ -1493,15 +1500,35 @@ class GarminHistoryArchive:
                 target_date, report, is_current_date=True
             )
         if report.outcome != "written":
-            if self._status.state not in {
-                HistoryArchiveState.FAILED,
-                HistoryArchiveState.BACKOFF,
-            }:
-                self._set_failed(report.error_type or "first_sync")
+            await self._async_handle_failed_run(report, "first_sync")
             return
         self._schedule_next_cycle()
         await self._async_persist_archive_status_best_effort(
             "Garmin archive schedule could not be persisted"
+        )
+
+    async def _async_handle_failed_run(
+        self, report: HistorySyncReport, fallback_error: str
+    ) -> None:
+        """Expose a failed run and arm recovery unless credentials must change."""
+        error_type = report.error_type or fallback_error
+        if self._status.state not in {
+            HistoryArchiveState.FAILED,
+            HistoryArchiveState.BACKOFF,
+        }:
+            self._set_failed(error_type)
+        if self._status.state is HistoryArchiveState.BACKOFF:
+            return
+        if error_type == "reauth_required":
+            if self._cycle_timer_cancel is not None:
+                self._cycle_timer_cancel()
+                self._cycle_timer_cancel = None
+            self._archive_next_eligible_run = None
+            self._status = replace(self._status, next_eligible_run=None)
+        else:
+            self._schedule_next_cycle()
+        await self._async_persist_archive_status_best_effort(
+            "Garmin archive retry schedule could not be persisted"
         )
 
     def _utc_now(self) -> datetime:
@@ -1937,7 +1964,10 @@ class GarminHistoryArchive:
         """Create and retain one prospective cycle task."""
         coroutine = self._async_run_cycle()
         if isinstance(self._hass, HomeAssistant):
-            task = self._hass.async_create_task(coroutine)
+            task = self._hass.async_create_background_task(
+                coroutine,
+                f"{DOMAIN} archive cycle {self._entry.entry_id}",
+            )
         else:
             task = asyncio.create_task(coroutine)
         self._tasks.add(task)
@@ -1997,15 +2027,11 @@ class GarminHistoryArchive:
                         confirmation_fingerprint=confirmation_fingerprint,
                     )
                     reports.append(reconciliation_report)
-            if (
-                any(report.outcome != "written" for report in reports)
-                and self._status.state
-                not in {HistoryArchiveState.FAILED, HistoryArchiveState.BACKOFF}
-            ):
+            if any(report.outcome != "written" for report in reports):
                 failed_report = next(
                     report for report in reports if report.outcome != "written"
                 )
-                self._set_failed(failed_report.error_type or "cycle")
+                await self._async_handle_failed_run(failed_report, "cycle")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -3051,7 +3077,7 @@ class GarminHistoryArchive:
                 if error.error_type == "rate_limited":
                     if not await self._async_enter_archive_backoff():
                         public_error = "store_unavailable"
-                else:
+                elif error.error_type == "reauth_required":
                     try:
                         await self._async_request_archive_reauth_once()
                     except Exception:

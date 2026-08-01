@@ -3849,8 +3849,8 @@ async def _current_value() -> str:
     return "current-value"
 
 
-async def test_failed_first_sync_does_not_start_recurring_cadence() -> None:
-    """Activation failure leaves no future archive wakeup armed."""
+async def test_failed_first_sync_retries_on_recurring_cadence() -> None:
+    """A recoverable activation failure retries without an integration reload."""
     hass = _hass()
     entry = _entry(
         data={
@@ -3877,7 +3877,10 @@ async def test_failed_first_sync_does_not_start_recurring_cadence() -> None:
     source.async_fetch_details = None
     recorder = MagicMock()
     recorder.async_write = AsyncMock(
-        return_value=RecorderWriteOutcome(0, "failed", "recorder_write")
+        side_effect=(
+            RecorderWriteOutcome(0, "failed", "recorder_write"),
+            *([RecorderWriteOutcome(0)] * 64),
+        )
     )
     archive = GarminHistoryArchive(
         hass,
@@ -3895,7 +3898,20 @@ async def test_failed_first_sync_does_not_start_recurring_cadence() -> None:
     await first_sync_task
 
     assert archive.status.state is HistoryArchiveState.FAILED
-    assert timer.active == []
+    assert archive.status.error_type == "recorder_write"
+    assert archive.status.next_eligible_run is not None
+    assert [slot[0] for slot in timer.active] == [timedelta(minutes=15)]
+
+    timer.fire_next()
+    for _ in range(100):
+        if archive.status.state is HistoryArchiveState.IDLE:
+            break
+        await asyncio.sleep(0)
+
+    assert archive.status.state is HistoryArchiveState.IDLE
+    assert archive.status.error_type is None
+    assert [slot[0] for slot in timer.active] == [timedelta(minutes=15)]
+    await archive.async_stop()
 
 
 @pytest.mark.asyncio
@@ -4061,9 +4077,13 @@ async def test_archive_auth_classification_requires_genuine_account_failure(
     if should_reauth:
         reauth.assert_awaited_once_with(archive._hass)
         assert archive.status.error_type == "reauth_required"
+        assert timer.active == []
+        assert archive.status.next_eligible_run is None
     else:
         reauth.assert_not_awaited()
         assert archive.status.error_type == "garmin_client_error"
+        assert [slot[0] for slot in timer.active] == [timedelta(minutes=15)]
+        assert archive.status.next_eligible_run is not None
     assert archive.status.state is HistoryArchiveState.FAILED
     assert archive.status.as_attributes()["safe_error_class"] in {
         "garmin_client_error",

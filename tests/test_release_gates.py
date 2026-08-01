@@ -428,7 +428,7 @@ def test_release_metadata_targets_beta_and_core_gate() -> None:
     floor = hacs["homeassistant"]
     parsed_floor = _canonical_home_assistant_version(floor)
 
-    assert manifest["version"] == "3.1.0-beta.11"
+    assert manifest["version"] == "3.1.0-beta.12"
     assert [line for line in requirements if line.startswith("homeassistant")] == [
         f"homeassistant>={floor}"
     ]
@@ -445,7 +445,7 @@ def test_release_gate_metadata_matches_manifest_requirements_and_beta_semver() -
     """The offline gate must cover every runtime dependency declared by manifest."""
     release = release_gate.read_release_metadata(ROOT)
 
-    assert release.version == "3.1.0-beta.11"
+    assert release.version == "3.1.0-beta.12"
     assert release.home_assistant == "2026.7.4"
     assert release.requirements["ha-garmin"] == "0.1.31"
     assert release.requirements["garmin-fit-sdk"] == "21.208.0"
