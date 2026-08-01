@@ -285,7 +285,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: GarminConnectConfigEntry
             return True
 
         state = _ENTRY_UPDATE_STATES[entry]
-        state.archive_start_task = entry.async_create_task(
+        state.archive_start_task = entry.async_create_background_task(
             hass,
             _async_start_history_archive(
                 hass, entry, history_archive, state, applied_options

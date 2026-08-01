@@ -74,7 +74,7 @@ def _coord_mock() -> MagicMock:
 def _config_entry_mock(**kwargs) -> MagicMock:
     """Return a config-entry double with HA-managed task creation."""
     entry = MagicMock(**kwargs)
-    entry.async_create_task.side_effect = (
+    entry.async_create_background_task.side_effect = (
         lambda _hass, target, name: asyncio.create_task(target, name=name)
     )
     return entry
@@ -83,6 +83,9 @@ def _config_entry_mock(**kwargs) -> MagicMock:
 def _configure_entry_task_factory(hass: MagicMock) -> None:
     """Make a mocked hass run tasks created through a real ConfigEntry."""
     hass.async_create_task_internal.side_effect = (
+        lambda target, name, _eager_start: asyncio.create_task(target, name=name)
+    )
+    hass.async_create_background_task.side_effect = (
         lambda target, name, _eager_start: asyncio.create_task(target, name=name)
     )
 
@@ -547,6 +550,7 @@ async def test_real_config_entry_lifecycle_keeps_backfill_dormant_and_surfaces_v
             )
             release_setup.set()
             await hass.async_block_till_done()
+            await _await_archive_start_task(entry)
 
             assert schedule_reload.call_count == 2
             assert entry.runtime_data.core.update_interval == timedelta(seconds=602)
@@ -569,6 +573,7 @@ async def test_real_config_entry_lifecycle_keeps_backfill_dormant_and_surfaces_v
                 options={CONF_ARCHIVE_ENABLED: False, CONF_SCAN_INTERVAL: 602},
             )
             await hass.async_block_till_done()
+            await _await_archive_start_task(entry)
             schedule_reload.reset_mock()
             reload_entry.reset_mock()
             first_sync.reset_mock()
@@ -583,6 +588,7 @@ async def test_real_config_entry_lifecycle_keeps_backfill_dormant_and_surfaces_v
                     data={**entry.data, CONF_TOKEN: "token-before-options-listener"},
                 )
                 await hass.async_block_till_done()
+                await _await_archive_start_task(entry)
 
             schedule_reload.assert_called_once_with(entry.entry_id)
             assert entry.data[CONF_TOKEN] == "token-before-options-listener"
@@ -610,6 +616,7 @@ async def test_real_config_entry_lifecycle_keeps_backfill_dormant_and_surfaces_v
                 options={CONF_ARCHIVE_ENABLED: True, CONF_SCAN_INTERVAL: 602},
             )
             await hass.async_block_till_done()
+            await _await_archive_start_task(entry)
             assert schedule_reload.call_count == 2
 
             from custom_components.garmin_connect.config_flow import GarminConnectConfigFlow
@@ -898,11 +905,12 @@ async def test_setup_entry_success() -> None:
 
     assert result is True
     assert entry.runtime_data is not None
-    entry.async_create_task.assert_called_once()
-    assert entry.async_create_task.call_args.args[0] is hass
-    assert entry.async_create_task.call_args.kwargs == {
+    entry.async_create_background_task.assert_called_once()
+    assert entry.async_create_background_task.call_args.args[0] is hass
+    assert entry.async_create_background_task.call_args.kwargs == {
         "name": "garmin_connect archive startup"
     }
+    entry.async_create_task.assert_not_called()
 
 
 async def test_enabled_first_sync_does_not_delay_platform_forwarding() -> None:
@@ -1088,6 +1096,7 @@ async def test_options_changed_during_archive_start_reload_latest_once(tmp_path)
             block_archive_start = False
             release_archive.set()
             await hass.async_block_till_done()
+            await _await_archive_start_task(entry)
 
             assert schedule_reload.call_count == 2
             assert entry.runtime_data.core.update_interval == timedelta(seconds=602)
@@ -1259,7 +1268,7 @@ async def test_stalled_recorder_check_starts_archive_in_background_and_can_cance
     hass.config_entries.async_forward_entry_setups = AsyncMock()
     coordinator = _coord_mock()
     created_tasks: list[asyncio.Task[None]] = []
-    entry.async_create_task.side_effect = (
+    entry.async_create_background_task.side_effect = (
         lambda _hass, target, name: created_tasks.append(
             asyncio.create_task(target, name=name)
         )
@@ -1297,6 +1306,53 @@ async def test_stalled_recorder_check_starts_archive_in_background_and_can_cance
     created_tasks[0].cancel()
     with pytest.raises(asyncio.CancelledError):
         await created_tasks[0]
+
+
+async def test_archive_startup_wait_does_not_block_home_assistant(tmp_path) -> None:
+    """An archive waiting during startup is excluded from HA bootstrap work."""
+    hass = HomeAssistant(str(tmp_path))
+    hass.config_entries = ConfigEntries(hass, {})
+    loader.async_setup(hass)
+    entry = _real_config_entry("entry-background-archive-start")
+    coordinator = _coord_mock()
+    archive_started = asyncio.Event()
+    release_archive = asyncio.Event()
+    archive = MagicMock()
+
+    async def wait_during_start() -> None:
+        archive_started.set()
+        await release_archive.wait()
+
+    archive.async_start = AsyncMock(side_effect=wait_during_start)
+    archive.async_stop = AsyncMock()
+
+    try:
+        with ExitStack() as stack:
+            stack.enter_context(patch("custom_components.garmin_connect.GarminAuth"))
+            stack.enter_context(patch("custom_components.garmin_connect.GarminClient"))
+            _stack_coordinators(stack, coordinator)
+            stack.enter_context(
+                patch(
+                    "custom_components.garmin_connect.GarminHistoryArchive",
+                    return_value=archive,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    hass.config_entries,
+                    "async_forward_entry_setups",
+                    new=AsyncMock(),
+                )
+            )
+
+            assert await async_setup_entry(hass, entry) is True
+            await asyncio.wait_for(archive_started.wait(), timeout=0.1)
+            await asyncio.wait_for(hass.async_block_till_done(), timeout=0.1)
+    finally:
+        release_archive.set()
+        await _await_archive_start_task(entry)
+        hass.config_entries._store._async_cleanup_delay_listener()
+        await hass.async_stop(force=True)
 
 
 async def test_missing_recorder_task_only_fails_archive_setup(
