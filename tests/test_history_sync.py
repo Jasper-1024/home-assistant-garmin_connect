@@ -107,10 +107,17 @@ def _sync_archive(source, recorder, store, *, options=None):
     entry = MagicMock(data={"history_account_key": "opaque-account-key-1234567890"}, entry_id="e")
     entry.options = {CONF_ARCHIVE_ENABLED: False} if options is None else options
     entry.runtime_data = SimpleNamespace(core=SimpleNamespace(client=object()), request_gate=object())
+    daily_status_stores = {}
+
+    def store_factory(_hass, _version, path, **_kwargs):
+        if ".daily_status_" in path:
+            return daily_status_stores.setdefault(path, _NamedStore())
+        return store
+
     archive = GarminHistoryArchive(
         MagicMock(), entry,
         recorder_checker=SimpleNamespace(async_check=AsyncMock(return_value=RecorderCompatibilityResult.compatible_result())),
-        store_factory=lambda *args, **kwargs: store,
+        store_factory=store_factory,
         source_factory=lambda *args: source,
         recorder_factory=lambda: recorder,
     )
@@ -368,6 +375,7 @@ async def test_top_level_heart_rate_and_stress_lists_persist_samples_and_presenc
     client.get_training_status = AsyncMock(return_value={})
     client._get_sleep_data_raw = AsyncMock(return_value={})
     client._get_hrv_data_raw = AsyncMock(return_value={"hrvReadings": []})
+    client.get_fitness_age = AsyncMock(return_value=None)
     client.get_activities = AsyncMock(return_value=[])
 
     async def request(_method, url, **_kwargs):
@@ -411,6 +419,7 @@ async def test_null_intraday_payloads_checkpoint_presence_without_samples() -> N
     client.get_training_status = AsyncMock(return_value={})
     client._get_sleep_data_raw = AsyncMock(return_value=None)
     client._get_hrv_data_raw = AsyncMock(return_value=None)
+    client.get_fitness_age = AsyncMock(return_value=None)
     client.get_activities = AsyncMock(return_value=[])
     client._request = AsyncMock(return_value=None)
     source = GarminHistorySource(client, _ImmediateGate())

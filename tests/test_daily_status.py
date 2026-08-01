@@ -275,6 +275,10 @@ def test_live_training_and_sleep_status_shapes_normalize_without_failure():
                     "maxMetCategory": 2,
                     "vo2MaxValue": 48,
                 },
+                "running": {
+                    "calendarDate": "2026-08-01",
+                    "vo2MaxValue": 49,
+                },
                 "userId": 123,
             },
             "mostRecentTrainingLoadBalance": {
@@ -285,7 +289,11 @@ def test_live_training_and_sleep_status_shapes_normalize_without_failure():
                         "monthlyLoadAerobicLowTargetMin": 200,
                         "primaryTrainingDevice": True,
                         "trainingBalanceFeedbackPhrase": "AEROBIC_HIGH_SHORTAGE",
-                    }
+                    },
+                    "other": {
+                        "calendarDate": "2026-08-01",
+                        "monthlyLoadAerobicLow": 200,
+                    },
                 }
             },
         },
@@ -294,10 +302,43 @@ def test_live_training_and_sleep_status_shapes_normalize_without_failure():
     assert not any(record.presence == "failed" for record in training)
     assert any(record.record_key.startswith("training_load_balance:") for record in training)
     assert any(
-        metric.key == "training_load_balance_monthly_load_aerobic_low"
+        metric.key.startswith("training_load_balance_monthly_load_aerobic_low_")
         for record in training
         for metric in record.metrics
     )
+    load_records = {
+        record.record_key
+        for record in training
+        if record.record_key.startswith("training_load_balance:")
+        for metric in record.metrics
+        if metric.key
+        == "training_load_balance_monthly_load_aerobic_low_"
+        + record.record_key.rsplit(":", 1)[1]
+    }
+    assert len(load_records) == 2
+    vo2_keys = {
+        metric.key
+        for record in training
+        if record.record_key.startswith("training_vo2:")
+        for metric in record.metrics
+        if "vo2_max" in metric.key
+    }
+    assert "training_vo2_max_generic" in vo2_keys
+    assert "training_vo2_max_running" in vo2_keys
+
+    metadata_null = normalize_training_daily_records(
+        {"mostRecentVO2Max": {"userId": None}}, TARGET
+    )
+    assert not any("user_id" in record.record_key for record in metadata_null)
+    null_balance = normalize_training_daily_records(
+        {
+            "mostRecentTrainingLoadBalance": {
+                "metricsTrainingLoadBalanceDTOMap": {"watch": None}
+            }
+        },
+        TARGET,
+    )
+    assert any(record.presence == "null" for record in null_balance)
 
     sleep = normalize_sleep_daily_records(
         {

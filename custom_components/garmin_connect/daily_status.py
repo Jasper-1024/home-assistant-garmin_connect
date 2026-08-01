@@ -270,6 +270,22 @@ def _with_record_key(
     )
 
 
+def _with_metric_suffix(
+    record: DailyStatusRecord,
+    suffix: str,
+    *,
+    replace_existing_suffix: bool = False,
+) -> DailyStatusRecord:
+    """Keep independent Recorder identity for one status subsource."""
+    metrics: list[DailyStatusMetric] = []
+    for metric in record.metrics:
+        key = metric.key
+        if replace_existing_suffix:
+            key = re.sub(r"_(?:generic|[0-9a-f]{12})$", "", key)
+        metrics.append(replace(metric, key=f"{key}_{suffix}"))
+    return replace(record, metrics=tuple(metrics))
+
+
 def normalize_hrv_status(payload: Any, target_date: date) -> DailyStatusRecord:
     """Normalize Garmin's bounded nightly HRV summary."""
     root = _mapping(payload, "HRV payload")
@@ -502,6 +518,8 @@ def normalize_training_daily_records(
         )
         vo2 = {}
     for raw_key, item in vo2.items():
+        if str(raw_key) in {"userId"}:
+            continue
         suffix = _stat_key(str(raw_key))
         if item is None:
             records.append(
@@ -524,6 +542,9 @@ def normalize_training_daily_records(
             )
         except HistorySchemaError:
             record = unavailable_daily_status("training", target_date, "failed")
+        record = _with_metric_suffix(
+            record, suffix, replace_existing_suffix=True
+        )
         records.append(_with_record_key(record, f"training_vo2:{suffix}"))
     raw_balance = root.get("mostRecentTrainingLoadBalance")
     if raw_balance is not None:
@@ -547,12 +568,16 @@ def normalize_training_daily_records(
         )
         for raw_id, item in candidates.items():
             suffix = _device_suffix(str(raw_id)) if raw_id != "generic" else "generic"
-            try:
-                record = normalize_training_daily_status(
-                    {"mostRecentTrainingLoadBalance": item}, target_date
-                )
-            except HistorySchemaError:
-                record = unavailable_daily_status("training", target_date, "failed")
+            if item is None:
+                record = unavailable_daily_status("training", target_date, "null")
+            else:
+                try:
+                    record = normalize_training_daily_status(
+                        {"mostRecentTrainingLoadBalance": item}, target_date
+                    )
+                except HistorySchemaError:
+                    record = unavailable_daily_status("training", target_date, "failed")
+            record = _with_metric_suffix(record, suffix)
             records.append(
                 _with_record_key(record, f"training_load_balance:{suffix}")
             )
