@@ -20,22 +20,19 @@ esac
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/.." && pwd)"
 remote_host="k2s"
-remote_config="/opt/hassio/homeassistant"
 source_dir="$repo_root/custom_components/garmin_connect/"
-remote_dir="$remote_config/custom_components/garmin_connect/"
-
-ssh -o BatchMode=yes "$remote_host" "mkdir -p '$remote_dir'"
-if ssh -o BatchMode=yes "$remote_host" "which rsync >/dev/null 2>&1"; then
-  rsync -az --checksum --exclude='__pycache__/' --exclude='*.pyc' \
-    "$source_dir" "$remote_host:$remote_dir"
-else
-  tar --exclude='__pycache__' --exclude='*.pyc' -C "$source_dir" -cf - . |
-    ssh -o BatchMode=yes "$remote_host" "tar -C '$remote_dir' -xf -"
-fi
+container_name="homeassistant"
+container_dir="/config/custom_components/garmin_connect/"
 
 ssh -o BatchMode=yes "$remote_host" \
-  "python3 -m json.tool '$remote_dir/manifest.json' | grep '\"version\"'"
+  "docker exec '$container_name' mkdir -p '$container_dir'"
+tar --exclude='__pycache__' --exclude='*.pyc' -C "$source_dir" -cf - . |
+  ssh -o BatchMode=yes "$remote_host" \
+    "docker exec -i '$container_name' tar --overwrite --no-same-owner -C '$container_dir' -xf -"
+
+ssh -o BatchMode=yes "$remote_host" \
+  "docker exec '$container_name' python3 -m json.tool '$container_dir/manifest.json' | grep '\"version\"'"
 
 if [ "$restart" = true ]; then
-  ssh -o BatchMode=yes "$remote_host" "docker restart homeassistant"
+  ssh -o BatchMode=yes "$remote_host" "docker restart '$container_name'"
 fi
