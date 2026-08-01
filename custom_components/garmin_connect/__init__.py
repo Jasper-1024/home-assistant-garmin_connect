@@ -47,7 +47,7 @@ _LOGGER = logging.getLogger(__name__)
 
 # Recorder's queue confirmation can legitimately wait for its own five-minute
 # hard limit. Archive is optional, so core setup gets a separate short bound.
-_ARCHIVE_STARTUP_TIMEOUT = 5
+_ARCHIVE_STARTUP_TIMEOUT = 60
 
 
 @dataclass(slots=True)

@@ -537,12 +537,29 @@ def _descriptors(payload: dict[str, Any], keys: tuple[str, ...]) -> dict[str, in
             raise HistorySchemaError(f"{key} is not a descriptor list")
         result: dict[str, int] = {}
         for item in raw:
-            if not isinstance(item, dict) or not isinstance(item.get("key"), str) or not isinstance(item.get("index"), int) or isinstance(item.get("index"), bool):
+            if not isinstance(item, dict):
                 raise HistorySchemaError(f"{key} contains a malformed descriptor")
-            index = item["index"]
-            if index < 0 or item["key"] in result or index in result.values():
+            descriptor_key = item.get("key")
+            index = item.get("index")
+            if descriptor_key is None and index is None:
+                pairs = [
+                    (name, name.removesuffix("Index") + "Key")
+                    for name in item
+                    if name.endswith("Index") and name.removesuffix("Index") + "Key" in item
+                ]
+                if len(pairs) == 1:
+                    index_name, key_name = pairs[0]
+                    index = item[index_name]
+                    descriptor_key = item[key_name]
+            if (
+                not isinstance(descriptor_key, str)
+                or not isinstance(index, int)
+                or isinstance(index, bool)
+            ):
+                raise HistorySchemaError(f"{key} contains a malformed descriptor")
+            if index < 0 or descriptor_key in result or index in result.values():
                 raise HistorySchemaError(f"{key} contains an invalid descriptor index")
-            result[item["key"]] = index
+            result[descriptor_key] = index
         return result
     return {}
 
@@ -633,10 +650,20 @@ def _object_series(
             continue
         if not isinstance(point, dict):
             raise HistorySchemaError("segmented point is not an object")
-        raw_time = _first_non_null(
-            point,
-            ("timestamp", "time", "startTime", "start", "readingTime", "readingTimeGMT"),
+        timestamp_aliases = (
+            "timestamp",
+            "time",
+            "startTime",
+            "start",
+            "readingTime",
+            "readingTimeGMT",
+            "startTimeGMT",
+            "startGMT",
         )
+        timestamp_key = next(
+            (key for key in timestamp_aliases if point.get(key) is not None), None
+        )
+        raw_time = point[timestamp_key] if timestamp_key is not None else _MISSING
         raw_value = _first_non_null(point, value_keys)
         if raw_time is _MISSING or raw_value is _MISSING:
             raise HistorySchemaError("segmented point lacks required fields")
@@ -646,7 +673,11 @@ def _object_series(
             raise HistorySchemaError("segmented timestamp has an invalid type")
         if isinstance(raw_value, bool) or not isinstance(raw_value, int | float):
             raise HistorySchemaError("segmented value has an invalid type")
-        parsed = _timestamp(raw_time)
+        parsed = (
+            _timestamp_as_utc(raw_time)
+            if timestamp_key is not None and timestamp_key.endswith("GMT")
+            else _timestamp(raw_time)
+        )
         if parsed is None:
             raise HistorySchemaError("segmented timestamp has an invalid value")
         if exclude_negative and raw_value < 0:
@@ -896,9 +927,9 @@ def normalize_respiration(payload: Any, target_date: date, averages: bool = Fals
 
 def normalize_spo2(payload: Any, target_date: date, variant: str) -> SourceSeries:
     configs = {
-        "single": (("spO2SingleValues", "spo2SingleValues", "singleValues"), ("spO2", "spo2", "value")),
-        "continuous": (("continuousReadingDTOList", "spO2ContinuousValues", "spo2ContinuousValues", "continuousValues"), ("spO2", "spo2", "reading", "value")),
-        "hourly": (("spO2HourlyAverages", "spo2HourlyAverages", "hourlyAverages"), ("spO2", "spo2", "average", "value")),
+        "single": (("spO2SingleValues", "spo2SingleValues", "singleValues"), ("spO2", "spo2", "spO2Reading", "spo2Reading", "value")),
+        "continuous": (("continuousReadingDTOList", "spO2ContinuousValues", "spo2ContinuousValues", "continuousValues"), ("spO2", "spo2", "spO2Reading", "spo2Reading", "reading", "value")),
+        "hourly": (("spO2HourlyAverages", "spo2HourlyAverages", "hourlyAverages"), ("spO2", "spo2", "spO2Reading", "spo2Reading", "average", "value")),
     }
     if variant not in configs:
         raise ValueError("unsupported SpO2 variant")
@@ -1157,7 +1188,11 @@ def parse_hrv_data(payload: Any, target_date: date) -> HRVData:
             continue
         if not isinstance(reading, dict):
             raise HistorySchemaError("HRV reading is not an object")
-        raw_time = _first_non_null(reading, ("readingTimeGMT", "readingTimeGmt", "readingTime"))
+        timestamp_aliases = ("readingTimeGMT", "readingTimeGmt", "readingTime")
+        timestamp_key = next(
+            (key for key in timestamp_aliases if reading.get(key) is not None), None
+        )
+        raw_time = reading[timestamp_key] if timestamp_key is not None else _MISSING
         raw_value = _first_non_null(reading, ("hrvValue", "value"))
         if raw_time is _MISSING or raw_value is _MISSING:
             raise HistorySchemaError("HRV reading lacks required fields")
@@ -1167,7 +1202,11 @@ def parse_hrv_data(payload: Any, target_date: date) -> HRVData:
             raise HistorySchemaError("HRV value has an invalid type")
         if raw_time is None or raw_value is None:
             continue
-        parsed = _timestamp(raw_time)
+        parsed = (
+            _timestamp_as_utc(raw_time)
+            if timestamp_key is not None and timestamp_key.lower().endswith("gmt")
+            else _timestamp(raw_time)
+        )
         if parsed is None:
             raise HistorySchemaError("HRV timestamp has an invalid value")
         readings.append(NormalizedSample(parsed, target_date, raw_time, float(raw_value)))
@@ -1284,7 +1323,10 @@ class GarminHistorySource:
             if metric == "body_battery":
                 return await self.client._request(
                     "GET", f"{base}/wellness-service/wellness/bodyBattery/reports/daily",
-                    params={"date": target_date.isoformat()},
+                    params={
+                        "startDate": target_date.isoformat(),
+                        "endDate": target_date.isoformat(),
+                    },
                 )
             if metric == "nightly_hrv":
                 return await self.client._get_hrv_data_raw(target_date)
@@ -1339,7 +1381,7 @@ class GarminHistorySource:
                 payload,
                 target_date,
                 ("heartRateValues",),
-                ("heartRate", "heartRateValue", "value"),
+                ("heartRate", "heartrate", "heartRateValue", "value"),
                 ("heartRateValueDescriptors",),
             )
         return _normalize_source_series(

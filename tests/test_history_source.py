@@ -69,6 +69,67 @@ def test_normalize_pair_series_uses_descriptors_and_keeps_ordered_equal_values()
     assert samples[1].raw_timestamp == 1_784_852_400_000
 
 
+def test_current_garmin_intraday_shapes_normalize() -> None:
+    """Accept descriptor, GMT, and chart shapes captured from Garmin Connect."""
+    target = date(2026, 8, 1)
+    heart_rate = normalize_pair_series(
+        {
+            "heartRateValueDescriptors": [
+                {"index": 0, "key": "timestamp"},
+                {"index": 1, "key": "heartrate"},
+            ],
+            "heartRateValues": [[1_785_513_600_000, 61]],
+        },
+        values_key="heartRateValues",
+        descriptor_keys=("heartRateValueDescriptors",),
+        value_keys=("heartRate", "heartrate"),
+        request_date=target,
+    )
+    hrv = parse_hrv_data(
+        {"hrvReadings": [{"readingTimeGMT": "2026-07-31T15:15:45.0", "hrvValue": 42}]},
+        target,
+    )
+    steps = normalize_steps(
+        [{"startGMT": "2026-07-31T16:00:00.0", "endGMT": "2026-07-31T16:15:00.0", "steps": 12}],
+        target,
+    )
+    spo2 = normalize_spo2(
+        {
+            "spO2ValueDescriptorsDTOList": [
+                {"spo2ValueDescriptorIndex": 0, "spo2ValueDescriptorKey": "timestamp"},
+                {"spo2ValueDescriptorIndex": 1, "spo2ValueDescriptorKey": "spo2Reading"},
+            ],
+            "spO2HourlyAverages": [[1_785_513_600_000, 91]],
+        },
+        target,
+        "hourly",
+    )
+
+    assert heart_rate[0].value == 61.0
+    assert hrv.readings[0].timestamp == datetime(2026, 7, 31, 15, 15, 45, tzinfo=UTC)
+    assert steps.readings[0].timestamp == datetime(2026, 7, 31, 16, tzinfo=UTC)
+    assert spo2.readings[0].value == 91.0
+
+
+@pytest.mark.asyncio
+async def test_body_battery_uses_date_range_parameters() -> None:
+    """Use the upstream Body Battery endpoint's required date-range contract."""
+    client = MagicMock()
+    client._base_url = "https://garmin.example"
+    client._request = AsyncMock(return_value=[])
+
+    result = await GarminHistorySource(client, _ImmediateGate()).async_fetch_details(
+        date(2026, 8, 1), "body_battery"
+    )
+
+    assert isinstance(result, SourceSeries)
+    client._request.assert_awaited_once_with(
+        "GET",
+        "https://garmin.example/wellness-service/wellness/bodyBattery/reports/daily",
+        params={"startDate": "2026-08-01", "endDate": "2026-08-01"},
+    )
+
+
 def test_measurement_without_source_instant_offset_fails_closed() -> None:
     with pytest.raises(HistorySchemaError):
         normalize_pair_series(
