@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -24,6 +25,7 @@ from homeassistant.config_entries import (
     OptionsFlow,
 )
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
+from homeassistant.helpers import config_validation as cv
 
 from .const import (
     CONF_ARCHIVE_ENABLED,
@@ -55,6 +57,11 @@ STEP_MFA_DATA_SCHEMA = vol.Schema(
         vol.Required("mfa_code"): str,
     }
 )
+
+
+def _is_valid_debug_replay_session(value: str) -> bool:
+    """Accept a single capture directory name, or an empty replay selection."""
+    return not value or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value) is not None
 
 
 class GarminConnectConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -327,6 +334,18 @@ class GarminConnectOptionsFlow(OptionsFlow):
             debug_replay_session = user_input.get(
                 CONF_DEBUG_REPLAY_SESSION, current_debug_replay_session
             ).strip()
+            if not _is_valid_debug_replay_session(debug_replay_session):
+                return self.async_show_form(
+                    step_id="init",
+                    data_schema=self._schema(
+                        current_scan_interval,
+                        current_is_cn,
+                        current_archive_enabled,
+                        current_debug_capture_enabled,
+                        current_debug_replay_session,
+                    ),
+                    errors={"base": "debug_replay_session_invalid"},
+                )
             if debug_capture_enabled and debug_replay_session:
                 return self.async_show_form(
                     step_id="init",
@@ -387,10 +406,6 @@ class GarminConnectOptionsFlow(OptionsFlow):
                 ): bool,
                 vol.Optional(
                     CONF_DEBUG_REPLAY_SESSION, default=debug_replay_session
-                ): vol.All(
-                    str,
-                    vol.Length(max=128),
-                    vol.Match(r"^$|^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"),
-                ),
+                ): cv.string,
             }
         )

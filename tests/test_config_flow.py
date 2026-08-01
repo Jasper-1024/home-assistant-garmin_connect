@@ -3,6 +3,8 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from ha_garmin import GarminAuthError, GarminConnectError, GarminMFARequired, GarminRateLimitError
+from homeassistant.helpers import config_validation as cv
+from voluptuous_serialize import convert
 
 from custom_components.garmin_connect.const import (
     CONF_ARCHIVE_ENABLED,
@@ -296,6 +298,15 @@ async def test_options_flow_shows_form() -> None:
     assert result["step_id"] == "init"
 
 
+async def test_options_flow_schema_serializes_for_the_home_assistant_ui() -> None:
+    """Options fields must use validators that HA can send to the frontend."""
+    flow = _make_options_flow({})
+
+    result = await flow.async_step_init(None)
+
+    assert convert(result["data_schema"], custom_serializer=cv.custom_serializer)
+
+
 async def test_options_flow_saves_new_interval() -> None:
     """Submitting the options form must create an entry with the chosen interval."""
     flow = _make_options_flow({CONF_SCAN_INTERVAL: DEFAULT_SCAN_INTERVAL})
@@ -343,6 +354,16 @@ async def test_options_flow_accepts_debug_capture_or_replay_but_not_both() -> No
     )
     assert conflict["type"] == "form"
     assert conflict["errors"] == {"base": "debug_capture_replay_conflict"}
+
+
+async def test_options_flow_rejects_debug_replay_path_traversal() -> None:
+    """Replay must remain inside this entry's local capture directory."""
+    flow = _make_options_flow({})
+
+    result = await flow.async_step_init({CONF_DEBUG_REPLAY_SESSION: "../capture"})
+
+    assert result["type"] == "form"
+    assert result["errors"] == {"base": "debug_replay_session_invalid"}
 
 
 async def test_options_flow_submission_keeps_archive_disabled_by_default() -> None:

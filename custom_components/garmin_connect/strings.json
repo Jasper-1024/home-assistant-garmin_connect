@@ -83,7 +83,8 @@
           "debug_replay_session": "Session directory name under config/tmp/garmin_connect/<entry-id>. Replay makes no Garmin network requests; leave blank for normal or capture mode."
         },
         "error": {
-          "debug_capture_replay_conflict": "Capture and replay cannot be enabled at the same time."
+          "debug_capture_replay_conflict": "Capture and replay cannot be enabled at the same time.",
+          "debug_replay_session_invalid": "Replay session must be one capture directory name."
         },
         "description": "Configure your Garmin Connect integration settings.",
         "title": "Garmin Connect Options"
