@@ -26,6 +26,7 @@ from ha_garmin.exceptions import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.start import async_at_started
 from homeassistant.util import dt as dt_util
 
 from .backfill import (
@@ -946,6 +947,7 @@ class HomeAssistantRecorderCompatibility:
             if not isinstance(Statistics, type):
                 return RecorderCompatibilityResult.incompatible_result("statistics_model")
 
+            await _async_wait_for_home_assistant_started(self.hass)
             recorder = get_instance(self.hass)
             await async_confirm_recorder_queue(recorder)
         except asyncio.CancelledError:
@@ -964,6 +966,24 @@ class HomeAssistantRecorderCompatibility:
     def __init__(self, hass: HomeAssistant) -> None:
         """Initialize the checker for one Home Assistant instance."""
         self.hass = hass
+
+
+async def _async_wait_for_home_assistant_started(hass: HomeAssistant) -> None:
+    """Wait to queue Recorder work until its consumer has started."""
+    if not hasattr(hass, "state") or not hasattr(hass, "bus"):
+        return
+
+    started = asyncio.get_running_loop().create_future()
+
+    def _mark_started(_: HomeAssistant) -> None:
+        if not started.done():
+            started.set_result(None)
+
+    cancel = async_at_started(hass, _mark_started)
+    try:
+        await started
+    finally:
+        cancel()
 
 
 def _require_parameters(callable_obj: Any, expected: tuple[str, ...]) -> None:

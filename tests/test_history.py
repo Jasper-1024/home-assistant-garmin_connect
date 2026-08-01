@@ -4902,6 +4902,36 @@ async def test_recorder_compatibility_uses_real_scratch_recorder() -> None:
     assert result == RecorderCompatibilityResult.compatible_result()
 
 
+async def test_recorder_compatibility_waits_for_core_started_before_queueing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup cannot enqueue a Recorder barrier before Recorder consumes tasks."""
+    hass = SimpleNamespace(state=object(), bus=object())
+    recorder = MagicMock()
+    confirm = AsyncMock()
+    callbacks: list[Callable[[HomeAssistant], None]] = []
+    monkeypatch.setattr(
+        "homeassistant.helpers.recorder.get_instance", lambda _hass: recorder
+    )
+    monkeypatch.setattr(history_module, "async_confirm_recorder_queue", confirm)
+
+    def at_started(_hass: HomeAssistant, callback: Callable[[HomeAssistant], None]):
+        callbacks.append(callback)
+        return lambda: None
+
+    monkeypatch.setattr(history_module, "async_at_started", at_started)
+
+    check_task = asyncio.create_task(HomeAssistantRecorderCompatibility(hass).async_check())
+    await asyncio.sleep(0)
+    confirm.assert_not_awaited()
+
+    assert len(callbacks) == 1
+    callbacks[0](hass)
+    assert await check_task == RecorderCompatibilityResult.compatible_result()
+
+    confirm.assert_awaited_once_with(recorder)
+
+
 @pytest.mark.parametrize(
     ("version", "expected"),
     (
