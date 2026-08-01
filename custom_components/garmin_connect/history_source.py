@@ -96,6 +96,13 @@ class SnapshotData:
 
 
 @dataclass(frozen=True, slots=True)
+class TrainingDeviceSnapshots:
+    """One Garmin-computed training snapshot per returned device."""
+
+    snapshots: dict[str, SnapshotData]
+
+
+@dataclass(frozen=True, slots=True)
 class NormalizedHealthEvent:
     """Sanitized Garmin event without health-value payloads."""
 
@@ -294,7 +301,7 @@ def health_event_from_record(record: Mapping[str, Any]) -> NormalizedHealthEvent
 
 HistorySeries = tuple[NormalizedSample, ...]
 HistoryResult = HistorySeries | tuple[SleepSession, ...] | tuple[NormalizedHealthEvent, ...] | tuple[NormalizedActivity, ...]
-HistoryDetails = HistorySeries | HRVData | SegmentedData | SourceSeries | SnapshotData | tuple[SleepSession, ...] | tuple[NormalizedHealthEvent, ...] | tuple[NormalizedActivity, ...]
+HistoryDetails = HistorySeries | HRVData | SegmentedData | SourceSeries | SnapshotData | TrainingDeviceSnapshots | tuple[SleepSession, ...] | tuple[NormalizedHealthEvent, ...] | tuple[NormalizedActivity, ...]
 
 
 def normalize_health_events(payload: Any, target_date: date) -> tuple[NormalizedHealthEvent, ...]:
@@ -342,9 +349,31 @@ def normalize_health_events(payload: Any, target_date: date) -> tuple[Normalized
     if len(raw_events) > 512:
         raise HistorySchemaError("health event batch exceeds bounded limit")
     result: dict[str, NormalizedHealthEvent] = {}
-    for event in raw_events[:512]:
-        if not isinstance(event, dict):
+    for raw_event in raw_events[:512]:
+        if not isinstance(raw_event, dict):
             raise HistorySchemaError("health event has invalid type")
+        event = raw_event
+        nested_event = raw_event.get("event")
+        if nested_event is not None:
+            if not isinstance(nested_event, dict):
+                raise HistorySchemaError("health event envelope has invalid type")
+            event = dict(nested_event)
+            event["source"] = "GARMIN"
+            if "eventStartTimeGmt" in event:
+                event["startTimeGMT"] = event["eventStartTimeGmt"]
+            duration = event.get("durationInMilliseconds")
+            if duration is not None:
+                if isinstance(duration, bool) or not isinstance(duration, int | float):
+                    raise HistorySchemaError("health event duration has invalid type")
+                _, event_start = _timestamp_from_aliases(
+                    event, ("startTimeGMT",), reject_malformed=True
+                )
+                if event_start is not None:
+                    event["endTimeGMT"] = (
+                        event_start + timedelta(milliseconds=float(duration))
+                    ).isoformat()
+            if "feedbackType" in event and "category" not in event:
+                event["category"] = event["feedbackType"]
         source = next((event[key] for key in ("source", "eventSource") if key in event), None)
         event_type = next((event[key] for key in ("type", "eventType") if key in event), None)
         category = next((event[key] for key in ("category", "eventCategory") if key in event), None)
@@ -411,13 +440,93 @@ def normalize_snapshot(
     return SnapshotData(fields, timestamp, raw_timestamp, events, calendar_date)
 
 
-DAILY_SUMMARY_FIELDS = {"abnormal_heart_rate_alerts": ("abnormalHeartRateAlertsCount",)}
+DAILY_SUMMARY_FIELDS = {
+    "abnormal_heart_rate_alerts": ("abnormalHeartRateAlertsCount",),
+    "floors_ascended": ("floorsAscended",),
+    "floors_descended": ("floorsDescended",),
+    "floors_ascended_meters": ("floorsAscendedInMeters",),
+    "floors_descended_meters": ("floorsDescendedInMeters",),
+    "intensity_moderate": ("moderateIntensityMinutes",),
+    "intensity_vigorous": ("vigorousIntensityMinutes",),
+}
 TRAINING_STATUS_FIELDS = {
     "acute_load": ("acuteLoad",), "chronic_load": ("chronicLoad",),
     "load_balance": ("loadBalance",), "acwr": ("acwr", "acuteChronicWorkloadRatio"),
     "vo2_max": ("vo2Max", "vo2MaxValue"), "fitness_trend": ("fitnessTrend",),
     "recovery_time": ("recoveryTime",),
 }
+
+
+def normalize_training_status(
+    payload: Any, target_date: date
+) -> SnapshotData | TrainingDeviceSnapshots:
+    """Normalize flat legacy or current device-keyed training status payloads."""
+    if not isinstance(payload, dict) or "mostRecentTrainingStatus" not in payload:
+        return normalize_snapshot(payload, target_date, TRAINING_STATUS_FIELDS)
+    status_container = payload.get("mostRecentTrainingStatus")
+    if not isinstance(status_container, dict):
+        raise HistorySchemaError("training status container has invalid type")
+    status_by_device = status_container.get("latestTrainingStatusData")
+    if status_by_device is None:
+        return TrainingDeviceSnapshots({})
+    if not isinstance(status_by_device, dict):
+        raise HistorySchemaError("training status devices have invalid type")
+    if len(status_by_device) > 32:
+        raise HistorySchemaError("training status has too many devices")
+
+    vo2_by_device: dict[str, Any] = {}
+    vo2_container = payload.get("mostRecentVO2Max")
+    if vo2_container is not None:
+        if not isinstance(vo2_container, dict):
+            raise HistorySchemaError("training VO2 container has invalid type")
+        for candidate in vo2_container.values():
+            if not isinstance(candidate, dict):
+                continue
+            device_id = candidate.get("deviceId")
+            if isinstance(device_id, str | int) and not isinstance(device_id, bool):
+                for key in ("vo2MaxValue", "vo2MaxPreciseValue"):
+                    if key in candidate:
+                        vo2_by_device[str(device_id)] = candidate[key]
+                        break
+
+    snapshots: dict[str, SnapshotData] = {}
+    for map_device_id, item in status_by_device.items():
+        if not isinstance(item, dict):
+            raise HistorySchemaError("training device snapshot has invalid type")
+        raw_device_id = item.get("deviceId", map_device_id)
+        if (
+            isinstance(raw_device_id, bool)
+            or not isinstance(raw_device_id, str | int)
+            or not str(raw_device_id)
+            or len(str(raw_device_id)) > 64
+        ):
+            raise HistorySchemaError("training device identity has invalid type")
+        device_id = str(raw_device_id)
+        if device_id in snapshots:
+            raise HistorySchemaError("training device identity is duplicated")
+        acute = item.get("acuteTrainingLoadDTO")
+        if acute is None:
+            acute = {}
+        if not isinstance(acute, dict):
+            raise HistorySchemaError("training load snapshot has invalid type")
+        flattened = {
+            "calendarDate": item.get("calendarDate", target_date.isoformat()),
+        }
+        for source_key, target_key in (
+            ("dailyTrainingLoadAcute", "acuteLoad"),
+            ("dailyTrainingLoadChronic", "chronicLoad"),
+            ("dailyAcuteChronicWorkloadRatio", "acwr"),
+        ):
+            if source_key in acute:
+                flattened[target_key] = acute[source_key]
+        if "fitnessTrend" in item:
+            flattened["fitnessTrend"] = item["fitnessTrend"]
+        if device_id in vo2_by_device:
+            flattened["vo2MaxValue"] = vo2_by_device[device_id]
+        snapshots[device_id] = normalize_snapshot(
+            flattened, target_date, TRAINING_STATUS_FIELDS
+        )
+    return TrainingDeviceSnapshots(snapshots)
 
 
 def _timestamp(value: Any, *, allow_date_only: bool = False) -> datetime | None:
@@ -1049,9 +1158,14 @@ def normalize_intensity(payload: Any, target_date: date, kind: str) -> Segmented
     return _normalize_segmented(
         payload,
         target_date,
-        ("intensityValues", "intensityValuesArray", "chartData", "data"),
+        ("imValuesArray", "intensityValues", "intensityValuesArray", "chartData", "data"),
         keys,
-        ("intensityValueDescriptors", "intensityValueDescriptorsDTOList", "intensityValueDescriptorDTOList"),
+        (
+            "imValueDescriptorsDTOList",
+            "intensityValueDescriptors",
+            "intensityValueDescriptorsDTOList",
+            "intensityValueDescriptorDTOList",
+        ),
         ("moderateIntensityMinutes", "vigorousIntensityMinutes", "totalIntensityMinutes"),
     )
 
@@ -1161,6 +1275,77 @@ def _body_battery_presence(payload: Any, target_date: date) -> str:
     )
 
 
+def _merge_source_series(primary: SourceSeries, supplemental: SourceSeries) -> SourceSeries:
+    """Merge equal-timestamp source records without hiding conflicting values."""
+    readings = {sample.timestamp: sample for sample in primary.readings}
+    for sample in supplemental.readings:
+        previous = readings.get(sample.timestamp)
+        if previous is not None and previous.value != sample.value:
+            raise HistorySchemaError("overlapping source series values conflict")
+        readings[sample.timestamp] = previous or sample
+    if readings:
+        presence = "present"
+    elif primary.presence == supplemental.presence:
+        presence = primary.presence
+    elif "failed" in {primary.presence, supplemental.presence}:
+        presence = "failed"
+    else:
+        presence = primary.presence
+    return SourceSeries(tuple(readings[key] for key in sorted(readings)), presence)
+
+
+def _normalize_body_battery_event_series(
+    payload: Any, target_date: date, metric: str
+) -> SourceSeries:
+    """Extract numeric records carried by live Body Battery event envelopes."""
+    if payload is None:
+        return SourceSeries((), "null")
+    if not isinstance(payload, list):
+        raise HistorySchemaError("body battery events have invalid type")
+    if not payload:
+        return SourceSeries((), "empty")
+    if len(payload) > 512:
+        raise HistorySchemaError("body battery event batch exceeds bounded limit")
+    samples: dict[datetime, NormalizedSample] = {}
+    for event in payload:
+        if not isinstance(event, dict):
+            raise HistorySchemaError("body battery event has invalid type")
+        if metric == "body_battery":
+            values_key = "bodyBatteryValuesArray"
+            descriptor_keys = (
+                "bodyBatteryValueDescriptorsDTOList",
+                "bodyBatteryValueDescriptorDTOList",
+            )
+            value_keys = ("bodyBatteryLevel", "bodyBatteryValue", "value")
+        elif metric == "stress":
+            values_key = "stressValuesArray"
+            descriptor_keys = (
+                "stressValueDescriptorsDTOList",
+                "stressValueDescriptorsDtoList",
+            )
+            value_keys = ("stressLevel", "stress", "value")
+        else:
+            raise ValueError("unsupported body battery event metric")
+        if values_key not in event:
+            continue
+        normalized = normalize_pair_series(
+            event,
+            values_key=values_key,
+            descriptor_keys=descriptor_keys,
+            value_keys=value_keys,
+            request_date=target_date,
+        )
+        for sample in normalized:
+            previous = samples.get(sample.timestamp)
+            if previous is not None and previous.value != sample.value:
+                raise HistorySchemaError("body battery event values conflict")
+            samples[sample.timestamp] = previous or sample
+    return SourceSeries(
+        tuple(samples[key] for key in sorted(samples)),
+        "present" if samples else "missing",
+    )
+
+
 def parse_hrv_data(payload: Any, target_date: date) -> HRVData:
     """Parse HRV readings while tolerating absent summary fields."""
     if payload is None:
@@ -1260,13 +1445,22 @@ class GarminHistorySource:
     ) -> None:
         self.client = client
         self.request_gate = request_gate or GarminRequestGate()
+        self._payload_cache: dict[tuple[date, str], Any] = {}
+
+    async def _async_cached_payload(
+        self, target_date: date, key: str, request: Callable[[], Awaitable[Any]]
+    ) -> Any:
+        cache_key = (target_date, key)
+        if cache_key not in self._payload_cache:
+            self._payload_cache[cache_key] = await request()
+        return self._payload_cache[cache_key]
 
     async def async_fetch(self, target_date: date, metric: str) -> HistoryResult:
         """Fetch one metric, retaining the historical tuple return contract."""
         result = await self.async_fetch_details(target_date, metric)
         if isinstance(result, (HRVData, SegmentedData, SourceSeries)):
             return result.readings
-        if isinstance(result, SnapshotData):
+        if isinstance(result, SnapshotData | TrainingDeviceSnapshots):
             return ()
         return result
 
@@ -1308,7 +1502,14 @@ class GarminHistorySource:
             if metric == "health_events_daily":
                 return await self.client._request("GET", f"{base}/wellness-service/wellness/dailyEvents", params={"calendarDate": target_date.isoformat()})
             if metric == "health_events_body_battery":
-                return await self.client._request("GET", f"{base}/wellness-service/wellness/bodyBattery/events/{target_date.isoformat()}")
+                return await self._async_cached_payload(
+                    target_date,
+                    "body_battery_events",
+                    lambda: self.client._request(
+                        "GET",
+                        f"{base}/wellness-service/wellness/bodyBattery/events/{target_date.isoformat()}",
+                    ),
+                )
             if metric == "heart_rate":
                 profile = await self.client.get_user_profile()
                 return await self.client._request(
@@ -1317,17 +1518,45 @@ class GarminHistorySource:
                     params={"date": target_date.isoformat()},
                 )
             if metric == "stress":
-                return await self.client._request(
-                    "GET", f"{base}/wellness-service/wellness/dailyStress/{target_date.isoformat()}"
+                primary = await self._async_cached_payload(
+                    target_date,
+                    "stress",
+                    lambda: self.client._request(
+                        "GET",
+                        f"{base}/wellness-service/wellness/dailyStress/{target_date.isoformat()}",
+                    ),
                 )
+                events = await self._async_cached_payload(
+                    target_date,
+                    "body_battery_events",
+                    lambda: self.client._request(
+                        "GET",
+                        f"{base}/wellness-service/wellness/bodyBattery/events/{target_date.isoformat()}",
+                    ),
+                )
+                return primary, events
             if metric == "body_battery":
-                return await self.client._request(
-                    "GET", f"{base}/wellness-service/wellness/bodyBattery/reports/daily",
-                    params={
-                        "startDate": target_date.isoformat(),
-                        "endDate": target_date.isoformat(),
-                    },
+                primary = await self._async_cached_payload(
+                    target_date,
+                    "body_battery",
+                    lambda: self.client._request(
+                        "GET",
+                        f"{base}/wellness-service/wellness/bodyBattery/reports/daily",
+                        params={
+                            "startDate": target_date.isoformat(),
+                            "endDate": target_date.isoformat(),
+                        },
+                    ),
                 )
+                events = await self._async_cached_payload(
+                    target_date,
+                    "body_battery_events",
+                    lambda: self.client._request(
+                        "GET",
+                        f"{base}/wellness-service/wellness/bodyBattery/events/{target_date.isoformat()}",
+                    ),
+                )
+                return primary, events
             if metric == "nightly_hrv":
                 return await self.client._get_hrv_data_raw(target_date)
             if metric == "steps":
@@ -1336,19 +1565,49 @@ class GarminHistorySource:
             if metric == "floors":
                 return await self.client._request("GET", f"{base}/wellness-service/wellness/floorsChartData/daily/{target_date.isoformat()}")
             if metric in {"intensity_moderate", "intensity_vigorous"}:
-                return await self.client._request("GET", f"{base}/wellness-service/wellness/daily/im/{target_date.isoformat()}")
+                return await self._async_cached_payload(
+                    target_date,
+                    "intensity",
+                    lambda: self.client._request(
+                        "GET",
+                        f"{base}/wellness-service/wellness/daily/im/{target_date.isoformat()}",
+                    ),
+                )
             if metric in {"respiration_raw", "respiration_average"}:
-                return await self.client._request("GET", f"{base}/wellness-service/wellness/daily/respiration/{target_date.isoformat()}")
+                return await self._async_cached_payload(
+                    target_date,
+                    "respiration",
+                    lambda: self.client._request(
+                        "GET",
+                        f"{base}/wellness-service/wellness/daily/respiration/{target_date.isoformat()}",
+                    ),
+                )
             if metric.startswith("spo2_"):
-                return await self.client._request("GET", f"{base}/wellness-service/wellness/daily/spo2/{target_date.isoformat()}")
+                return await self._async_cached_payload(
+                    target_date,
+                    "spo2",
+                    lambda: self.client._request(
+                        "GET",
+                        f"{base}/wellness-service/wellness/daily/spo2/{target_date.isoformat()}",
+                    ),
+                )
             raise ValueError(f"unsupported history metric: {metric}")
 
         payload = await self.request_gate.async_request(GarminRequestPriority.BACKGROUND, request)
         if metric == "body_battery":
-            presence = _body_battery_presence(payload, target_date)
-            return SourceSeries(
-                normalize_body_battery(payload, target_date) if presence == "present" else (),
+            primary_payload, event_payload = payload
+            presence = _body_battery_presence(primary_payload, target_date)
+            primary = SourceSeries(
+                normalize_body_battery(primary_payload, target_date)
+                if presence == "present"
+                else (),
                 presence,
+            )
+            return _merge_source_series(
+                primary,
+                _normalize_body_battery_event_series(
+                    event_payload, target_date, "body_battery"
+                ),
             )
         if metric == "nightly_hrv":
             return parse_hrv_data(payload, target_date)
@@ -1367,7 +1626,7 @@ class GarminHistorySource:
         if metric == "daily_summary":
             return normalize_snapshot(payload, target_date, DAILY_SUMMARY_FIELDS)
         if metric == "training_status":
-            return normalize_snapshot(payload, target_date, TRAINING_STATUS_FIELDS)
+            return normalize_training_status(payload, target_date)
         if metric == "sleep_sessions":
             return parse_sleep_sessions(payload, target_date)
         if metric == "timed_activities":
@@ -1384,12 +1643,18 @@ class GarminHistorySource:
                 ("heartRate", "heartrate", "heartRateValue", "value"),
                 ("heartRateValueDescriptors",),
             )
-        return _normalize_source_series(
-            payload,
-            target_date,
-            ("stressValuesArray",),
-            ("stressLevel", "stress", "value"),
-            ("stressValueDescriptorsDTOList", "stressValueDescriptorsDtoList"),
+        primary_payload, event_payload = payload
+        return _merge_source_series(
+            _normalize_source_series(
+                primary_payload,
+                target_date,
+                ("stressValuesArray",),
+                ("stressLevel", "stress", "value"),
+                ("stressValueDescriptorsDTOList", "stressValueDescriptorsDtoList"),
+            ),
+            _normalize_body_battery_event_series(
+                event_payload, target_date, "stress"
+            ),
         )
 
 

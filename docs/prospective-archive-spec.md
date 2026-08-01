@@ -72,7 +72,7 @@ account-wide reauthentication flow.
 19. As a Home Assistant operator, I want entity enablement to affect presentation only, so that disabling an entity does not unexpectedly start or stop data collection.
 20. As a longitudinal-data consumer, I want every valid Source Record returned for the Frozen Archive Catalog retained, so that downstream analysis is not biased by intentional thinning.
 21. As a longitudinal-data consumer, I want raw heart rate, stress, Body Battery, HRV, and sleep-stream samples retained, so that I can analyze their original time series externally.
-22. As a longitudinal-data consumer, I want segmented steps, floors, and intensity records retained, so that intraday movement remains available for later analysis.
+22. As a longitudinal-data consumer, I want segmented steps and intensity records plus Garmin's daily floor totals and vertical distances retained, so that movement remains available without treating fixed chart buckets as measured floor events.
 23. As a longitudinal-data consumer, I want respiration and SpO2 records retained, so that respiratory and oxygen trends remain available.
 24. As a longitudinal-data consumer, I want daily and training snapshots retained, so that Garmin's own computed context is available beside raw measurements.
 25. As a longitudinal-data consumer, I want sleep, activity, and health structures retained, so that structured Garmin events remain queryable without flattening away their meaning.
@@ -179,9 +179,10 @@ account-wide reauthentication flow.
   Activation Date, start a recurring task, or expose the dormant Historical
   Backfill scheduler.
 - The Frozen Archive Catalog for this beta consists of raw heart-rate, stress,
-  Body Battery, HRV, and sleep streams; segmented steps, floors, and intensity;
-  respiration and SpO2; daily and training snapshots; structured sleep,
-  activity, and health records; and activity FIT files.
+  Body Battery, HRV, and sleep streams; segmented steps and intensity; daily
+  floor totals and vertical distances; respiration and SpO2; daily and training
+  snapshots; structured sleep, activity, and health records; and activity FIT
+  files.
 - Every valid Source Record returned for the Frozen Archive Catalog is retained.
   Best-effort continuity permits unavoidable source and transport gaps but does
   not permit intentional thinning, representative sampling, or dropping valid

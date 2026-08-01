@@ -157,6 +157,72 @@ def test_sleep_parser_preserves_sanitized_high_resolution_streams() -> None:
     assert session_from_record(session_record(session)) == session
 
 
+def test_current_garmin_sleep_payload_unwraps_session_and_streams() -> None:
+    """The live dailySleepDTO envelope retains its session and raw streams."""
+    payload = {
+        "dailySleepDTO": {
+            "calendarDate": "2026-08-01",
+            "sleepStartTimestampGMT": 1_785_520_800_000,
+            "sleepEndTimestampGMT": 1_785_549_600_000,
+            "sleepScores": {"overall": {"value": 82}},
+        },
+        "sleepLevels": [
+            {
+                "startGMT": "2026-07-31T22:00:00.0",
+                "endGMT": "2026-07-31T22:15:00.0",
+                "activityLevel": 2,
+            }
+        ],
+        "sleepHeartRate": [{"startGMT": 1_785_520_800_000, "value": 60}],
+        "hrvData": [{"startGMT": 1_785_520_800_000, "value": 42}],
+        "sleepBodyBattery": [{"startGMT": 1_785_520_800_000, "value": 70}],
+        "sleepStress": [{"startGMT": 1_785_520_800_000, "value": 12}],
+        "sleepMovement": [
+            {
+                "startGMT": "2026-07-31T22:00:00.0",
+                "endGMT": "2026-07-31T22:00:30.0",
+                "activityLevel": 1,
+            }
+        ],
+        "wellnessEpochRespirationDataDTOList": [
+            {"startTimeGMT": 1_785_520_800_000, "respirationValue": 14.0}
+        ],
+        "wellnessEpochSPO2DataDTOList": [
+            {"epochTimestamp": "2026-07-31T22:00:00.0", "spo2Reading": 97}
+        ],
+    }
+
+    sessions = parse_sleep_sessions(payload, date(2026, 8, 1))
+
+    assert len(sessions) == 1
+    assert sessions[0].calendar_date == date(2026, 8, 1)
+    assert len(sessions[0].stages) == 1
+    assert {
+        stream.metric: (stream.presence, len(stream.points))
+        for stream in sessions[0].streams
+    } == {
+        "heart_rate": ("present", 1),
+        "hrv": ("present", 1),
+        "body_battery": ("present", 1),
+        "stress": ("present", 1),
+        "respiration": ("present", 1),
+        "spo2": ("present", 1),
+        "movement": ("present", 1),
+    }
+
+
+def test_generic_naive_sleep_session_timestamp_remains_rejected() -> None:
+    """Only Garmin fields explicitly labelled GMT may imply UTC."""
+    with pytest.raises(SleepSchemaError, match="no offset"):
+        parse_sleep_sessions(
+            {
+                "startTime": "2026-08-01T00:00:00",
+                "endTime": "2026-08-01T01:00:00",
+            },
+            date(2026, 8, 1),
+        )
+
+
 def test_sleep_stream_presence_distinguishes_sparse_states() -> None:
     session = parse_sleep_sessions(
         {

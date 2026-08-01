@@ -59,7 +59,7 @@ class SleepData:
     sessions: tuple[SleepSession, ...]
 
 
-def _parse_time(value: Any) -> datetime:
+def _parse_time(value: Any, *, assume_utc: bool = False) -> datetime:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         try:
             seconds = float(value) / (1000 if abs(float(value)) >= 100_000_000_000 else 1)
@@ -73,7 +73,9 @@ def _parse_time(value: Any) -> datetime:
     except ValueError as err:
         raise SleepSchemaError("sleep timestamp has invalid value") from err
     if parsed.tzinfo is None:
-        raise SleepSchemaError("sleep timestamp has no offset")
+        if not assume_utc:
+            raise SleepSchemaError("sleep timestamp has no offset")
+        parsed = parsed.replace(tzinfo=UTC)
     # Preserve Garmin's supplied offset for local-date, DST, and cross-midnight
     # calendar semantics.
     return parsed
@@ -87,6 +89,15 @@ def _first(mapping: dict[str, Any], names: tuple[str, ...]) -> Any:
         if value is not None:
             return value
     return None
+
+
+def _first_named(
+    mapping: dict[str, Any], names: tuple[str, ...]
+) -> tuple[str | None, Any]:
+    for name in names:
+        if name in mapping and mapping[name] is not None:
+            return name, mapping[name]
+    return None, None
 
 
 def _bounded_structured(value: Any, *, depth: int = 0) -> Any:
@@ -126,8 +137,15 @@ def _stage_list(value: Any) -> tuple[Any, ...]:
     for item in value:
         if not isinstance(item, dict):
             raise SleepSchemaError("sleep stage has invalid type")
-        if any(key not in item for key in ("startGMT", "activityLevel", "activityType")):
+        if (
+            "startGMT" not in item
+            or "activityLevel" not in item
+            or not any(key in item for key in ("activityType", "endGMT"))
+        ):
             raise SleepSchemaError("sleep stage has invalid shape")
+        _parse_time(item["startGMT"], assume_utc=True)
+        if item.get("endGMT") is not None:
+            _parse_time(item["endGMT"], assume_utc=True)
         bounded = _bounded_structured(item)
         if not isinstance(bounded, dict):
             raise SleepSchemaError("sleep stage has invalid shape")
@@ -138,11 +156,29 @@ def _stage_list(value: Any) -> tuple[Any, ...]:
 _STREAM_FIELDS = {
     "heart_rate": ("sleepHeartRate", "sleepHeartRateValues", "heartRateValues"),
     "hrv": ("hrvData", "sleepHrv", "sleepHrvValues", "hrvReadings"),
-    "body_battery": ("sleepBodyBattery", "sleepBodyBatteryValues", "bodyBatteryValuesArray", "bodyBattery"),
+    "body_battery": (
+        "sleepBodyBattery",
+        "sleepBodyBatteryValues",
+        "bodyBatteryValuesArray",
+        "bodyBatteryChange",
+        "bodyBattery",
+    ),
     "stress": ("sleepStress", "sleepStressValues", "stressValuesArray", "stress"),
-    "respiration": ("sleepRespiration", "sleepRespirationValues", "respirationValuesArray", "respiration"),
-    "spo2": ("sleepSpO2", "sleepSpo2", "sleepSpO2Values", "spO2ContinuousValues"),
-    "movement": ("sleepMovement", "sleepMovementValues"),
+    "respiration": (
+        "sleepRespiration",
+        "sleepRespirationValues",
+        "respirationValuesArray",
+        "wellnessEpochRespirationDataDTOList",
+        "respiration",
+    ),
+    "spo2": (
+        "sleepSpO2",
+        "sleepSpo2",
+        "sleepSpO2Values",
+        "spO2ContinuousValues",
+        "wellnessEpochSPO2DataDTOList",
+    ),
+    "movement": ("sleepMovement", "sleepMovementValues", "movement"),
 }
 _STREAM_DESCRIPTOR_FIELDS = {
     "heart_rate": ("sleepHeartRateDescriptors", "sleepHeartRateValueDescriptors", "sleepHeartRateValueDescriptorsDTOList", "heartRateValueDescriptors"),
@@ -223,10 +259,19 @@ def _sleep_streams(item: dict[str, Any]) -> tuple[SleepStream, ...]:
             if row is None:
                 continue
             if isinstance(row, dict):
-                raw_time = _first_non_null(
-                    row, ("timestamp", "time", "startGMT", "readingTimeGMT")
+                time_names = (
+                    "timestamp",
+                    "time",
+                    "startGMT",
+                    "startTimeGMT",
+                    "readingTimeGMT",
+                    "epochTimestamp",
                 )
-                raw_value = _first_non_null(row, ("value", metric, "heartRate", "hrvValue", "stressLevel", "spO2", "spo2", "bodyBattery", "respirationValue", "movement", "activityLevel"))
+                raw_time = _first_non_null(row, time_names)
+                time_name = next(
+                    (name for name in time_names if row.get(name) is not None), None
+                )
+                raw_value = _first_non_null(row, ("value", metric, "heartRate", "hrvValue", "stressLevel", "spO2", "spo2", "spo2Reading", "bodyBattery", "respirationValue", "movement", "activityLevel"))
                 if raw_time is _MISSING or raw_value is _MISSING:
                     raise SleepSchemaError("sleep stream point lacks required fields")
             elif isinstance(row, list) and descriptors is not None:
@@ -242,7 +287,16 @@ def _sleep_streams(item: dict[str, Any]) -> tuple[SleepStream, ...]:
                 raw_time, raw_value = row[0], row[1]
             else:
                 raise SleepSchemaError("sleep stream point has invalid type")
-            parsed_time = _parse_time(raw_time)
+            parsed_time = _parse_time(
+                raw_time,
+                assume_utc=isinstance(row, dict)
+                and time_name in {
+                    "startGMT",
+                    "startTimeGMT",
+                    "readingTimeGMT",
+                    "epochTimestamp",
+                },
+            )
             if raw_value is not None and (isinstance(raw_value, bool) or not isinstance(raw_value, int | float)):
                 raise SleepSchemaError("sleep stream value has invalid type")
             by_timestamp[parsed_time] = SleepStreamPoint(parsed_time, raw_time, None if raw_value is None else float(raw_value))
@@ -314,7 +368,16 @@ def parse_sleep_sessions(payload: Any, target_date: date) -> tuple[SleepSession,
     if not isinstance(payload, dict):
         raise SleepSchemaError("sleep payload has invalid type")
     candidates: list[tuple[str, dict[str, Any]]] = []
-    for container in (payload, payload.get("sleepData"), payload.get("data")):
+    daily_sleep = payload.get("dailySleepDTO")
+    root = payload
+    if isinstance(daily_sleep, dict):
+        root = dict(daily_sleep)
+        root.update(
+            {key: value for key, value in payload.items() if key != "dailySleepDTO"}
+        )
+    elif daily_sleep is not None:
+        raise SleepSchemaError("daily sleep payload has invalid type")
+    for container in (root, root.get("sleepData"), root.get("data")):
         if not isinstance(container, dict):
             continue
         candidates.append(("main", container))
@@ -327,11 +390,21 @@ def parse_sleep_sessions(payload: Any, target_date: date) -> tuple[SleepSession,
             candidates.extend(("nap", item) for item in naps)
     sessions: dict[str, SleepSession] = {}
     for kind, item in candidates:
-        start_raw = _first(item, ("sleepStartTimestampGMT", "startTimeGMT", "startTime", "start"))
-        end_raw = _first(item, ("sleepEndTimestampGMT", "endTimeGMT", "endTime", "end"))
+        start_name, start_raw = _first_named(
+            item,
+            ("sleepStartTimestampGMT", "startTimeGMT", "startTime", "start"),
+        )
+        end_name, end_raw = _first_named(
+            item,
+            ("sleepEndTimestampGMT", "endTimeGMT", "endTime", "end"),
+        )
         if start_raw is None or end_raw is None:
             continue
-        start, end = _parse_time(start_raw), _parse_time(end_raw)
+        start, end = _parse_time(
+            start_raw, assume_utc=start_name is not None and start_name.endswith("GMT")
+        ), _parse_time(
+            end_raw, assume_utc=end_name is not None and end_name.endswith("GMT")
+        )
         if end <= start:
             continue
         canonical_start = start.astimezone(UTC).isoformat()
@@ -348,8 +421,17 @@ def parse_sleep_sessions(payload: Any, target_date: date) -> tuple[SleepSession,
         revision = hashlib.sha256(
             json.dumps(revision_payload, sort_keys=True, separators=(",", ":"), default=str).encode()
         ).hexdigest()[:16]
+        calendar_date = target_date
+        raw_calendar_date = item.get("calendarDate")
+        if raw_calendar_date is not None:
+            if not isinstance(raw_calendar_date, str):
+                raise SleepSchemaError("sleep calendar date has invalid type")
+            try:
+                calendar_date = date.fromisoformat(raw_calendar_date)
+            except ValueError as err:
+                raise SleepSchemaError("sleep calendar date has invalid value") from err
         sessions[logical_id] = SleepSession(
-            logical_id, kind, start, end, target_date, revision, _score(item),
+            logical_id, kind, start, end, calendar_date, revision, _score(item),
             _structured_list(item.get("adjustments")), _structured_list(item.get("feedback")),
             _structured_list(item.get("restlessEvents")), _stage_list(item.get("sleepLevels")),
             _sleep_streams(item),

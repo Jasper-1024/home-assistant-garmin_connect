@@ -53,6 +53,7 @@ from custom_components.garmin_connect.history_recorder import (
 )
 from custom_components.garmin_connect.history_sensor import GarminHistoryStatusSensor
 from custom_components.garmin_connect.history_source import (
+    DAILY_SUMMARY_FIELDS,
     GarminHistorySource,
     NormalizedSample,
     SegmentedData,
@@ -315,7 +316,7 @@ async def _run_reconciliation_cycle(
     source: ReconciliationSource,
 ) -> None:
     """Fire one cadence and await its observable remote requests."""
-    expected_requests = len(source.requested) + 19
+    expected_requests = len(source.requested) + 18
     for _ in range(1000):
         if timer.active:
             break
@@ -360,14 +361,14 @@ async def test_reconciliation_requires_one_later_unchanged_confirmation() -> Non
     archive = _enabled_reconciliation_archive(store, source, now, timer)
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     await _run_reconciliation_cycle(archive, timer, source)
 
-    assert source.requested.count(target) == 19
+    assert source.requested.count(target) == 18
 
     await _run_reconciliation_cycle(archive, timer, source)
 
-    assert source.requested.count(target) == 38
+    assert source.requested.count(target) == 36
     await archive.async_stop()
 
 
@@ -382,7 +383,7 @@ async def test_settled_date_stays_terminal_after_confirmation_restart_and_next_s
     archive = _enabled_reconciliation_archive(store, source, now, timer)
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     await _run_reconciliation_cycle(archive, timer, source)
     await _run_reconciliation_cycle(archive, timer, source)
 
@@ -395,7 +396,7 @@ async def test_settled_date_stays_terminal_after_confirmation_restart_and_next_s
     restarted_timer = DeterministicTimer()
     restarted = _enabled_reconciliation_archive(store, source, now, restarted_timer)
     await restarted.async_start()
-    await _wait_for_remote_requests(source, len(source.requested) + 19)
+    await _wait_for_remote_requests(source, len(source.requested) + 18)
     await _run_reconciliation_cycle(restarted, restarted_timer, source)
     assert source.requested.count(target) == settled_requests
     await restarted.async_stop()
@@ -411,9 +412,9 @@ async def test_reconciliation_retries_empty_then_saves_delayed_and_changed_data(
     archive = _enabled_reconciliation_archive(store, source, now, timer)
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     await _run_reconciliation_cycle(archive, timer, source)
-    assert source.requested.count(target) == 19
+    assert source.requested.count(target) == 18
 
     source.values[target] = (70.0,)
     await _run_reconciliation_cycle(archive, timer, source)
@@ -422,7 +423,7 @@ async def test_reconciliation_retries_empty_then_saves_delayed_and_changed_data(
     await _run_reconciliation_cycle(archive, timer, source)
 
     await _run_reconciliation_cycle(archive, timer, source)
-    assert source.requested.count(target) == 76
+    assert source.requested.count(target) == 72
     await archive.async_stop()
 
 
@@ -436,17 +437,17 @@ async def test_empty_archive_date_settles_as_continuity_gap_at_window_boundary()
     archive = _enabled_reconciliation_archive(store, source, now, timer)
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     await _run_reconciliation_cycle(archive, timer, source)
-    assert source.requested.count(target) == 19
+    assert source.requested.count(target) == 18
 
     now[0] = datetime(2026, 8, 8, tzinfo=UTC)
     await _run_reconciliation_cycle(archive, timer, source)
 
-    assert source.requested.count(target) == 19
+    assert source.requested.count(target) == 18
     now[0] = datetime(2026, 8, 7, tzinfo=UTC)
     await _run_reconciliation_cycle(archive, timer, source)
-    assert source.requested.count(target) == 19
+    assert source.requested.count(target) == 18
     await archive.async_stop()
 
 
@@ -481,7 +482,7 @@ async def test_missing_sleep_stream_keeps_reconciliation_date_open() -> None:
     )
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     await _run_reconciliation_cycle(archive, timer, source)
     await _run_reconciliation_cycle(archive, timer, source)
 
@@ -548,7 +549,7 @@ async def test_successful_sleep_stream_can_settle_after_unchanged_confirmation()
     )
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     await _run_reconciliation_cycle(archive, timer, source)
     first_confirmation_requests = source.requested.count(target)
 
@@ -604,7 +605,7 @@ async def test_partial_sleep_stream_stays_open_through_window() -> None:
     )
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     await _run_reconciliation_cycle(archive, timer, source)
 
     public_presence = archive.get_history_presence(target, target)[target.isoformat()]
@@ -631,7 +632,7 @@ async def test_present_then_empty_observation_stays_open_and_records_current_pre
     archive = _enabled_reconciliation_archive(store, source, now, timer)
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     await _run_reconciliation_cycle(archive, timer, source)
 
     source.values[target] = ()
@@ -652,7 +653,7 @@ async def test_present_then_missing_observation_stays_open_and_records_current_p
     archive = _enabled_reconciliation_archive(store, source, now, timer)
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     await _run_reconciliation_cycle(archive, timer, source)
 
     source.presence[target] = "missing"
@@ -674,7 +675,7 @@ async def test_settled_date_is_local_first_and_survives_restart() -> None:
     archive = _enabled_reconciliation_archive(store, source, now, timer)
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     await _run_reconciliation_cycle(archive, timer, source)
     assert source.requested.count(target) == 0
     await archive.async_stop()
@@ -700,7 +701,7 @@ async def test_reconciliation_respects_activation_boundary_and_current_rollover(
     )
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     await _run_reconciliation_cycle(archive, timer, source)
     assert source.requested.count(before_activation) == 0
 
@@ -751,7 +752,7 @@ async def test_partial_structured_failure_retains_observed_records_and_stays_ope
     source = PartialFailureSource({})
     recorder = MagicMock()
     recorder.async_write = AsyncMock(
-        side_effect=[RecorderWriteOutcome(0) for _ in range(45)]
+            side_effect=[RecorderWriteOutcome(0) for _ in range(42)]
         + [OSError("injected structured write failure")]
     )
     timer = DeterministicTimer()
@@ -764,7 +765,7 @@ async def test_partial_structured_failure_retains_observed_records_and_stays_ope
     )
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     await _run_reconciliation_cycle(archive, timer, source)
     await _wait_for_archive_state(archive, HistoryArchiveState.FAILED)
 
@@ -849,7 +850,7 @@ async def test_sleep_stream_failure_recovery_requires_unchanged_confirmation() -
     )
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     await _run_reconciliation_cycle(archive, timer, source)
     failed_requests = source.requested.count(target)
 
@@ -932,7 +933,7 @@ async def test_sleep_stream_failure_survives_restart_and_settles_after_unchanged
     )
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     await _run_reconciliation_cycle(archive, timer, source)
     await _wait_for_archive_state(archive, HistoryArchiveState.FAILED)
     await archive.async_stop()
@@ -943,7 +944,7 @@ async def test_sleep_stream_failure_survives_restart_and_settles_after_unchanged
     )
     await restarted.async_start()
     assert restarted.status.state is HistoryArchiveState.IDLE
-    await _wait_for_remote_requests(source, len(source.requested) + 19)
+    await _wait_for_remote_requests(source, len(source.requested) + 18)
 
     await _run_reconciliation_cycle(restarted, restarted_timer, source)
     requests_after_recovery = source.requested.count(target)
@@ -985,7 +986,7 @@ async def test_reconciliation_failure_stays_open_at_window_boundary(
     archive = _enabled_reconciliation_archive(store, source, now, timer)
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     await _run_reconciliation_cycle(archive, timer, source)
 
     now[0] = datetime(2026, 8, 11, tzinfo=UTC)
@@ -993,7 +994,7 @@ async def test_reconciliation_failure_stays_open_at_window_boundary(
     restarted_timer = DeterministicTimer()
     restarted = _enabled_reconciliation_archive(store, source, now, restarted_timer)
     await restarted.async_start()
-    expected_requests = len(source.requested) + 19
+    expected_requests = len(source.requested) + 18
     await _wait_for_remote_requests(source, expected_requests)
     await _run_reconciliation_cycle(restarted, restarted_timer, source)
 
@@ -1027,7 +1028,7 @@ async def test_failed_then_empty_observation_remains_open_after_window_end() -> 
     archive = _enabled_reconciliation_archive(store, source, now, timer)
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     await _run_reconciliation_cycle(archive, timer, source)
     failed_requests = source.requested.count(target)
 
@@ -1057,7 +1058,7 @@ async def test_partial_then_empty_observation_remains_open_after_window_end() ->
     archive = _enabled_reconciliation_archive(store, source, now, timer)
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     await _run_reconciliation_cycle(archive, timer, source)
 
     source.presence.pop(target)
@@ -1084,13 +1085,13 @@ async def test_incomplete_checkpoint_survives_restart_and_empty_window() -> None
     archive = _enabled_reconciliation_archive(store, source, now, timer)
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     await archive.async_stop()
 
     restarted_timer = DeterministicTimer()
     restarted = _enabled_reconciliation_archive(store, source, now, restarted_timer)
     await restarted.async_start()
-    await _wait_for_remote_requests(source, len(source.requested) + 19)
+    await _wait_for_remote_requests(source, len(source.requested) + 18)
     await _run_reconciliation_cycle(restarted, restarted_timer, source)
 
     now[0] = datetime(2026, 8, 12, tzinfo=UTC)
@@ -1126,7 +1127,7 @@ async def test_public_archive_failure_then_complete_records_then_unchanged_settl
     archive = _enabled_reconciliation_archive(store, source, now, timer)
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     await _run_reconciliation_cycle(archive, timer, source)
     failed_requests = source.requested.count(target)
 
@@ -1168,7 +1169,7 @@ async def test_public_archive_failure_then_empty_through_window_stays_open() -> 
     archive = _enabled_reconciliation_archive(store, source, now, timer)
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     await _run_reconciliation_cycle(archive, timer, source)
     source.fail_target = False
     await _run_reconciliation_cycle(archive, timer, source)
@@ -1235,7 +1236,7 @@ async def test_reconciliation_family_checkpoint_survives_interruption(
         store, restarted_source, now, restarted_timer
     )
     await restarted.async_start()
-    await _wait_for_remote_requests(restarted_source, 19)
+    await _wait_for_remote_requests(restarted_source, 18)
     await _run_reconciliation_cycle(restarted, restarted_timer, restarted_source)
 
     assert target in restarted_source.requested
@@ -1263,7 +1264,7 @@ async def test_reenable_does_not_expire_open_date_before_new_activation_boundary
         return_value=datetime(2026, 8, 8, tzinfo=UTC),
         ):
             await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     await _run_reconciliation_cycle(archive, timer, source)
 
     assert archive.activation_date == date(2026, 8, 8)
@@ -2562,16 +2563,19 @@ async def test_full_numeric_presence_catalog_survives_restart() -> None:
         async def async_fetch_details(self, _request_date: date, metric: str) -> object:
             if metric in {"sleep_sessions", "health_events_daily", "health_events_body_battery", "timed_activities"}:
                 return ()
-            if metric in {"steps", "floors", "intensity_moderate", "intensity_vigorous"}:
+            if metric in {"steps", "intensity_moderate", "intensity_vigorous"}:
                 total_keys = {
                     "steps": ("totalSteps",),
-                    "floors": ("floorsAscended", "floorsDescended", "floorsAscendedInMeters", "floorsDescendedInMeters", "totalFloors"),
                     "intensity_moderate": ("moderateIntensityMinutes", "vigorousIntensityMinutes", "totalIntensityMinutes"),
                     "intensity_vigorous": ("moderateIntensityMinutes", "vigorousIntensityMinutes", "totalIntensityMinutes"),
                 }[metric]
                 return SegmentedData((), presence="empty", total_presence=dict.fromkeys(total_keys, "absent"))
             if metric == "daily_summary":
-                return SnapshotData({"abnormal_heart_rate_alerts": ("absent", None)}, datetime.combine(target, datetime.min.time(), tzinfo=UTC), target.isoformat())
+                return SnapshotData(
+                    dict.fromkeys(DAILY_SUMMARY_FIELDS, ("absent", None)),
+                    datetime.combine(target, datetime.min.time(), tzinfo=UTC),
+                    target.isoformat(),
+                )
             if metric == "training_status":
                 return SnapshotData(training_fields, datetime.combine(target, datetime.min.time(), tzinfo=UTC), target.isoformat())
             return SourceSeries((), "empty")
@@ -2610,7 +2614,7 @@ async def test_numeric_checkpoint_survives_restart_without_gap() -> None:
     )
 
     await initial.async_start()
-    await _wait_for_remote_requests(initial_source, 19)
+    await _wait_for_remote_requests(initial_source, 18)
     await _wait_for_archive_state(initial, HistoryArchiveState.IDLE)
     assert initial.get_history_presence(target, target)[target.isoformat()][
         "heart_rate"
@@ -2647,7 +2651,7 @@ async def test_numeric_checkpoint_survives_restart_without_gap() -> None:
         store, restarted_source, now, restarted_timer
     )
     await restarted.async_start()
-    await _wait_for_remote_requests(restarted_source, 19)
+    await _wait_for_remote_requests(restarted_source, 18)
     await _wait_for_archive_state(restarted, HistoryArchiveState.IDLE)
     requests_before_window = restarted_source.requested.count(target)
     await _run_reconciliation_cycle(restarted, restarted_timer, restarted_source)
@@ -2664,7 +2668,7 @@ async def test_numeric_checkpoint_survives_restart_without_gap() -> None:
 
 
 @pytest.mark.asyncio
-async def test_segmented_totals_are_written_with_provenance_and_revisions() -> None:
+async def test_daily_floor_and_intensity_summaries_keep_provenance_and_revisions() -> None:
     target = date(2026, 7, 24)
     hass = _hass()
     entry = _entry(data={"history_account_key": "opaque-account-key-123"})
@@ -2688,11 +2692,24 @@ async def test_segmented_totals_are_written_with_provenance_and_revisions() -> N
                 return ()
             if metric == "steps":
                 return SegmentedData((), {"totalSteps": 0.0}, "empty", {"totalSteps": "present"})
-            if metric == "floors":
-                return SegmentedData((), {"totalFloors": 2.0}, "empty", {"totalFloors": "present"})
             if metric in {"intensity_moderate", "intensity_vigorous"}:
+                return SegmentedData((), presence="null")
+            if metric == "daily_summary":
                 value = 9.0 if self.revised else 7.0
-                return SegmentedData((), {"totalIntensityMinutes": value}, "empty", {"totalIntensityMinutes": "present"})
+                return SnapshotData(
+                    {
+                        "abnormal_heart_rate_alerts": ("absent", None),
+                        "floors_ascended": ("present", 2.0),
+                        "floors_descended": ("present", 1.0),
+                        "floors_ascended_meters": ("present", 6.0),
+                        "floors_descended_meters": ("present", 3.0),
+                        "intensity_moderate": ("present", value),
+                        "intensity_vigorous": ("present", 3.0),
+                    },
+                    datetime(2026, 7, 23, 16, tzinfo=UTC),
+                    target.isoformat(),
+                    calendar_date=target,
+                )
             return SourceSeries((), "empty")
 
     source = Source()
@@ -2706,25 +2723,38 @@ async def test_segmented_totals_are_written_with_provenance_and_revisions() -> N
     )
     await archive.async_start()
     assert (await archive.async_sync_range(target, target)).outcome == "written"
-    total_writes = {
+    summary_writes = {
         statistic_id.rsplit(":", 1)[-1]: samples[-1].value
         for statistic_id, _metadata, samples in writes
         if samples and statistic_id.rsplit(":", 1)[-1] in {
-            "floors_daily_total", "intensity_daily_total", "steps_daily_total"
+            "floors_ascended_daily_total",
+            "floors_descended_daily_total",
+            "floors_ascended_meters_daily_total",
+            "floors_descended_meters_daily_total",
+            "intensity_moderate_daily_total",
+            "intensity_vigorous_daily_total",
+            "steps_daily_total",
         }
     }
-    assert total_writes == {
-        "floors_daily_total": 2.0,
-        "intensity_daily_total": 7.0,
+    assert summary_writes == {
+        "floors_ascended_daily_total": 2.0,
+        "floors_descended_daily_total": 1.0,
+        "floors_ascended_meters_daily_total": 6.0,
+        "floors_descended_meters_daily_total": 3.0,
+        "intensity_moderate_daily_total": 7.0,
+        "intensity_vigorous_daily_total": 3.0,
         "steps_daily_total": 0.0,
     }
-    assert archive.get_history_presence(target, target)[target.isoformat()]["floors:totalFloors"] == "present"
+    assert archive.get_history_presence(target, target)[target.isoformat()][
+        "daily_summary:floors_ascended"
+    ] == "present"
 
     source.revised = True
     archive._completed_dates.clear()
     assert (await archive.async_sync_range(target, target)).outcome == "written"
     assert any(
-        statistic_id.endswith(":intensity_daily_total") and samples[-1].value == 9.0
+        statistic_id.endswith(":intensity_moderate_daily_total")
+        and samples[-1].value == 9.0
         for statistic_id, _metadata, samples in writes
     )
 
@@ -3454,7 +3484,7 @@ async def test_enabled_start_syncs_only_the_archive_activation_date() -> None:
         await first_sync_task
 
     assert archive.status.state is HistoryArchiveState.IDLE
-    assert source.async_fetch.await_count == 15
+    assert source.async_fetch.await_count == 14
     assert {call.args[0] for call in source.async_fetch.await_args_list} == {
         date(2026, 8, 4)
     }
@@ -3482,9 +3512,9 @@ async def test_successful_first_sync_starts_fifteen_minute_local_day_cycles() ->
 
     async def fetch(target: date, _metric: str):
         requested_dates.append(target)
-        if len(requested_dates) == 30:
+        if len(requested_dates) == 28:
             first_cycle_done.set()
-        if len(requested_dates) == 45:
+        if len(requested_dates) == 42:
             second_cycle_done.set()
         return ()
 
@@ -3536,7 +3566,7 @@ async def test_successful_archive_status_persists_and_restores_schedule() -> Non
     archive = _enabled_reconciliation_archive(store, source, now, timer)
 
     await archive.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
 
     expected_last_success = now[0].isoformat()
     expected_next_run = (now[0] + timedelta(minutes=15)).isoformat()
@@ -3591,7 +3621,7 @@ async def test_recurring_archive_yields_real_shared_gate_to_foreground_refresh()
         async def _mark_request(self):
             self.requests += 1
             if not self.cycle_enabled:
-                if self.requests == 19:
+                if self.requests == 14:
                     first_sync_done.set()
                 return {}
             self.cycle_requests += 1
@@ -3599,12 +3629,15 @@ async def test_recurring_archive_yields_real_shared_gate_to_foreground_refresh()
             if self.cycle_requests == 1:
                 cycle_started.set()
                 await release_cycle_request.wait()
-            if self.cycle_requests == 19:
+            if self.cycle_requests == 14:
                 cycle_done.set()
             return {}
 
-        async def _request(self, *_args, **_kwargs):
-            return await self._mark_request()
+        async def _request(self, *args, **_kwargs):
+            result = await self._mark_request()
+            if len(args) > 1 and "bodyBattery/events" in str(args[1]):
+                return []
+            return result
 
         async def _get_hrv_data_raw(self, _target):
             return await self._mark_request()
@@ -3694,7 +3727,7 @@ async def test_archive_cycle_failure_does_not_break_foreground_request() -> None
 
         async def async_fetch(self, _target: date, _metric: str):
             self.calls += 1
-            if self.calls == 15:
+            if self.calls == 14:
                 first_sync_done.set()
 
             async def request():
@@ -3986,10 +4019,10 @@ async def test_archive_rate_limit_backoff_survives_restart_and_expires_once() ->
     after_timer = DeterministicTimer()
     after = _enabled_reconciliation_archive(store, source, after_expiry, after_timer)
     await after.async_start()
-    await _wait_for_remote_requests(source, 19)
+    await _wait_for_remote_requests(source, 18)
     first_sync_requests = len(source.requested)
     assert after.status.state is HistoryArchiveState.IDLE
-    assert first_sync_requests == 19
+    assert first_sync_requests == 18
     assert [slot[0] for slot in after_timer.active] == [timedelta(minutes=15)]
     await after.async_stop()
 
@@ -4098,9 +4131,9 @@ async def test_restart_restores_one_cadence_without_replaying_missed_ticks() -> 
 
     assert len(second_timer.active) == 1
     assert [slot[0] for slot in second_timer.active] == [timedelta(minutes=15)]
-    assert source.async_fetch.await_count == 30
-    assert {call.args[0] for call in source.async_fetch.await_args_list[:15]} == {date(2026, 8, 4)}
-    assert {call.args[0] for call in source.async_fetch.await_args_list[15:]} == {date(2026, 8, 6)}
+    assert source.async_fetch.await_count == 28
+    assert {call.args[0] for call in source.async_fetch.await_args_list[:14]} == {date(2026, 8, 4)}
+    assert {call.args[0] for call in source.async_fetch.await_args_list[14:]} == {date(2026, 8, 6)}
     await restarted.async_stop()
 
 
@@ -4126,10 +4159,10 @@ async def test_cycle_ticks_coalesce_while_one_cycle_is_running() -> None:
     async def fetch(_target: date, _metric: str):
         nonlocal calls
         calls += 1
-        if calls == 16:
+        if calls == 15:
             cycle_started.set()
             await release_cycle.wait()
-        if calls == 45:
+        if calls == 42:
             follow_up_done.set()
         return ()
 
@@ -4161,13 +4194,13 @@ async def test_cycle_ticks_coalesce_while_one_cycle_is_running() -> None:
     await asyncio.sleep(0)
     timer.fire_next()
     await asyncio.sleep(0)
-    assert calls == 16
+    assert calls == 15
 
     release_cycle.set()
     await asyncio.wait_for(follow_up_done.wait(), timeout=0.1)
-    assert calls == 45
+    assert calls == 42
     await asyncio.sleep(0)
-    assert calls == 45
+    assert calls == 42
     assert len(timer.active) == 1
     await archive.async_stop()
 
@@ -4666,7 +4699,7 @@ async def test_manual_repair_accepts_one_and_31_days_but_rejects_32_before_reque
     source.requested.clear()
     thirty_one = await archive.async_sync_range(start, start + timedelta(days=30))
     assert thirty_one.outcome == "written"
-    assert len(source.requested) == 31 * 19
+    assert len(source.requested) == 31 * 18
     assert set(source.requested) == {
         start + timedelta(days=offset) for offset in range(31)
     }
@@ -4730,8 +4763,8 @@ async def test_manual_repair_keeps_per_date_results_when_a_later_date_fails() ->
     report = await archive.async_sync_range(first, third)
 
     assert report.outcome == "failed"
-    assert source.requested.count(first) == 19
-    assert source.requested.count(second) == 19
+    assert source.requested.count(first) == 18
+    assert source.requested.count(second) == 18
     assert source.requested.count(third) == 0
     assert archive.get_history_presence(first, third)[first.isoformat()][
         "heart_rate"
@@ -4757,7 +4790,7 @@ async def test_manual_repair_keeps_per_date_results_when_a_later_date_fails() ->
     retry = await archive.async_sync_range(second, second)
 
     assert retry.outcome == "written"
-    assert source.requested.count(second) == 38
+    assert source.requested.count(second) == 36
     assert source.requested.count(third) == 0
     assert store.data["reconciliation"][second.isoformat()]["state"] == "open"
     assert store.data["reconciliation"][second.isoformat()]["outcome"] == "records"

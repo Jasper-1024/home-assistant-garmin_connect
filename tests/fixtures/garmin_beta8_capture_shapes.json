@@ -1,0 +1,76 @@
+{
+  "_redaction_version": "3.1.0-beta.9",
+  "_provenance": "Sanitized shapes from the local beta.8 debug capture; identifiers and health values are synthetic.",
+  "_captured_cardinality": {
+    "sleep_heart_rate": 298,
+    "sleep_hrv": 119,
+    "sleep_body_battery": 199,
+    "sleep_stress": 199,
+    "sleep_movement": 658,
+    "sleep_respiration": 298,
+    "sleep_spo2": 592,
+    "body_battery_event": 200,
+    "stress_event": 200
+  },
+  "sleep": {
+    "dailySleepDTO": {
+      "calendarDate": "2026-08-01",
+      "sleepStartTimestampGMT": "2026-07-31T16:00:00.0",
+      "sleepEndTimestampGMT": "2026-08-01T00:00:00.0",
+      "sleepLevels": []
+    },
+    "sleepHeartRate": [{"startTimeGMT": "2026-07-31T16:00:00.0", "value": 52}],
+    "hrvData": [{"startTimeGMT": "2026-07-31T16:05:00.0", "value": 44}],
+    "bodyBatteryChange": [{"startTimeGMT": "2026-07-31T16:10:00.0", "value": 6}],
+    "stress": [{"startTimeGMT": "2026-07-31T16:15:00.0", "value": 18}],
+    "wellnessEpochRespirationDataDTOList": [{"startTimeGMT": "2026-07-31T16:20:00.0", "respirationValue": 14}],
+    "wellnessEpochSPO2DataDTOList": [{"startTimeGMT": "2026-07-31T16:25:00.0", "spo2Reading": 97}],
+    "movement": [{"startTimeGMT": "2026-07-31T16:30:00.0", "activityLevel": 1}]
+  },
+  "body_battery_events": [{
+    "event": {
+      "eventStartTimeGmt": "2026-08-01T01:00:00.0",
+      "durationInMilliseconds": 900000,
+      "eventType": "ACTIVITY",
+      "feedbackType": "POSITIVE"
+    },
+    "bodyBatteryValueDescriptorsDTOList": [
+      {"bodyBatteryValueDescriptorIndex": 0, "bodyBatteryValueDescriptorKey": "timestamp"},
+      {"bodyBatteryValueDescriptorIndex": 1, "bodyBatteryValueDescriptorKey": "bodyBatteryLevel"}
+    ],
+    "bodyBatteryValuesArray": [[1785524400000, 70], [1785525300000, 72]],
+    "stressValueDescriptorsDTOList": [
+      {"index": 0, "key": "timestamp"},
+      {"index": 1, "key": "stressLevel"}
+    ],
+    "stressValuesArray": [[1785524400000, 20], [1785525300000, 18]]
+  }],
+  "daily_summary": {
+    "calendarDate": "2026-08-01",
+    "floorsAscended": 8,
+    "floorsDescended": 7,
+    "floorsAscendedInMeters": 24,
+    "floorsDescendedInMeters": 21,
+    "moderateIntensityMinutes": 32,
+    "vigorousIntensityMinutes": 9
+  },
+  "training_status": {
+    "mostRecentTrainingStatus": {
+      "latestTrainingStatusData": {
+        "101": {
+          "deviceId": 101,
+          "calendarDate": "2026-08-01",
+          "acuteTrainingLoadDTO": {
+            "dailyTrainingLoadAcute": 420,
+            "dailyTrainingLoadChronic": 560,
+            "dailyAcuteChronicWorkloadRatio": 0.75
+          },
+          "fitnessTrend": 2
+        }
+      }
+    },
+    "mostRecentVO2Max": {
+      "generic": {"deviceId": 101, "vo2MaxValue": 47.2}
+    }
+  }
+}

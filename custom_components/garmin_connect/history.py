@@ -69,10 +69,7 @@ from .history_recorder import (
     FLOORS_ASCENDED_METERS_DAILY_METADATA,
     FLOORS_DESCENDED_DAILY_METADATA,
     FLOORS_DESCENDED_METERS_DAILY_METADATA,
-    FLOORS_METADATA,
-    FLOORS_TOTAL_DAILY_METADATA,
     HEART_RATE_METADATA,
-    INTENSITY_TOTAL_DAILY_METADATA,
     MODERATE_INTENSITY_DAILY_METADATA,
     MODERATE_INTENSITY_METADATA,
     NIGHTLY_HRV_METADATA,
@@ -117,6 +114,7 @@ from .history_source import (
     SegmentedData,
     SnapshotData,
     SourceSeries,
+    TrainingDeviceSnapshots,
     activity_from_record,
     health_event_from_record,
     health_event_record,
@@ -147,10 +145,9 @@ _FIT_QUEUE_FIELDS = frozenset(
 )
 _DATE_SUMMARY_BUCKET_TIME_ZONE = timezone(timedelta(hours=8))
 _PRESENCE_STATES = frozenset({"null", "empty", "all-null", "missing", "unsupported", "returned-empty", "present", "absent", "failed", "mixed", "unknown", "partial", "incomplete"})
-# The frozen numeric catalog currently produces 33 base presence keys: 13
-# families, 12 segmented total contexts, and 8 snapshot fields. Seven aggregate
-# sleep-stream states retain date-level availability without session-key growth.
-_MAX_PRESENCE_METRICS = 64
+# The catalog includes bounded per-device training fields. Garmin currently
+# returns a small device set; the normalizer rejects more than 32 devices.
+_MAX_PRESENCE_METRICS = 256
 _SLEEP_SCHEMA_VERSION = 1
 _SLEEP_PRESENCE_PREFIX = "sleep_stream:"
 _SLEEP_STREAM_METADATA = {
@@ -171,7 +168,6 @@ _NUMERIC_FAMILY_METADATA = (
     ("body_battery", BODY_BATTERY_METADATA),
     ("nightly_hrv", NIGHTLY_HRV_METADATA),
     ("steps", STEPS_METADATA),
-    ("floors", FLOORS_METADATA),
     ("intensity_moderate", MODERATE_INTENSITY_METADATA),
     ("intensity_vigorous", VIGOROUS_INTENSITY_METADATA),
     ("respiration_raw", RESPIRATION_RAW_METADATA),
@@ -191,6 +187,22 @@ _STRUCTURED_FAMILIES = (
 _FROZEN_ARCHIVE_FAMILIES = tuple(
     family for family, _metadata in _NUMERIC_FAMILY_METADATA
 ) + _STRUCTURED_FAMILIES + ("sleep_stream",)
+_SNAPSHOT_METADATA = {
+    "abnormal_heart_rate_alerts": DAILY_ABNORMAL_HR_METADATA,
+    "floors_ascended": FLOORS_ASCENDED_DAILY_METADATA,
+    "floors_descended": FLOORS_DESCENDED_DAILY_METADATA,
+    "floors_ascended_meters": FLOORS_ASCENDED_METERS_DAILY_METADATA,
+    "floors_descended_meters": FLOORS_DESCENDED_METERS_DAILY_METADATA,
+    "intensity_moderate": MODERATE_INTENSITY_DAILY_METADATA,
+    "intensity_vigorous": VIGOROUS_INTENSITY_DAILY_METADATA,
+    "acute_load": TRAINING_ACUTE_LOAD_METADATA,
+    "chronic_load": TRAINING_CHRONIC_LOAD_METADATA,
+    "load_balance": TRAINING_LOAD_BALANCE_METADATA,
+    "acwr": TRAINING_ACWR_METADATA,
+    "vo2_max": TRAINING_VO2_MAX_METADATA,
+    "fitness_trend": TRAINING_FITNESS_TREND_METADATA,
+    "recovery_time": TRAINING_RECOVERY_TIME_METADATA,
+}
 _RECONCILIATION_FAMILIES = _FROZEN_ARCHIVE_FAMILIES
 _RECONCILIATION_EXPLICIT_EMPTY_STATES = frozenset(
     {"empty", "all-null", "null", "returned-empty", "absent"}
@@ -266,6 +278,7 @@ class _NormalizedDetailAdapter:
     summary: HRVSummary | None = None
     events: tuple[NormalizedHealthEvent, ...] = ()
     fields: Mapping[str, tuple[str, float | None]] | None = None
+    device_snapshots: Mapping[str, SnapshotData] | None = None
 
     @property
     def supported(self) -> bool:
@@ -340,6 +353,32 @@ def _normalized_detail_adapter(details: Any) -> _NormalizedDetailAdapter:
             (),
             events=details.events,
             fields=details.fields,
+        )
+    if isinstance(details, TrainingDeviceSnapshots):
+        states = {
+            state
+            for snapshot in details.snapshots.values()
+            for state, _value in snapshot.fields.values()
+        }
+        return _NormalizedDetailAdapter(
+            details,
+            "device_snapshots",
+            any(
+                state == "present" and value is not None
+                for snapshot in details.snapshots.values()
+                for state, value in snapshot.fields.values()
+            ),
+            lambda available: (
+                "present"
+                if "present" in states
+                else "missing"
+                if states & _RECONCILIATION_UNAVAILABLE_STATES
+                else "empty"
+                if available
+                else "missing"
+            ),
+            (),
+            device_snapshots=details.snapshots,
         )
     if isinstance(details, tuple):
         return _NormalizedDetailAdapter(
@@ -2135,6 +2174,55 @@ class GarminHistoryArchive:
         family_observation = _FamilyObservation.from_details(details)
 
         inserted = updated = skipped = 0
+
+        async def write_snapshot_field(
+            field: str,
+            state: str,
+            value: float | None,
+            snapshot_details: SnapshotData,
+            *,
+            device_id: str | None = None,
+        ) -> None:
+            nonlocal inserted, updated, skipped
+            metadata_for_field = _SNAPSHOT_METADATA.get(field)
+            if state != "present" or value is None or metadata_for_field is None:
+                return
+            metric_key = metadata_for_field.key
+            metric_metadata = metadata_for_field
+            if device_id is not None:
+                metric_key = f"{metric_key}:{device_id}"
+                metric_metadata = replace(
+                    metadata_for_field,
+                    key=metric_key,
+                    name=f"{metadata_for_field.name} ({device_id})",
+                )
+            snapshot = NormalizedSample(
+                snapshot_details.timestamp,
+                snapshot_details.calendar_date or target,
+                snapshot_details.raw_timestamp,
+                value,
+            )
+            statistic_id = statistic_id_for(self._account_key(), metric_key)
+            await self._async_prepare_numeric_source_dates(statistic_id, (snapshot,))
+            snapshot_outcome = await recorder.async_write(
+                statistic_id,
+                metric_metadata,
+                (snapshot,),
+            )
+            if snapshot_outcome.outcome != "written":
+                raise _NumericFamilyError(
+                    snapshot_outcome.error_type or "sync_failed",
+                    write_failure=True,
+                    observation=family_observation,
+                )
+            await self._async_confirm_numeric_source_dates(statistic_id, (snapshot,))
+            inserted += getattr(
+                snapshot_outcome,
+                "inserted_count",
+                snapshot_outcome.accepted_count,
+            )
+            updated += getattr(snapshot_outcome, "updated_count", 0)
+            skipped += getattr(snapshot_outcome, "skipped_count", 0)
         if detail_adapter.metric_presence is not None:
             presence.setdefault(target_key, {})[metric] = detail_adapter.metric_presence
         for total_key, state in detail_adapter.total_presence.items():
@@ -2148,47 +2236,32 @@ class GarminHistoryArchive:
                 "baseline": detail_adapter.summary.baseline,
             }
         health_events.extend(detail_adapter.events)
+        device_snapshots = detail_adapter.device_snapshots
+        if device_snapshots is not None:
+            for device_id, snapshot_details in sorted(device_snapshots.items()):
+                for field, (state, value) in snapshot_details.fields.items():
+                    presence.setdefault(target_key, {})[
+                        f"{metric}:{device_id}:{field}"
+                    ] = state
+                    await write_snapshot_field(
+                        field,
+                        state,
+                        value,
+                        snapshot_details,
+                        device_id=device_id,
+                    )
+            return _NumericImportResult(
+                inserted,
+                updated,
+                skipped,
+                family_observation,
+            )
         snapshot_fields = detail_adapter.fields
         if snapshot_fields is not None:
             for field, (state, _value) in snapshot_fields.items():
                 presence.setdefault(target_key, {})[f"{metric}:{field}"] = state
-            snapshot_metadata = {
-                "abnormal_heart_rate_alerts": DAILY_ABNORMAL_HR_METADATA,
-                "acute_load": TRAINING_ACUTE_LOAD_METADATA,
-                "chronic_load": TRAINING_CHRONIC_LOAD_METADATA,
-                "load_balance": TRAINING_LOAD_BALANCE_METADATA,
-                "acwr": TRAINING_ACWR_METADATA,
-                "vo2_max": TRAINING_VO2_MAX_METADATA,
-                "fitness_trend": TRAINING_FITNESS_TREND_METADATA,
-                "recovery_time": TRAINING_RECOVERY_TIME_METADATA,
-            }
             for field, (state, value) in snapshot_fields.items():
-                metadata_for_field = snapshot_metadata.get(field)
-                if state != "present" or value is None or metadata_for_field is None:
-                    continue
-                snapshot = NormalizedSample(
-                    details.timestamp,
-                    details.calendar_date or target,
-                    details.raw_timestamp,
-                    value,
-                )
-                statistic_id = statistic_id_for(self._account_key(), metadata_for_field.key)
-                await self._async_prepare_numeric_source_dates(statistic_id, (snapshot,))
-                snapshot_outcome = await recorder.async_write(
-                    statistic_id,
-                    metadata_for_field,
-                    (snapshot,),
-                )
-                if snapshot_outcome.outcome != "written":
-                    raise _NumericFamilyError(
-                        snapshot_outcome.error_type or "sync_failed",
-                        write_failure=True,
-                        observation=family_observation,
-                    )
-                await self._async_confirm_numeric_source_dates(statistic_id, (snapshot,))
-                inserted += getattr(snapshot_outcome, "inserted_count", snapshot_outcome.accepted_count)
-                updated += getattr(snapshot_outcome, "updated_count", 0)
-                skipped += getattr(snapshot_outcome, "skipped_count", 0)
+                await write_snapshot_field(field, state, value, details)
             return _NumericImportResult(
                 inserted,
                 updated,
@@ -2219,17 +2292,6 @@ class GarminHistoryArchive:
         if total_values:
             total_metadata = {
                 ("steps", "totalSteps"): STEPS_DAILY_TOTAL_METADATA,
-                ("floors", "floorsAscended"): FLOORS_ASCENDED_DAILY_METADATA,
-                ("floors", "floorsDescended"): FLOORS_DESCENDED_DAILY_METADATA,
-                ("floors", "floorsAscendedInMeters"): FLOORS_ASCENDED_METERS_DAILY_METADATA,
-                ("floors", "floorsDescendedInMeters"): FLOORS_DESCENDED_METERS_DAILY_METADATA,
-                ("floors", "totalFloors"): FLOORS_TOTAL_DAILY_METADATA,
-                ("intensity_moderate", "moderateIntensityMinutes"): MODERATE_INTENSITY_DAILY_METADATA,
-                ("intensity_moderate", "vigorousIntensityMinutes"): VIGOROUS_INTENSITY_DAILY_METADATA,
-                ("intensity_vigorous", "vigorousIntensityMinutes"): VIGOROUS_INTENSITY_DAILY_METADATA,
-                ("intensity_moderate", "totalIntensityMinutes"): INTENSITY_TOTAL_DAILY_METADATA,
-                ("intensity_vigorous", "moderateIntensityMinutes"): MODERATE_INTENSITY_DAILY_METADATA,
-                ("intensity_vigorous", "totalIntensityMinutes"): INTENSITY_TOTAL_DAILY_METADATA,
             }
             for total_key, total_value in total_values.items():
                 total_metric = total_metadata.get((metric, total_key))

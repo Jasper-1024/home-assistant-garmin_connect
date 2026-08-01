@@ -165,7 +165,7 @@ class _RuntimeHistoryClient:
     async def _archive_request(self) -> dict:
         self.requests += 1
         self.events.append(f"archive-{self.requests}")
-        if self.requests == 19:
+        if self.requests == 14:
             self.first_sync_done.set()
         if self.block_cycle and not self.cycle_started.is_set():
             self.cycle_started.set()
@@ -179,8 +179,11 @@ class _RuntimeHistoryClient:
     async def get_user_profile(self) -> SimpleNamespace:
         return SimpleNamespace(display_name="athlete", profile_id=123456789)
 
-    async def _request(self, *_args, **_kwargs) -> dict:
-        return await self._archive_request()
+    async def _request(self, *args, **_kwargs):
+        result = await self._archive_request()
+        if len(args) > 1 and "bodyBattery/events" in str(args[1]):
+            return []
+        return result
 
     async def _get_hrv_data_raw(self, _target: date) -> dict:
         return await self._archive_request()

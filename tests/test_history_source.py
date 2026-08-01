@@ -3,7 +3,7 @@
 import json
 from datetime import UTC, date, datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 from ha_garmin import GarminClient
@@ -14,6 +14,7 @@ from custom_components.garmin_connect.history_source import (
     GarminHistorySource,
     HistorySchemaError,
     SourceSeries,
+    TrainingDeviceSnapshots,
     health_event_from_record,
     health_event_record,
     normalize_activities,
@@ -26,8 +27,10 @@ from custom_components.garmin_connect.history_source import (
     normalize_snapshot,
     normalize_spo2,
     normalize_steps,
+    normalize_training_status,
     parse_hrv_data,
 )
+from custom_components.garmin_connect.sleep_archive import parse_sleep_sessions
 
 
 class _ImmediateGate:
@@ -123,11 +126,12 @@ async def test_body_battery_uses_date_range_parameters() -> None:
     )
 
     assert isinstance(result, SourceSeries)
-    client._request.assert_awaited_once_with(
+    assert client._request.await_args_list[0] == call(
         "GET",
         "https://garmin.example/wellness-service/wellness/bodyBattery/reports/daily",
         params={"startDate": "2026-08-01", "endDate": "2026-08-01"},
     )
+    assert client._request.await_count == 2
 
 
 def test_measurement_without_source_instant_offset_fails_closed() -> None:
@@ -157,7 +161,11 @@ async def test_fetch_stress_retains_negative_numeric_samples() -> None:
 
     client = MagicMock()
     client._base_url = "https://garmin.example"
-    client._request = AsyncMock(return_value=payload)
+    client._request = AsyncMock(
+        side_effect=lambda _method, url, **_kwargs: (
+            [] if "/bodyBattery/events/" in url else payload
+        )
+    )
     result = await GarminHistorySource(client, _ImmediateGate()).async_fetch_details(
         date(2026, 7, 24), "stress"
     )
@@ -1226,6 +1234,111 @@ def test_daily_summary_and_training_snapshot_presence_and_type_drift() -> None:
         )
 
 
+def test_current_daily_summary_retains_floor_and_intensity_totals() -> None:
+    """Live daily totals remain separate Garmin-computed snapshots."""
+    summary = normalize_snapshot(
+        {
+            "calendarDate": "2026-08-01",
+            "floorsAscended": 8.0,
+            "floorsDescended": 7.0,
+            "floorsAscendedInMeters": 24.0,
+            "floorsDescendedInMeters": 21.0,
+            "moderateIntensityMinutes": 32,
+            "vigorousIntensityMinutes": 9,
+        },
+        date(2026, 8, 1),
+        DAILY_SUMMARY_FIELDS,
+    )
+
+    assert {key: state for key, (state, _value) in summary.fields.items()} == {
+        "abnormal_heart_rate_alerts": "absent",
+        "floors_ascended": "present",
+        "floors_descended": "present",
+        "floors_ascended_meters": "present",
+        "floors_descended_meters": "present",
+        "intensity_moderate": "present",
+        "intensity_vigorous": "present",
+    }
+
+
+def test_sanitized_beta8_capture_shapes_cover_repaired_families() -> None:
+    """The repaired normalizers consume representative offline capture shapes."""
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "garmin_beta8_capture_shapes.json").read_text()
+    )
+    target = date(2026, 8, 1)
+
+    sessions = parse_sleep_sessions(fixture["sleep"], target)
+    events = normalize_health_events(fixture["body_battery_events"], target)
+    summary = normalize_snapshot(
+        fixture["daily_summary"], target, DAILY_SUMMARY_FIELDS
+    )
+    training = normalize_training_status(fixture["training_status"], target)
+
+    assert len(sessions) == 1
+    assert {stream.metric for stream in sessions[0].streams} == {
+        "heart_rate",
+        "hrv",
+        "body_battery",
+        "stress",
+        "respiration",
+        "spo2",
+        "movement",
+    }
+    assert len(events) == 1
+    assert summary.fields["floors_ascended"] == ("present", 8.0)
+    assert isinstance(training, TrainingDeviceSnapshots)
+    assert training.snapshots["101"].fields["acute_load"] == (
+        "present",
+        420.0,
+    )
+
+
+def test_current_training_status_retains_every_device_snapshot() -> None:
+    """Aggregated training status is flattened per returned Garmin device."""
+    payload = {
+        "mostRecentTrainingStatus": {
+            "latestTrainingStatusData": {
+                "101": {
+                    "deviceId": 101,
+                    "calendarDate": "2026-08-01",
+                    "primaryTrainingDevice": True,
+                    "acuteTrainingLoadDTO": {
+                        "dailyTrainingLoadAcute": 420,
+                        "dailyTrainingLoadChronic": 560,
+                        "dailyAcuteChronicWorkloadRatio": 0.75,
+                    },
+                    "fitnessTrend": 2,
+                },
+                "202": {
+                    "deviceId": 202,
+                    "calendarDate": "2026-08-01",
+                    "primaryTrainingDevice": False,
+                    "acuteTrainingLoadDTO": {
+                        "dailyTrainingLoadAcute": 210,
+                        "dailyTrainingLoadChronic": 350,
+                        "dailyAcuteChronicWorkloadRatio": 0.6,
+                    },
+                    "fitnessTrend": 1,
+                },
+            }
+        },
+        "mostRecentVO2Max": {
+            "generic": {"deviceId": 101, "vo2MaxValue": 47.2},
+            "cycling": {"deviceId": 202, "vo2MaxValue": 51.0},
+        },
+    }
+
+    result = normalize_training_status(payload, date(2026, 8, 1))
+
+    assert isinstance(result, TrainingDeviceSnapshots)
+    assert set(result.snapshots) == {"101", "202"}
+    assert result.snapshots["101"].fields["acute_load"] == ("present", 420.0)
+    assert result.snapshots["101"].fields["vo2_max"] == ("present", 47.2)
+    assert result.snapshots["202"].fields["vo2_max"] == ("present", 51.0)
+    assert result.snapshots["202"].fields["recovery_time"] == ("absent", None)
+
+
 def test_date_only_snapshots_use_the_utc_plus_eight_calendar_bucket() -> None:
     """Summaries retain Source Calendar Date without inventing a Source Instant."""
     calendar_date = date(2027, 1, 1)
@@ -1292,3 +1405,111 @@ async def test_daily_summary_uses_raw_client_method_without_profile() -> None:
 
     client._get_user_summary_raw.assert_awaited_once_with(date(2026, 7, 24))
     client.get_user_profile.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_current_body_battery_event_enriches_numeric_series_and_event() -> None:
+    """One live-shaped event response feeds both statistics and Calendar data."""
+    target = date(2026, 8, 1)
+    event_payload = [
+        {
+            "event": {
+                "eventStartTimeGmt": "2026-08-01T01:00:00.0",
+                "durationInMilliseconds": 900_000,
+                "eventType": "ACTIVITY",
+                "feedbackType": "POSITIVE",
+            },
+            "bodyBatteryValueDescriptorsDTOList": [
+                {
+                    "bodyBatteryValueDescriptorIndex": 0,
+                    "bodyBatteryValueDescriptorKey": "timestamp",
+                },
+                {
+                    "bodyBatteryValueDescriptorIndex": 1,
+                    "bodyBatteryValueDescriptorKey": "bodyBatteryLevel",
+                },
+            ],
+            "bodyBatteryValuesArray": [
+                [1_785_524_400_000, 70],
+                [1_785_525_300_000, 72],
+            ],
+            "stressValueDescriptorsDTOList": [
+                {"index": 0, "key": "timestamp"},
+                {"index": 1, "key": "stressLevel"},
+            ],
+            "stressValuesArray": [
+                [1_785_524_400_000, 20],
+                [1_785_525_300_000, 18],
+            ],
+        }
+    ]
+    client = MagicMock(_base_url="https://connect.garmin.test/gc-api")
+
+    async def request(_method, url, **_kwargs):
+        if "/bodyBattery/events/" in url:
+            return event_payload
+        if "/dailyStress/" in url:
+            return {
+                "stressValueDescriptorsDTOList": [
+                    {"index": 0, "key": "timestamp"},
+                    {"index": 1, "key": "stressLevel"},
+                ],
+                "stressValuesArray": [[1_785_524_400_000, 20]],
+            }
+        if "/bodyBattery/reports/daily" in url:
+            return [
+                {
+                    "calendarDate": target.isoformat(),
+                    "bodyBatteryValueDescriptorDTOList": [
+                        {"index": 0, "key": "timestamp"},
+                        {"index": 1, "key": "bodyBatteryLevel"},
+                    ],
+                    "bodyBatteryValuesArray": [[1_785_524_400_000, 70]],
+                }
+            ]
+        raise AssertionError(url)
+
+    client._request = AsyncMock(side_effect=request)
+    source = GarminHistorySource(client, _ImmediateGate())
+
+    stress = await source.async_fetch_details(target, "stress")
+    body_battery = await source.async_fetch_details(target, "body_battery")
+    events = await source.async_fetch_details(target, "health_events_body_battery")
+
+    assert isinstance(stress, SourceSeries)
+    assert isinstance(body_battery, SourceSeries)
+    assert len(stress.readings) == 2
+    assert len(body_battery.readings) == 2
+    assert len(events) == 1
+    assert events[0].event_type == "ACTIVITY"
+    assert events[0].start == datetime(2026, 8, 1, 1, tzinfo=UTC)
+    assert events[0].end == datetime(2026, 8, 1, 1, 15, tzinfo=UTC)
+    assert sum(
+        "/bodyBattery/events/" in call.args[1]
+        for call in client._request.await_args_list
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_shared_daily_endpoints_are_requested_once_per_source_instance() -> None:
+    """Sibling metrics reuse one captured payload instead of polling Garmin again."""
+    target = date(2026, 8, 1)
+    client = MagicMock(_base_url="https://connect.garmin.test/gc-api")
+    client._request = AsyncMock(return_value={})
+    source = GarminHistorySource(client, _ImmediateGate())
+
+    for metric in (
+        "intensity_moderate",
+        "intensity_vigorous",
+        "respiration_raw",
+        "respiration_average",
+        "spo2_single",
+        "spo2_continuous",
+        "spo2_hourly",
+    ):
+        await source.async_fetch_details(target, metric)
+
+    urls = [call.args[1] for call in client._request.await_args_list]
+    assert sum("/daily/im/" in url for url in urls) == 1
+    assert sum("/daily/respiration/" in url for url in urls) == 1
+    assert sum("/daily/spo2/" in url for url in urls) == 1

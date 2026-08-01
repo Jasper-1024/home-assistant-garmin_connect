@@ -46,14 +46,15 @@ from custom_components.garmin_connect.history_source import (
     SegmentedData,
     SnapshotData,
     SourceSeries,
+    TrainingDeviceSnapshots,
     normalize_activities,
     normalize_body_battery,
-    normalize_floors,
     normalize_health_events,
     normalize_intensity,
     normalize_pair_series,
     normalize_snapshot,
     normalize_steps,
+    normalize_training_status,
 )
 from custom_components.garmin_connect.sleep_archive import (
     SleepSession,
@@ -184,7 +185,6 @@ async def test_sync_fetches_only_supported_metrics_and_writes_each_day():
         "body_battery",
         "nightly_hrv",
         "steps",
-        "floors",
         "intensity_moderate",
         "intensity_vigorous",
         "respiration_raw",
@@ -195,7 +195,7 @@ async def test_sync_fetches_only_supported_metrics_and_writes_each_day():
         "daily_summary",
         "training_status",
     }
-    assert recorder.async_write.await_count == 26
+    assert recorder.async_write.await_count == 24
     assert archive.status.state is HistoryArchiveState.IDLE
 
 
@@ -265,7 +265,6 @@ async def test_numeric_family_presence_survives_archive_normalization():
                 return HRVData((), None, "null")
             if metric in {
                 "steps",
-                "floors",
                 "intensity_moderate",
                 "intensity_vigorous",
             }:
@@ -291,7 +290,6 @@ async def test_numeric_family_presence_survives_archive_normalization():
             "body_battery": "missing",
             "nightly_hrv": "null",
             "steps": "empty",
-            "floors": "empty",
             "intensity_moderate": "empty",
             "intensity_vigorous": "empty",
             "respiration_raw": "returned-empty",
@@ -319,8 +317,6 @@ async def test_list_shaped_numeric_payloads_write_samples_and_presence() -> None
                 return body_battery
             if metric == "steps":
                 return normalize_steps([{"timestamp": "2026-01-01T01:00:00Z", "steps": 12}], request_date)
-            if metric == "floors":
-                return normalize_floors([{"time": "2026-01-01T01:00:00Z", "floors": 2}], request_date)
             if metric == "intensity_moderate":
                 return normalize_intensity([{"start": "2026-01-01T01:00:00Z", "moderateIntensityMinutes": 1}], request_date, "moderate")
             if metric == "intensity_vigorous":
@@ -340,12 +336,6 @@ async def test_list_shaped_numeric_payloads_write_samples_and_presence() -> None
         "body_battery": "present",
         "steps": "present",
         "steps:totalSteps": "absent",
-        "floors": "present",
-        "floors:floorsAscended": "absent",
-        "floors:floorsDescended": "absent",
-        "floors:floorsAscendedInMeters": "absent",
-        "floors:floorsDescendedInMeters": "absent",
-        "floors:totalFloors": "absent",
         "intensity_moderate": "present",
         "intensity_moderate:moderateIntensityMinutes": "absent",
         "intensity_moderate:vigorousIntensityMinutes": "absent",
@@ -360,10 +350,9 @@ async def test_list_shaped_numeric_payloads_write_samples_and_presence() -> None
         for call in recorder.async_write.await_args_list
         if call.args[2]
     }
-    assert {key: written[key] for key in ("body_battery", "steps", "floors", "intensity_moderate", "intensity_vigorous")} == {
+    assert {key: written[key] for key in ("body_battery", "steps", "intensity_moderate", "intensity_vigorous")} == {
         "body_battery": 42.0,
         "steps": 12.0,
-        "floors": 2.0,
         "intensity_moderate": 1.0,
         "intensity_vigorous": 3.0,
     }
@@ -464,7 +453,7 @@ async def test_archive_captures_every_numeric_catalog_family_without_thinning():
                 return SourceSeries((sample,), "present")
             if metric == "nightly_hrv":
                 return HRVData((sample,), presence="present")
-            if metric in {"steps", "floors", "intensity_moderate", "intensity_vigorous"}:
+            if metric in {"steps", "intensity_moderate", "intensity_vigorous"}:
                 return SegmentedData((sample,), presence="present")
             if metric == "daily_summary":
                 return SnapshotData(
@@ -502,7 +491,6 @@ async def test_archive_captures_every_numeric_catalog_family_without_thinning():
         "body_battery",
         "nightly_hrv",
         "steps",
-        "floors",
         "intensity_moderate",
         "intensity_vigorous",
         "respiration_raw",
@@ -519,7 +507,7 @@ async def test_archive_captures_every_numeric_catalog_family_without_thinning():
         "training_fitness_trend",
         "training_recovery_time",
     }
-    assert len(writes) == 21
+    assert len(writes) == 20
     assert all(samples[0].request_date == target for _, _, samples in writes)
     assert all(len(samples) == 1 for _, _, samples in writes)
     assert next(samples[0].value for _, metadata, samples in writes if metadata.key == "heart_rate") == 0.0
@@ -1024,10 +1012,9 @@ async def test_many_sleep_sessions_keep_stream_presence_in_annual_partition() ->
                 return ()
             if metric == "nightly_hrv":
                 return HRVData((), presence="empty")
-            if metric in {"steps", "floors", "intensity_moderate", "intensity_vigorous"}:
+            if metric in {"steps", "intensity_moderate", "intensity_vigorous"}:
                 total_keys = {
                     "steps": ("totalSteps",),
-                    "floors": ("floorsAscended", "floorsDescended", "floorsAscendedInMeters", "floorsDescendedInMeters", "totalFloors"),
                     "intensity_moderate": ("moderateIntensityMinutes", "vigorousIntensityMinutes", "totalIntensityMinutes"),
                     "intensity_vigorous": ("moderateIntensityMinutes", "vigorousIntensityMinutes", "totalIntensityMinutes"),
                 }[metric]
@@ -1053,7 +1040,7 @@ async def test_many_sleep_sessions_keep_stream_presence_in_annual_partition() ->
     await archive.async_start()
     assert (await archive.async_sync_range(target, target)).outcome == "written"
     catalog = stores["garmin_connect.e.history_catalog"]
-    assert len(catalog.data["presence"][target.isoformat()]) == 40
+    assert len(catalog.data["presence"][target.isoformat()]) == 34
     assert not any(
         key.startswith(("sleep_heart_rate:", "sleep_hrv:", "sleep_body_battery:", "sleep_stress:", "sleep_respiration:", "sleep_spo2:", "sleep_movement:"))
         for key in catalog.data["presence"][target.isoformat()]
@@ -1165,6 +1152,81 @@ async def test_snapshot_archive_writes_present_fields_and_restarts_from_checkpoi
 
 
 @pytest.mark.asyncio
+async def test_training_archive_writes_each_returned_device_with_direct_id():
+    """Device-keyed snapshots remain distinct through Recorder persistence."""
+    target = date(2026, 8, 1)
+    training = normalize_training_status(
+        {
+            "mostRecentTrainingStatus": {
+                "latestTrainingStatusData": {
+                    "101": {
+                        "deviceId": 101,
+                        "calendarDate": target.isoformat(),
+                        "acuteTrainingLoadDTO": {
+                            "dailyTrainingLoadAcute": 420,
+                            "dailyTrainingLoadChronic": 560,
+                            "dailyAcuteChronicWorkloadRatio": 0.75,
+                        },
+                    },
+                    "202": {
+                        "deviceId": 202,
+                        "calendarDate": target.isoformat(),
+                        "acuteTrainingLoadDTO": {
+                            "dailyTrainingLoadAcute": 210,
+                            "dailyTrainingLoadChronic": 350,
+                            "dailyAcuteChronicWorkloadRatio": 0.6,
+                        },
+                    },
+                }
+            },
+            "mostRecentVO2Max": {
+                "generic": {"deviceId": 101, "vo2MaxValue": 47.2},
+                "cycling": {"deviceId": 202, "vo2MaxValue": 51.0},
+            },
+        },
+        target,
+    )
+    assert isinstance(training, TrainingDeviceSnapshots)
+
+    class Source:
+        async def async_fetch_details(self, _request_date, metric):
+            return training if metric == "training_status" else ()
+
+    recorder = MagicMock()
+    recorder.async_write = AsyncMock(return_value=RecorderWriteOutcome(1))
+    store = _Store()
+    archive = _sync_archive(Source(), recorder, store)
+    await archive.async_start()
+
+    report = await archive.async_sync_range(target, target)
+
+    assert report.outcome == "written"
+    training_calls = [
+        call
+        for call in recorder.async_write.await_args_list
+        if call.args[1].key.startswith("training_")
+    ]
+    assert {call.args[1].key for call in training_calls} == {
+        "training_acute_load:101",
+        "training_chronic_load:101",
+        "training_acwr:101",
+        "training_vo2_max:101",
+        "training_acute_load:202",
+        "training_chronic_load:202",
+        "training_acwr:202",
+        "training_vo2_max:202",
+    }
+    assert all(
+        call.args[0]
+        == statistic_id_for("opaque-account-key-1234567890", call.args[1].key)
+        for call in training_calls
+    )
+    presence = store.data["presence"][target.isoformat()]
+    assert presence["training_status:101:recovery_time"] == "absent"
+    assert presence["training_status:202:load_balance"] == "absent"
+
+
+@pytest.mark.asyncio
 async def test_archive_aggregates_import_classification_counts():
     source = MagicMock()
     source.async_fetch = AsyncMock(return_value=())
@@ -1214,7 +1276,7 @@ async def test_checkpoint_persists_each_date_and_manual_repair_retries_it():
     assert report.outcome == "written"
     assert report.skipped_count == 0
     assert report.processed_dates == (date(2026, 1, 1), date(2026, 1, 2))
-    assert source.async_fetch.await_count == 30
+    assert source.async_fetch.await_count == 28
 
 
 @pytest.mark.asyncio
