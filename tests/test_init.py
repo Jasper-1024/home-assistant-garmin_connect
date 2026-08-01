@@ -20,6 +20,7 @@ from homeassistant.config_entries import (
 from homeassistant.core import HomeAssistant
 
 from custom_components.garmin_connect import (
+    _ENTRY_UPDATE_STATES,
     _migrate_entity_unique_ids,
     async_migrate_entry,
     async_options_update_listener,
@@ -84,6 +85,15 @@ def _configure_entry_task_factory(hass: MagicMock) -> None:
     hass.async_create_task_internal.side_effect = (
         lambda target, name, _eager_start: asyncio.create_task(target, name=name)
     )
+
+
+async def _await_archive_start_task(entry: object) -> None:
+    """Wait for a setup-created archive task when it has a finite startup."""
+    state = _ENTRY_UPDATE_STATES.get(entry)
+    assert state is not None
+    task = state.archive_start_task
+    if task is not None:
+        await task
 
 
 def _stack_coordinators(stack: ExitStack, coord: MagicMock) -> list[MagicMock]:
@@ -460,16 +470,19 @@ async def test_real_config_entry_lifecycle_keeps_backfill_dormant_and_surfaces_v
             )
 
             await hass.config_entries.async_add(entry)
+            await _await_archive_start_task(entry)
             await assert_disabled_surfaces()
             account_key = entry.data["history_account_key"]
 
             assert await hass.config_entries.async_reload(entry.entry_id)
+            await _await_archive_start_task(entry)
             await assert_disabled_surfaces()
             assert entry.data["history_account_key"] == account_key
 
             assert await hass.config_entries.async_unload(entry.entry_id)
             assert entry.state is ConfigEntryState.NOT_LOADED
             assert await hass.config_entries.async_setup(entry.entry_id)
+            await _await_archive_start_task(entry)
             await assert_disabled_surfaces()
             assert entry.data["history_account_key"] == account_key
 
@@ -708,14 +721,15 @@ async def test_option_disablement_reload_cancels_recurring_archive_work(tmp_path
             )
 
             await hass.config_entries.async_add(entry)
+            await _await_archive_start_task(entry)
             first_archive = entry.runtime_data.history_archive
-            await asyncio.wait_for(client.first_sync_done.wait(), timeout=0.1)
+            await asyncio.wait_for(client.first_sync_done.wait(), timeout=1)
             await hass.async_block_till_done()
             assert timer.active, (first_archive.status, client.requests, client.events)
 
             client.block_cycle = True
             timer.fire_next()
-            await asyncio.wait_for(client.cycle_started.wait(), timeout=0.1)
+            await asyncio.wait_for(client.cycle_started.wait(), timeout=1)
 
             requests_before_disable = client.requests
             hass.config_entries.async_update_entry(entry, options={CONF_ARCHIVE_ENABLED: False})
@@ -813,7 +827,8 @@ async def test_runtime_archive_prioritizes_foreground_work_through_shared_gate(t
             )
 
             await hass.config_entries.async_add(entry)
-            await asyncio.wait_for(client.first_sync_done.wait(), timeout=0.1)
+            await _await_archive_start_task(entry)
+            await asyncio.wait_for(client.first_sync_done.wait(), timeout=1)
             await hass.async_block_till_done()
             for _ in range(100):
                 if timer.active:
@@ -822,7 +837,7 @@ async def test_runtime_archive_prioritizes_foreground_work_through_shared_gate(t
 
             client.block_cycle = True
             timer.fire_next()
-            await asyncio.wait_for(client.cycle_started.wait(), timeout=0.1)
+            await asyncio.wait_for(client.cycle_started.wait(), timeout=1)
 
             async def current_value_request() -> str:
                 client.events.append("current")
@@ -838,7 +853,7 @@ async def test_runtime_archive_prioritizes_foreground_work_through_shared_gate(t
             assert not current_task.done()
 
             client.release_cycle.set()
-            assert await asyncio.wait_for(current_task, timeout=0.1) == "current-value"
+            assert await asyncio.wait_for(current_task, timeout=1) == "current-value"
             await hass.async_block_till_done()
 
             current_index = client.events.index("current")
@@ -1223,16 +1238,15 @@ async def test_archive_startup_failure_does_not_block_current_setup() -> None:
         )
 
         result = await async_setup_entry(hass, entry)
+        await _await_archive_start_task(entry)
 
     assert result is True
     archive.async_start.assert_awaited_once()
     hass.config_entries.async_forward_entry_setups.assert_awaited_once()
 
 
-async def test_stalled_recorder_check_times_out_archive_without_leaking_setup_tasks(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A stuck Recorder capability check cannot delay current-value setup."""
+async def test_stalled_recorder_check_starts_archive_in_background_and_can_cancel() -> None:
+    """A slow Recorder barrier cannot delay current-value setup."""
     entry = _config_entry_mock(entry_id="entry-stalled-recorder", title="Garmin account")
     entry.data = {**ENTRY_DATA, "history_account_key": "opaque-account-key-1234567890"}
     entry.options = {}
@@ -1263,8 +1277,6 @@ async def test_stalled_recorder_check_times_out_archive_without_leaking_setup_ta
         recorder_checker=MagicMock(async_check=AsyncMock(side_effect=never_complete)),
         store_factory=lambda *_args, **_kwargs: store,
     )
-    monkeypatch.setattr("custom_components.garmin_connect._ARCHIVE_STARTUP_TIMEOUT", 0.01)
-
     with ExitStack() as stack:
         stack.enter_context(patch("custom_components.garmin_connect.GarminAuth"))
         stack.enter_context(patch("custom_components.garmin_connect.GarminClient"))
@@ -1275,12 +1287,13 @@ async def test_stalled_recorder_check_times_out_archive_without_leaking_setup_ta
 
         assert await asyncio.wait_for(async_setup_entry(hass, entry), timeout=0.1) is True
 
-    assert recorder_check_started.is_set()
-    assert archive.status.state.value == "failed"
-    assert archive.status.error_type == "startup_timeout"
+    await asyncio.wait_for(recorder_check_started.wait(), timeout=0.1)
     assert hass.config_entries.async_forward_entry_setups.await_count == 1
-    assert created_tasks and all(task.done() for task in created_tasks)
-    assert not [task for task in created_tasks if not task.done()]
+    assert created_tasks and not created_tasks[0].done()
+
+    created_tasks[0].cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await created_tasks[0]
 
 
 async def test_missing_recorder_task_only_fails_archive_setup(
@@ -1317,6 +1330,7 @@ async def test_missing_recorder_task_only_fails_archive_setup(
         )
 
         assert await async_setup_entry(hass, entry) is True
+        await _await_archive_start_task(entry)
 
     assert archive.status.state.value == "failed"
     assert archive.status.error_type == "recorder_signature"
@@ -1395,6 +1409,7 @@ async def test_real_entry_setup_rolls_back_partial_platform_failure_and_retries(
         setup_services.assert_not_awaited()
 
         assert await async_setup_entry(hass, entry) is True
+        await _await_archive_start_task(entry)
 
     assert entry.runtime_data.request_gate is not first_gate
     assert entry.runtime_data.request_gate._closed is False
@@ -1507,8 +1522,8 @@ async def test_real_entry_timeout_becomes_not_ready() -> None:
     assert constructors[0].call_args.args[4]._closed is True
 
 
-async def test_setup_cancellation_removes_registered_services_and_listener() -> None:
-    """Cancellation after registration compensates every setup-side resource."""
+async def test_unload_cancels_pending_archive_start_and_releases_runtime() -> None:
+    """Unload owns a pending optional archive startup task."""
     entry = _real_config_entry()
     hass = MagicMock()
     _configure_entry_task_factory(hass)
@@ -1519,11 +1534,9 @@ async def test_setup_cancellation_removes_registered_services_and_listener() -> 
     coord = _coord_mock()
     archive = MagicMock(spec=GarminHistoryArchive)
     archive_started = asyncio.Event()
-    release_archive = asyncio.Event()
-
     async def start_archive() -> None:
         archive_started.set()
-        await release_archive.wait()
+        await asyncio.Event().wait()
 
     archive.async_start = AsyncMock(side_effect=start_archive)
     archive.async_stop = AsyncMock()
@@ -1541,21 +1554,18 @@ async def test_setup_cancellation_removes_registered_services_and_listener() -> 
             patch("custom_components.garmin_connect.async_setup_services", new=AsyncMock())
         )
 
-        setup_task = asyncio.create_task(async_setup_entry(hass, entry))
+        assert await async_setup_entry(hass, entry) is True
         await archive_started.wait()
-        setup_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await setup_task
+        assert await async_unload_entry(hass, entry) is True
 
     assert constructors[0].call_args.args[4]._closed is True
     archive.async_stop.assert_awaited_once()
     unload_services.assert_awaited_once_with(hass)
-    assert entry.update_listeners == []
     assert not hasattr(entry, "runtime_data")
 
 
-async def test_setup_rollback_keeps_services_owned_by_another_loaded_entry() -> None:
-    """Cancelling entry A cannot unregister the services entry B still needs."""
+async def test_unload_keeps_services_owned_by_another_loaded_entry() -> None:
+    """Unloading entry A cannot unregister services entry B still needs."""
     entry_a = _real_config_entry()
     entry_b = _real_config_entry("entry-b")
     entry_b.runtime_data = object()
@@ -1590,11 +1600,9 @@ async def test_setup_rollback_keeps_services_owned_by_another_loaded_entry() -> 
             patch("custom_components.garmin_connect.async_setup_services", new=AsyncMock())
         )
 
-        setup_task = asyncio.create_task(async_setup_entry(hass, entry_a))
+        assert await async_setup_entry(hass, entry_a) is True
         await archive_started.wait()
-        setup_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await setup_task
+        assert await async_unload_entry(hass, entry_a) is True
 
     unload_services.assert_not_awaited()
     assert entry_b.runtime_data is not None

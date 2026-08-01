@@ -153,7 +153,7 @@ RELEASE_GATE_GROUPS: dict[str, tuple[str, ...]] = {
         "tests/test_history.py::test_recorder_compatibility_accepts_supported_versions_with_a_slow_queue_task",
         "tests/test_history.py::test_recorder_compatibility_rejects_versions_below_the_hacs_minimum",
         "tests/test_history.py::test_recorder_compatibility_rejects_missing_durable_import_seam",
-        "tests/test_init.py::test_stalled_recorder_check_times_out_archive_without_leaking_setup_tasks",
+        "tests/test_init.py::test_stalled_recorder_check_starts_archive_in_background_and_can_cancel",
     ),
 }
 
@@ -428,7 +428,7 @@ def test_release_metadata_targets_beta_and_core_gate() -> None:
     floor = hacs["homeassistant"]
     parsed_floor = _canonical_home_assistant_version(floor)
 
-    assert manifest["version"] == "3.1.0-beta.5"
+    assert manifest["version"] == "3.1.0-beta.6"
     assert [line for line in requirements if line.startswith("homeassistant")] == [
         f"homeassistant>={floor}"
     ]
@@ -445,7 +445,7 @@ def test_release_gate_metadata_matches_manifest_requirements_and_beta_semver() -
     """The offline gate must cover every runtime dependency declared by manifest."""
     release = release_gate.read_release_metadata(ROOT)
 
-    assert release.version == "3.1.0-beta.5"
+    assert release.version == "3.1.0-beta.6"
     assert release.home_assistant == "2026.7.4"
     assert release.requirements["ha-garmin"] == "0.1.31"
     assert release.requirements["garmin-fit-sdk"] == "21.208.0"

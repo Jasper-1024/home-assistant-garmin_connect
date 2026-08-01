@@ -106,7 +106,7 @@ made new data available. Nine independent coordinators fetch data in parallel:
 
 > **Tip:** Garmin devices sync to Garmin Connect when in Bluetooth range of the paired phone or via WiFi. Sensors update after your device syncs to Garmin Connect **and** the integration polls for new data.
 
-## Prospective Archive (3.1.0-beta.5)
+## Prospective Archive (3.1.0-beta.6)
 
 The Prospective Archive is **off by default**. It records eligible data only
 after you explicitly enable **Prospective Archive** in the Garmin config-entry
@@ -126,7 +126,7 @@ retained; this integration provides no archive-deletion action and no automatic
 expiry policy. There is no built-in retention period: the records remain until
 an administrator manages the storage outside this integration. Disabling,
 reloading, upgrading, or rolling back does not remove those records. See the
-[3.1.0-beta.5 release guide](docs/release-3.1.0-beta.5.md) for the current-data
+[3.1.0-beta.6 release guide](docs/release-3.1.0-beta.6.md) for the current-data
 cadence, retention planning, downgrade, and re-authentication safety guidance.
 
 ### Raw HTTP capture and offline replay

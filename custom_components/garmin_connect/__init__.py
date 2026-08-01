@@ -45,11 +45,6 @@ from .services import async_setup_services, async_unload_services
 
 _LOGGER = logging.getLogger(__name__)
 
-# Recorder's queue confirmation can legitimately wait for its own five-minute
-# hard limit. Archive is optional, so core setup gets a separate short bound.
-_ARCHIVE_STARTUP_TIMEOUT = 60
-
-
 @dataclass(slots=True)
 class _EntryUpdateState:
     """Observed and applied config-entry options plus one reload flight."""
@@ -290,74 +285,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: GarminConnectConfigEntry
             return True
 
         state = _ENTRY_UPDATE_STATES[entry]
-        archive_start = history_archive.async_start()
         state.archive_start_task = entry.async_create_task(
             hass,
-            archive_start,
+            _async_start_history_archive(
+                hass, entry, history_archive, state, applied_options
+            ),
             name=f"{DOMAIN} archive startup",
         )
-        try:
-            await asyncio.wait_for(
-                state.archive_start_task, timeout=_ARCHIVE_STARTUP_TIMEOUT
-            )
-        except TimeoutError:
-            # wait_for has cancelled and joined the startup task before this
-            # branch runs. Mark the optional archive failed and release any
-            # partially initialized resources; never retain a pending task.
-            try:
-                await history_archive.async_abort_startup("startup_timeout")
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                _LOGGER.warning(
-                    "Garmin history archive could not stop after startup timeout for "
-                    "entry %s",
-                    entry.entry_id,
-                )
-            _LOGGER.warning(
-                "Garmin history archive startup timed out for entry %s",
-                entry.entry_id,
-            )
-        except asyncio.CancelledError:
-            # An options listener cancels this child task to prevent an
-            # obsolete archive from scheduling its first sync. Propagate only
-            # cancellation of setup itself; the replacement reload owns an
-            # options-driven cancellation.
-            if not state.reload_requested:
-                raise
-        except Exception:
-            # The archive is optional. Its implementation must never prevent
-            # current-value coordinators from loading.
-            _LOGGER.warning(
-                "Garmin history archive could not start for entry %s",
-                entry.entry_id,
-            )
-        finally:
-            state.archive_start_task = None
 
-        # Reconcile an update that arrived while archive startup was awaiting.
-        # Stop this archive before reloading so its newly scheduled background
-        # first sync cannot run alongside the replacement runtime's first sync.
-        reload_needed = _record_entry_update_state(hass, entry, applied_options)
-        reload_needed = reload_needed or state.reload_requested
-        if reload_needed:
-            try:
-                await history_archive.async_stop()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                _LOGGER.warning(
-                    "Garmin history archive could not stop after an options update for "
-                    "entry %s",
-                    entry.entry_id,
-                )
-
-        # Commit the provisional listener only after the final await. Failed
-        # setup removes it below rather than retaining no-op callbacks.
+        # Recorder confirmation can legitimately wait minutes. Archive setup
+        # is optional, so it must not block current-value integration startup.
         entry.async_on_unload(remove_options_listener)
         remove_options_listener = None
-        if reload_needed:
-            _schedule_entry_reload(hass, entry, _ENTRY_UPDATE_STATES[entry])
         return True
     except BaseException:
         if remove_options_listener is not None:
@@ -377,6 +316,46 @@ async def async_setup_entry(hass: HomeAssistant, entry: GarminConnectConfigEntry
 def _add_options_update_listener(entry: GarminConnectConfigEntry) -> Callable[[], None]:
     """Start observing options until setup commits it to the entry lifetime."""
     return entry.add_update_listener(async_options_update_listener)
+
+
+async def _async_start_history_archive(
+    hass: HomeAssistant,
+    entry: GarminConnectConfigEntry,
+    history_archive: GarminHistoryArchive,
+    state: _EntryUpdateState,
+    applied_options: dict[str, Any],
+) -> None:
+    """Start the optional archive without blocking config-entry setup."""
+    try:
+        await history_archive.async_start()
+    except asyncio.CancelledError:
+        # An options update cancels obsolete startup before its first sync.
+        if not state.reload_requested:
+            raise
+    except Exception:
+        _LOGGER.warning(
+            "Garmin history archive could not start for entry %s",
+            entry.entry_id,
+        )
+    finally:
+        state.archive_start_task = None
+
+    # Reconcile an update that arrived while startup was awaiting. Stop this
+    # archive before reloading so only the replacement can start a first sync.
+    reload_needed = _record_entry_update_state(hass, entry, applied_options)
+    reload_needed = reload_needed or state.reload_requested
+    if not reload_needed:
+        return
+    try:
+        await history_archive.async_stop()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _LOGGER.warning(
+            "Garmin history archive could not stop after an options update for %s",
+            entry.entry_id,
+        )
+    _schedule_entry_reload(hass, entry, state)
 
 
 async def _async_rollback_setup(
@@ -464,6 +443,14 @@ async def _async_release_runtime(
 ) -> None:
     """Stop resources only after their platforms no longer reference them."""
     try:
+        state = _ENTRY_UPDATE_STATES.get(entry)
+        if (
+            state is not None
+            and (archive_start_task := state.archive_start_task) is not None
+            and not archive_start_task.done()
+        ):
+            archive_start_task.cancel()
+            await asyncio.gather(archive_start_task, return_exceptions=True)
         if history_archive is not None:
             await history_archive.async_stop()
     finally:

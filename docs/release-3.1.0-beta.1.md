@@ -176,7 +176,7 @@ pytest -q \
   tests/test_history.py::test_recorder_compatibility_accepts_supported_versions_with_a_slow_queue_task \
   tests/test_history.py::test_recorder_compatibility_rejects_versions_below_the_hacs_minimum \
   tests/test_history.py::test_recorder_compatibility_rejects_missing_durable_import_seam \
-  tests/test_init.py::test_stalled_recorder_check_times_out_archive_without_leaking_setup_tasks \
+  tests/test_init.py::test_stalled_recorder_check_starts_archive_in_background_and_can_cancel \
   tests/test_history_recorder.py::test_release_gate_scratch_recorder_restart_revision_and_no_state_changed \
   tests/test_fit_archive.py::test_optional_private_captured_fit_replay
 ```
