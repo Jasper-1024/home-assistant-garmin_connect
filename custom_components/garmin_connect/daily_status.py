@@ -167,6 +167,30 @@ def _field(
     return value
 
 
+def _enum_field(
+    source: Mapping[str, Any],
+    name: str,
+    values: dict[str, Any],
+    presence: dict[str, str],
+    *,
+    presence_name: str | None = None,
+) -> str | int | float | None:
+    """Keep a bounded enum code without pretending it is a statistic."""
+    presence_key = presence_name or name
+    if name not in source:
+        presence[presence_key] = "missing"
+        return None
+    raw = source[name]
+    if raw is None:
+        presence[presence_key] = "null"
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, str | int | float):
+        raise HistorySchemaError(f"{name} has an invalid type")
+    values[name] = raw
+    presence[presence_key] = "present"
+    return raw
+
+
 def _metric(
     metrics: list[DailyStatusMetric], key: str, name: str, unit: str, value: Any
 ) -> None:
@@ -360,8 +384,14 @@ def normalize_training_daily_status(payload: Any, target_date: date) -> DailySta
         item_values: dict[str, Any] = {}
         vo2_values[suffix] = item_values
         returned_dates.append(_calendar_date(item, target_date))
-        for source in ("calendarDate", "maxMetCategory"):
-            _field(item, source, item_values, presence, text_value=True, presence_name=f"vo2Max.{suffix}.{source}")
+        _field(
+            item, "calendarDate", item_values, presence, text_value=True,
+            presence_name=f"vo2Max.{suffix}.calendarDate",
+        )
+        _enum_field(
+            item, "maxMetCategory", item_values, presence,
+            presence_name=f"vo2Max.{suffix}.maxMetCategory",
+        )
         for source, key, name in (
             ("vo2MaxValue", "vo2_max", "Training VO2 max"),
             ("vo2MaxPreciseValue", "vo2_max_precise", "Training precise VO2 max"),
@@ -382,7 +412,8 @@ def normalize_training_daily_status(payload: Any, target_date: date) -> DailySta
             "monthlyLoadAnaerobicTargetMax", "lowAerobicTargetMin",
             "lowAerobicTargetMax", "highAerobicTargetMin", "highAerobicTargetMax",
             "anaerobicTargetMin", "anaerobicTargetMax", "feedback",
-            "trainingLoadBalanceFeedback", "calendarDate",
+            "trainingLoadBalanceFeedback", "trainingBalanceFeedbackPhrase",
+            "calendarDate", "primaryTrainingDevice",
         }
     )
     if balance_root:
@@ -404,6 +435,9 @@ def normalize_training_daily_status(payload: Any, target_date: date) -> DailySta
         value = _number(raw, str(key))
         balance_values[str(key)] = value
         _metric(metrics, f"training_load_balance_{_stat_key(str(key))}", f"Training load balance {key}", "load", value)
+    primary = balance_root.get("primaryTrainingDevice")
+    if isinstance(primary, bool):
+        balance_values["primaryTrainingDevice"] = primary
     if balance_values:
         values["loadBalance"] = balance_values
     if not values["devices"]:
@@ -468,27 +502,60 @@ def normalize_training_daily_records(
         )
         vo2 = {}
     for raw_key, item in vo2.items():
-        fallback_suffix = _device_suffix(str(raw_key))
+        suffix = _stat_key(str(raw_key))
+        if item is None:
+            records.append(
+                _with_record_key(
+                    unavailable_daily_status("training", target_date, "null"),
+                    f"training_vo2:{suffix}",
+                )
+            )
+            continue
+        if not isinstance(item, Mapping):
+            # The VO2 envelope also contains account metadata such as userId.
+            continue
         try:
-            mapped = _mapping(item, "training VO2 item")
+            mapped = item
             raw_device = mapped.get("deviceId")
-            suffix = _device_suffix(str(raw_device)) if raw_device is not None else "generic"
+            if raw_device is not None:
+                suffix = _device_suffix(str(raw_device))
             record = normalize_training_daily_status(
                 {"mostRecentVO2Max": {str(raw_key): item}}, target_date
             )
         except HistorySchemaError:
             record = unavailable_daily_status("training", target_date, "failed")
-            suffix = fallback_suffix
         records.append(_with_record_key(record, f"training_vo2:{suffix}"))
-    if root.get("mostRecentTrainingLoadBalance") is not None:
+    raw_balance = root.get("mostRecentTrainingLoadBalance")
+    if raw_balance is not None:
         try:
-            record = normalize_training_daily_status(
-                {"mostRecentTrainingLoadBalance": root["mostRecentTrainingLoadBalance"]},
-                target_date,
+            balance_root = _mapping(raw_balance, "training load balance")
+            balance_by_device = _mapping(
+                balance_root.get("metricsTrainingLoadBalanceDTOMap"),
+                "training load balance devices",
             )
         except HistorySchemaError:
-            record = unavailable_daily_status("training", target_date, "failed")
-        records.append(_with_record_key(record, "training_load_balance"))
+            records.append(
+                _with_record_key(
+                    unavailable_daily_status("training", target_date, "failed"),
+                    "training_load_balance",
+                )
+            )
+            balance_by_device = {}
+            balance_root = {}
+        candidates = balance_by_device or (
+            {"generic": balance_root} if balance_root else {}
+        )
+        for raw_id, item in candidates.items():
+            suffix = _device_suffix(str(raw_id)) if raw_id != "generic" else "generic"
+            try:
+                record = normalize_training_daily_status(
+                    {"mostRecentTrainingLoadBalance": item}, target_date
+                )
+            except HistorySchemaError:
+                record = unavailable_daily_status("training", target_date, "failed")
+            records.append(
+                _with_record_key(record, f"training_load_balance:{suffix}")
+            )
     return tuple(records) or (normalize_training_daily_status({}, target_date),)
 
 
@@ -527,13 +594,34 @@ def normalize_sleep_daily_status(payload: Any, target_date: date) -> DailyStatus
     for need_name in ("sleepNeed", "nextSleepNeed"):
         need = _mapping(daily.get(need_name, root.get(need_name)), need_name)
         need_values: dict[str, Any] = {}
-        for source, unit in (
-            ("actual", "min"), ("baseline", "min"), ("hrvAdjustment", "min"),
-            ("napAdjustment", "min"), ("sleepHistoryAdjustment", "min"),
-            ("trainingAdjustment", "min"),
-        ):
+        for source in ("actual", "baseline"):
             value = _field(need, source, need_values, presence, presence_name=f"{need_name}.{source}")
-            _metric(metrics, f"sleep_{_stat_key(need_name)}_{_stat_key(source)}", f"Sleep {need_name} {source}", unit, value)
+            _metric(metrics, f"sleep_{_stat_key(need_name)}_{_stat_key(source)}", f"Sleep {need_name} {source}", "min", value)
+        for source in (
+            "hrvAdjustment", "napAdjustment", "sleepHistoryAdjustment",
+            "trainingAdjustment",
+        ):
+            presence_key = f"{need_name}.{source}"
+            raw_adjustment = need.get(source)
+            if source not in need:
+                presence[presence_key] = "missing"
+            elif raw_adjustment is None:
+                presence[presence_key] = "null"
+            elif isinstance(raw_adjustment, str):
+                need_values[source] = raw_adjustment
+                presence[presence_key] = "present"
+            else:
+                value = _field(
+                    need, source, need_values, presence,
+                    presence_name=presence_key,
+                )
+                _metric(
+                    metrics,
+                    f"sleep_{_stat_key(need_name)}_{_stat_key(source)}",
+                    f"Sleep {need_name} {source}",
+                    "min",
+                    value,
+                )
         for source in ("calendarDate", "feedback", "trainingFeedback"):
             _field(need, source, need_values, presence, text_value=True, presence_name=f"{need_name}.{source}")
         for source in (
@@ -569,12 +657,25 @@ def normalize_sleep_daily_status(payload: Any, target_date: date) -> DailyStatus
         elif tracker is None:
             presence[f"{need_name}.preferredActivityTracker"] = "null"
         else:
-            if isinstance(tracker, bool) or not isinstance(tracker, str | int):
+            if isinstance(tracker, bool):
+                need_values["preferredActivityTracker"] = tracker
+            elif not isinstance(tracker, str | int):
                 raise HistorySchemaError("preferredActivityTracker has an invalid type")
-            need_values["preferredActivityTracker"] = hashlib.sha256(
-                str(tracker).encode()
-            ).hexdigest()[:12]
+            else:
+                need_values["preferredActivityTracker"] = hashlib.sha256(
+                    str(tracker).encode()
+                ).hexdigest()[:12]
             presence[f"{need_name}.preferredActivityTracker"] = "present"
+        device_id = need.get("deviceId")
+        if "deviceId" not in need:
+            presence[f"{need_name}.deviceId"] = "missing"
+        elif device_id is None:
+            presence[f"{need_name}.deviceId"] = "null"
+        elif isinstance(device_id, bool) or not isinstance(device_id, str | int):
+            raise HistorySchemaError("sleep need deviceId has an invalid type")
+        else:
+            need_values["device"] = _device_suffix(str(device_id))
+            presence[f"{need_name}.deviceId"] = "present"
         bedtime = need_values.get("recommendedBedtimeStartMins")
         actual = need_values.get("actual")
         if isinstance(bedtime, float) and isinstance(actual, float):

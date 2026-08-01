@@ -265,6 +265,66 @@ def test_nullable_status_fields_remain_distinct_from_missing():
     assert null_stale.field_presence["components.rhr.stale"] == "null"
 
 
+def test_live_training_and_sleep_status_shapes_normalize_without_failure():
+    training = normalize_training_daily_records(
+        {
+            "mostRecentVO2Max": {
+                "cycling": None,
+                "generic": {
+                    "calendarDate": "2026-08-01",
+                    "maxMetCategory": 2,
+                    "vo2MaxValue": 48,
+                },
+                "userId": 123,
+            },
+            "mostRecentTrainingLoadBalance": {
+                "metricsTrainingLoadBalanceDTOMap": {
+                    "3417635870": {
+                        "calendarDate": "2026-08-01",
+                        "monthlyLoadAerobicLow": 358.3,
+                        "monthlyLoadAerobicLowTargetMin": 200,
+                        "primaryTrainingDevice": True,
+                        "trainingBalanceFeedbackPhrase": "AEROBIC_HIGH_SHORTAGE",
+                    }
+                }
+            },
+        },
+        TARGET,
+    )
+    assert not any(record.presence == "failed" for record in training)
+    assert any(record.record_key.startswith("training_load_balance:") for record in training)
+    assert any(
+        metric.key == "training_load_balance_monthly_load_aerobic_low"
+        for record in training
+        for metric in record.metrics
+    )
+
+    sleep = normalize_sleep_daily_records(
+        {
+            "dailySleepDTO": {
+                "calendarDate": "2026-08-01",
+                "sleepNeed": {
+                    "actual": 450,
+                    "baseline": 480,
+                    "calendarDate": "2026-08-01",
+                    "deviceId": 3417635870,
+                    "displayedForTheDay": True,
+                    "hrvAdjustment": "NO_CHANGE",
+                    "napAdjustment": "DECREASING",
+                    "preferredActivityTracker": True,
+                    "sleepHistoryAdjustment": "NO_CHANGE",
+                    "timestampGmt": "2026-08-01T01:06:15",
+                },
+            }
+        },
+        TARGET,
+    )
+    need = next(record for record in sleep if record.record_key == "sleep_sleep_need")
+    assert need.presence == "present"
+    assert need.values["sleepNeed"]["hrvAdjustment"] == "NO_CHANGE"
+    assert need.values["sleepNeed"]["preferredActivityTracker"] is True
+
+
 @pytest.mark.asyncio
 async def test_store_is_idempotent_revisable_and_empty_cannot_erase():
     store = DailyStatusStore(object(), "entry", "account-key", MemoryStore)
