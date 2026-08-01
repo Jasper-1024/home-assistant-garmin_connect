@@ -1,5 +1,11 @@
 # Prospective Archive Specification
 
+> **Historical design record.** This specification has been implemented as of
+> `3.1.0-beta.14`. For current operation, use the
+> [project README](../README.md) and the
+> [Garmin health data integration guide](garmin-health-data-integration.md).
+> The design rationale below is retained for reference.
+
 ## Problem Statement
 
 Garmin Connect exposes useful raw measurements, structured records, activities,
@@ -263,8 +269,8 @@ account-wide reauthentication flow.
 - Fifteen-minute freshness, seven-day reconciliation, and one-hour FIT pacing
   are operating policies rather than guarantees of Garmin availability,
   network success, or uninterrupted Home Assistant runtime.
-- The beta version remains `3.1.0-beta.2` until these behaviors and release
-  gates are implemented and reviewed.
+- These behaviors and release gates were implemented and reviewed through
+  `3.1.0-beta.14`.
 
 ## Testing Decisions
 
@@ -423,9 +429,10 @@ account-wide reauthentication flow.
   Time using the browser or server timezone preference. For example, a Source
   Instant expressed as 10:00 at UTC+2 is the same instant as 08:00 UTC and is
   displayed as 16:00 when Home Assistant uses UTC+8.
-- The current implementation is not release-ready because normal startup still
-  starts legacy Historical Backfill and lacks Archive Enablement, Archive
-  Activation Date, Open and Settled Archive Dates, the accepted status
-  contract, hourly FIT pacing, and prospective failure isolation.
+- By `3.1.0-beta.14`, normal startup no longer starts legacy Historical
+  Backfill, and the accepted Archive Enablement, Archive Activation Date, Open
+  and Settled Archive Date, status, FIT pacing, and failure-isolation behavior
+  is implemented. Current operational details live in the README and health
+  data integration guide linked above.
 - No prototype was required. The accepted design can be verified through the
   two agreed high-level seams without adding a new public archive interface.

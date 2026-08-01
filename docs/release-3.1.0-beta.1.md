@@ -1,13 +1,8 @@
 # Garmin Connect 3.1.0-beta.1 historical release record
 
-> Historical record only. The existing annotated `3.1.0-beta.1` tag resolves
-> to commit `5e25218` and is not the current release candidate. Do not use this
-> document as the candidate guide or as release-gate input; use
-> [the 3.1.0-beta.2 release guide](release-3.1.0-beta.2.md).
-
-The remainder of this file retains the beta.1 historical release record. This
-release cycle adds explicit annotations for historical isolation and
-release-gate guidance; it must not be used as the beta.2 release candidate.
+> **Historical release record.** This document describes `3.1.0-beta.1` and is
+> not current installation guidance. Use the
+> [3.1.0-beta.14 release guide](release-3.1.0-beta.14.md) for the current beta.
 
 Minimum Home Assistant Core version: **2026.7.4**. Newer patch and minor
 releases are accepted only after the Recorder capability contract passes; an

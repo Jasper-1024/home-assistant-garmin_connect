@@ -1,4 +1,4 @@
-"""Release and privacy gates for the 3.1.0-beta.2 candidate and beta.1 historical fixtures."""
+"""Release, documentation, and privacy gates for the current beta."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import re
 from datetime import date
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import unquote, urlsplit
 
 import pytest
 import yaml
@@ -49,6 +50,21 @@ UPSTREAM_URL = "https://github.com/cyberjunky/home-assistant-garmin_connect"
 PUBLIC_FEEDBACK_URL = FORK_PULLS_URL
 DEFAULT_POLLING_PROMISE = "900 seconds (15 minutes)"
 MARKDOWN_LINK_URLS = re.compile(r"\[[^]]+\]\((https?://[^)\s]+)\)")
+INLINE_MARKDOWN_LINK_TARGETS = re.compile(
+    r"(?<!!)\[[^]]+\]\((?P<target><[^>]+>|[^)\s]+)(?:\s+['\"][^)]*['\"])?\)"
+)
+REFERENCE_MARKDOWN_LINK_TARGETS = re.compile(
+    r"(?m)^\s*\[[^]]+\]:\s*(?P<target><[^>]+>|\S+)"
+)
+NON_POLLED_TRAINING_CAPABILITIES = re.compile(
+    r"(?i)\b(?:"
+    r"(?:training|morning)\s+readiness|"
+    r"lactate(?:\s+threshold)?|"
+    r"endurance(?:\s+score)?|"
+    r"hill(?:\s+score)?|"
+    r"recovery(?:\s+time)?"
+    r")\b"
+)
 POLLING_DEFAULT_CLAIM = re.compile(
     r"(?ix)^"
     r"(?=.*\b(?:poll(?:ing|ed)?|scan[ -]interval|next[ -]poll)\b)"
@@ -174,6 +190,93 @@ DOCUMENTED_RELEASE_GATE_EXTRAS = (
     "tests/test_history_recorder.py::test_release_gate_scratch_recorder_restart_revision_and_no_state_changed",
     "tests/test_fit_archive.py::test_optional_private_captured_fit_replay",
 )
+
+
+def _current_release_version() -> str:
+    manifest = json.loads(
+        (ROOT / "custom_components" / "garmin_connect" / "manifest.json").read_text()
+    )
+    return manifest["version"]
+
+
+def _local_markdown_targets(document: Path) -> tuple[Path, ...]:
+    content = document.read_text()
+    raw_targets = (
+        *(match["target"] for match in INLINE_MARKDOWN_LINK_TARGETS.finditer(content)),
+        *(match["target"] for match in REFERENCE_MARKDOWN_LINK_TARGETS.finditer(content)),
+    )
+    targets: list[Path] = []
+    for raw_target in raw_targets:
+        target = raw_target.strip("<>")
+        parsed = urlsplit(target)
+        if parsed.scheme or parsed.netloc or not parsed.path or parsed.path.startswith("/"):
+            continue
+        targets.append((document.parent / unquote(parsed.path)).resolve())
+    return tuple(targets)
+
+
+def _assert_document_links_to(document: Path, target: Path) -> None:
+    assert target.resolve() in _local_markdown_targets(document), (
+        f"{document.relative_to(ROOT)} must link to {target.relative_to(ROOT)}"
+    )
+
+
+def test_current_release_guide_exists_and_is_linked_from_readme() -> None:
+    version = _current_release_version()
+    relative_guide = Path("docs") / f"release-{version}.md"
+    guide = ROOT / relative_guide
+
+    assert guide.is_file()
+    _assert_document_links_to(ROOT / "README.md", guide)
+
+
+def test_readme_links_current_documentation_entry_points() -> None:
+    readme = ROOT / "README.md"
+
+    _assert_document_links_to(readme, ROOT / "docs" / "README.md")
+    _assert_document_links_to(
+        readme,
+        ROOT / "docs" / "garmin-health-data-integration.md",
+    )
+
+
+def test_key_current_document_local_markdown_links_resolve() -> None:
+    version = _current_release_version()
+    documents = (
+        ROOT / "README.md",
+        ROOT / "docs" / "README.md",
+        ROOT / "docs" / "garmin-health-data-integration.md",
+        ROOT / "docs" / f"release-{version}.md",
+    )
+
+    for document in documents:
+        assert document.is_file(), f"missing current document: {document.relative_to(ROOT)}"
+        for target in _local_markdown_targets(document):
+            assert target.is_relative_to(ROOT), (
+                f"local Markdown link escapes repository in {document.relative_to(ROOT)}: "
+                f"{target}"
+            )
+            assert target.exists(), (
+                f"broken local Markdown link in {document.relative_to(ROOT)}: "
+                f"{target}"
+            )
+
+
+def test_readme_active_training_polling_excludes_non_polled_capabilities() -> None:
+    readme = (ROOT / "README.md").read_text()
+    training_polling_rows = re.findall(
+        r"(?im)^\|\s*Training\s*\|(?P<capabilities>[^|]+)\|\s*$",
+        readme,
+    )
+    training_summary_rows = re.findall(
+        r"(?im)^-\s*\*\*Training metrics\*\*\s*[—:-]+\s*(?P<capabilities>.+)$",
+        readme,
+    )
+    active_training_descriptions = (*training_polling_rows, *training_summary_rows)
+
+    assert training_polling_rows, "README must document the active Training polling row"
+    for description in active_training_descriptions:
+        assert NON_POLLED_TRAINING_CAPABILITIES.search(description) is None, description
 
 
 def test_executable_release_gate_matrix_covers_the_archive_contract() -> None:

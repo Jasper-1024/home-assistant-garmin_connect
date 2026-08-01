@@ -1,5 +1,9 @@
 # Garmin Connect 3.1.0-beta.8
 
+> **Historical release record.** This document describes `3.1.0-beta.8` and is
+> not current installation guidance. Use the
+> [3.1.0-beta.14 release guide](release-3.1.0-beta.14.md) for the current beta.
+
 This release fixes the Recorder startup ordering exposed by beta.7. Home
 Assistant Recorder intentionally does not consume its work queue until the Core
 has emitted `homeassistant_started`; the archive now waits for that event before

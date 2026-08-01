@@ -1,5 +1,9 @@
 # Garmin Connect 3.1.0-beta.9
 
+> **Historical release record.** This document describes `3.1.0-beta.9` and is
+> not current installation guidance. Use the
+> [3.1.0-beta.14 release guide](release-3.1.0-beta.14.md) for the current beta.
+
 This release repairs history parsing against the complete local HTTP capture
 produced by beta.8. Development and regression tests replay sanitized captured
 shapes and do not add Garmin requests.

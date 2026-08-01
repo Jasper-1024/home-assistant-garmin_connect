@@ -1,5 +1,9 @@
 # Garmin Connect 3.1.0-beta.5
 
+> **Historical release record.** This document describes `3.1.0-beta.5` and is
+> not current installation guidance. Use the
+> [3.1.0-beta.14 release guide](release-3.1.0-beta.14.md) for the current beta.
+
 This release repairs Garmin response shapes captured from a live Home Assistant
 instance without requesting more Garmin data. History import now accepts the
 current Heart Rate, HRV, Steps, and SpO2 payload forms, and Body Battery uses

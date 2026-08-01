@@ -1,5 +1,9 @@
 # Garmin Connect 3.1.0-beta.3
 
+> **Historical release record.** This document describes `3.1.0-beta.3` and is
+> not current installation guidance. Use the
+> [3.1.0-beta.14 release guide](release-3.1.0-beta.14.md) for the current beta.
+
 This beta adds an operator-controlled full Garmin HTTP capture and offline
 replay boundary for local diagnosis. It is intended to investigate archive
 failures without repeatedly calling Garmin Connect.

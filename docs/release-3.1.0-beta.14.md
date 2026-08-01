@@ -17,9 +17,9 @@ polls use Home Assistant's configured local date.
 Current-value entities remain useful as latest-value views. Daily snapshot
 entities no longer claim sync-time long-term statistics where Source Calendar
 Date statistics are now canonical, and large training/HRV attributes are bounded.
-Eight endpoint families that this device/account does not support remain
-available for compatibility but are disabled by default for new installations.
-Existing entity-registry choices are not changed automatically.
+Compatibility entities for known-empty endpoint families remain available but
+are disabled by default for new installations. Existing entity-registry choices
+are not changed automatically.
 
 The training coordinator now requests only training status, HRV, and
 power-to-weight/FTP data. It no longer polls readiness, morning readiness,
@@ -33,6 +33,13 @@ synced and one archive cycle has completed, verify that Archive Status returns
 to `idle`, supported current entities retain values, and Recorder statistics
 whose IDs begin with `garmin_connect:` contain Source Calendar Date HRV, sleep,
 stress, fitness-age, and training points.
+
+Source Calendar Date can differ from the request date. Live beta.14 validation
+confirmed that a training response can store generic VO2 Max under an earlier
+source date, while `nextSleepNeed` is stored under the following source date.
+Inspect source-date records or Recorder statistics rather than treating an old
+request-date key left by a previous beta as the canonical result. Repeated
+reloads are idempotent when the returned revision is unchanged.
 
 Daily status Source Records are retained in files named
 `garmin_connect.<entry-id>.daily_status_<year>` under Home Assistant private

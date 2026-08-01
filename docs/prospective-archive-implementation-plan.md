@@ -1,6 +1,12 @@
 # Prospective Archive implementation plan
 
-Status: accepted design; implementation pending.
+> **Historical design record.** This plan was implemented through
+> `3.1.0-beta.14`. For current operation, use the
+> [project README](../README.md) and the
+> [Garmin health data integration guide](garmin-health-data-integration.md).
+> The implementation rationale and original delivery slices remain below.
+
+Status: implemented; retained as a historical delivery plan.
 
 ## Outcome
 
@@ -122,7 +128,8 @@ FIT queue bookkeeping remain internal.
 
 ### 9. Release and documentation
 
-- Keep the unreleased version at `3.1.0-beta.2`.
+- The completed implementation is represented by `3.1.0-beta.14`; use its
+  release guide for current upgrade and validation instructions.
 - Replace the fixed `2026-07-24` and post-canary full-backfill instructions
   with backup, upgrade, explicit enablement, first-current-day validation, and
   reversible disablement.
@@ -162,9 +169,9 @@ FIT queue bookkeeping remain internal.
 
 ## Release readiness
 
-The current branch is not release-ready until every slice above is implemented
-and reviewed. Afterward, deployment consists of a Home Assistant backup,
-integration upgrade and restart, verification that existing entities still
-refresh, explicit archive enablement, first-current-day validation, a second
-restart to prove persistence, and continued observation of privacy-safe status
-and storage growth.
+The slices above were implemented and reviewed through `3.1.0-beta.14`.
+Deployment remains a Home Assistant backup, integration upgrade and restart,
+verification that existing entities still refresh, explicit archive
+enablement, first-current-day validation, a second restart to prove
+persistence, and continued observation of privacy-safe status and storage
+growth. Use the current README and release guide for operational instructions.

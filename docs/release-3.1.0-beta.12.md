@@ -1,5 +1,9 @@
 # Garmin Connect 3.1.0-beta.12
 
+> **Historical release record.** This document describes `3.1.0-beta.12` and is
+> not current installation guidance. Use the
+> [3.1.0-beta.14 release guide](release-3.1.0-beta.14.md) for the current beta.
+
 This release isolates all Garmin cloud traffic from Home Assistant startup and
 shutdown. The integration and its entities load immediately; while Garmin is
 slow or unavailable, entities may temporarily report unavailable or unknown

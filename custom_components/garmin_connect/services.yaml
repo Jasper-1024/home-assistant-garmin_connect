@@ -520,8 +520,9 @@ probe_capability:
 sync_history:
   name: Sync Garmin history
   description: >
-    Import heart-rate and stress history for one bounded date range. The
-    inserted, updated, and skipped counts are adapter bookkeeping
+    Import the supported Garmin archive catalog for one bounded date range,
+    including numeric series, structured records, daily status, and eligible
+    FIT work. The inserted, updated, and skipped counts are adapter bookkeeping
     classifications, not authoritative Recorder database audit counts.
   fields:
     entity_id:

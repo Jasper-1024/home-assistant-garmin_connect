@@ -1,5 +1,9 @@
 # Garmin Connect 3.1.0-beta.11
 
+> **Historical release record.** This document describes `3.1.0-beta.11` and is
+> not current installation guidance. Use the
+> [3.1.0-beta.14 release guide](release-3.1.0-beta.14.md) for the current beta.
+
 This release prevents optional Garmin archive initialization from delaying
 Home Assistant startup. The archive must wait until Home Assistant has started
 before confirming Recorder compatibility, but beta.10 registered that wait as
